@@ -102,7 +102,8 @@ kbd.soft { background: var(--accent-soft); color: var(--accent-dark); }
 .cart th { font-size: 12px; font-weight: 600; color: var(--muted); text-align: start; padding: 9px 12px; border-bottom: 1px solid var(--line); background: #f7f8f6; white-space: nowrap; }
 .cart td { padding: 11px 12px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
 .cart .empty { text-align: center; color: var(--muted); padding: 48px 12px; }
-.alloc { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; }
+.cart td:first-child { min-width: 210px; }
+.alloc { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; white-space: nowrap; }
 .qty { display: inline-flex; align-items: center; border: 1px solid #c9d1cd; border-radius: 8px; overflow: hidden; }
 .qty button { width: 34px; height: 34px; border: 0; background: #f1f4f2; font-size: 16px; }
 .qty input { width: 44px; height: 34px; border: 0; text-align: center; }
