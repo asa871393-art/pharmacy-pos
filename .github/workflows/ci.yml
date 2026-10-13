@@ -6,6 +6,9 @@ on:
   pull_request:
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   web:
     name: Tests, typecheck, screenshots
@@ -30,6 +33,17 @@ jobs:
         with:
           name: screenshots
           path: screenshots/
+      - name: Publish screenshots to the 'screenshots' branch (for review)
+        if: always() && github.event_name == 'push'
+        run: |
+          [ -d screenshots ] || exit 0
+          cd screenshots
+          git init -q -b screenshots
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add -A
+          git commit -q -m "Screenshots for ${GITHUB_SHA}"
+          git push -q -f "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${GITHUB_REPOSITORY}" screenshots
 
   windows:
     name: Windows installer
