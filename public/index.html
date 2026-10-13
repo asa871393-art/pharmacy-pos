@@ -9,7 +9,7 @@
 <link rel="stylesheet" href="css/style.css">
 </head>
 <body>
-<div class="app">
+<div class="app" id="app" hidden>
 
   <header class="topbar">
     <div class="brand">
@@ -17,26 +17,31 @@
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
       </div>
       <div class="brand-text">
-        <strong>[اسم الصيدلية]</strong>
+        <strong id="pharmacy-name">الصيدلية</strong>
         <span>نقطة البيع</span>
       </div>
     </div>
-    <nav class="mainnav" aria-label="القائمة الرئيسية">
-      <a href="#" class="active">البيع</a>
-      <a href="#">المخزون</a>
-      <a href="#">المشتريات</a>
-      <a href="#">الوصفات</a>
-      <a href="#">التقارير</a>
+    <nav class="mainnav" id="nav" aria-label="القائمة الرئيسية">
+      <a href="#/sales" data-route="sales" hidden>البيع</a>
+      <a href="#/inventory" data-route="inventory" hidden>المخزون</a>
+      <a href="#/purchases" data-route="purchases" hidden>المشتريات</a>
+      <a href="#/prescriptions" data-route="prescriptions" hidden>الوصفات</a>
+      <a href="#/reports" data-route="reports" hidden>التقارير</a>
+      <a href="#/invoices" data-route="invoices" hidden>الفواتير</a>
+      <a href="#/settings" data-route="settings" hidden>الإعدادات</a>
     </nav>
     <div class="spacer"></div>
     <div class="shift">
-      <span>الوردية: صباحية</span>
+      <span id="shift-info">الوردية: —</span>
+      <button type="button" class="btn-top" id="shift-btn">فتح وردية</button>
       <span class="sep"></span>
-      <span>الصيدلاني: [الاسم]</span>
+      <span id="user-name"></span>
+      <button type="button" class="btn-top" id="logout">خروج</button>
     </div>
   </header>
 
-  <main class="body">
+  <!-- البيع -->
+  <main class="body view" data-view="sales" hidden>
     <section class="catalog" aria-label="الأدوية">
       <div class="searchrow">
         <label for="q" class="sr-only">بحث عن دواء</label>
@@ -45,7 +50,7 @@
           <input id="q" type="text" placeholder="ابحث بالاسم التجاري أو العلمي أو امسح الباركود (F2)" autocomplete="off">
           <kbd>F2</kbd>
         </div>
-        <button type="button" class="btn-outline">
+        <button type="button" class="btn-outline" id="scan">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6v12M8 6v12M12 6v12M16 6v12M20 6v12"/></svg>
           مسح باركود
         </button>
@@ -67,7 +72,12 @@
 
       <div class="inv-cust">
         <label for="cust">الزبون (اختياري)</label>
-        <input id="cust" type="text" placeholder="الاسم أو رقم الهاتف">
+        <div class="cust-picked" id="cust-picked" hidden></div>
+        <div class="suggest-wrap" id="cust-search">
+          <input id="cust" type="text" placeholder="الاسم أو رقم الهاتف" autocomplete="off"
+                 role="combobox" aria-expanded="false" aria-controls="cust-list" aria-autocomplete="list">
+          <ul class="suggest" id="cust-list" role="listbox" hidden></ul>
+        </div>
       </div>
 
       <div class="inv-lines" id="cart"></div>
@@ -75,18 +85,27 @@
       <div class="inv-foot">
         <div class="row"><span>المجموع</span><span id="subtotal">0 د.ع</span></div>
         <div class="row">
-          <label for="disc">الخصم %</label>
-          <input id="disc" type="number" min="0" max="100" value="0">
+          <label for="disc">الخصم % <small class="muted" id="disc-max"></small></label>
+          <input id="disc" type="number" min="0" max="100" step="0.5" value="0">
         </div>
         <div class="row total"><strong>الصافي</strong><strong id="total">0 د.ع</strong></div>
         <div class="pays" id="pays"></div>
         <button type="button" class="checkout" id="checkout">إتمام البيع وطباعة الفاتورة <kbd>F9</kbd></button>
-        <div class="success" id="done" role="status" hidden>تم حفظ الفاتورة بنجاح</div>
+        <div class="success" id="done" role="status" hidden></div>
       </div>
     </aside>
   </main>
+
+  <main class="page view" data-view="inventory" hidden></main>
+  <main class="page view" data-view="purchases" hidden></main>
+  <main class="page view" data-view="prescriptions" hidden></main>
+  <main class="page view" data-view="reports" hidden></main>
+  <main class="page view" data-view="invoices" hidden></main>
+  <main class="page view" data-view="settings" hidden></main>
 </div>
-<script src="js/data.js"></script>
-<script src="js/app.js"></script>
+
+<div id="receipt" class="receipt"></div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>

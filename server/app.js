@@ -10,8 +10,9 @@ const { catalogRoutes } = require('./routes/catalog');
 const { customerRoutes } = require('./routes/customers');
 const { shiftRoutes } = require('./routes/shifts');
 const { salesRoutes } = require('./routes/sales');
+const { prescriptionRoutes } = require('./routes/prescriptions');
 
-function createApp({ db, publicDir = config.publicDir, logErrors = true }) {
+function createApp({ db, publicDir = config.publicDir, uploadsDir = config.uploadsDir, logErrors = true }) {
   const app = express();
   app.disable('x-powered-by');
 
@@ -42,7 +43,8 @@ function createApp({ db, publicDir = config.publicDir, logErrors = true }) {
   api.use(customerRoutes(db));
   api.use(shiftRoutes(db));
   api.use(salesRoutes(db));
-  api.use((req, res) => res.status(404).json({ error: 'المسار غير موجود' }));
+  api.use(prescriptionRoutes(db, uploadsDir));
+  api.use((req, res) =>res.status(404).json({ error: 'المسار غير موجود' }));
   app.use('/api', api);
 
   app.use(express.static(publicDir));

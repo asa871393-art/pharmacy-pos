@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>تسجيل الدخول - الصيدلية</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body class="login-body">
+<main class="login-card">
+  <div class="brand login-brand">
+    <div class="logo">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+    </div>
+    <div class="brand-text">
+      <strong>تسجيل الدخول</strong>
+      <span>نظام نقطة البيع للصيدلية</span>
+    </div>
+  </div>
+  <form id="login-form" class="form" novalidate>
+    <label class="field">
+      <span>اسم المستخدم</span>
+      <input name="username" autocomplete="username" required autofocus>
+    </label>
+    <label class="field">
+      <span>كلمة المرور</span>
+      <input name="password" type="password" autocomplete="current-password" required>
+    </label>
+    <div class="form-error" id="login-error" role="alert" hidden></div>
+    <button type="submit" class="btn-primary btn-block">دخول</button>
+  </form>
+</main>
+<script type="module" src="js/login.js"></script>
+</body>
+</html>

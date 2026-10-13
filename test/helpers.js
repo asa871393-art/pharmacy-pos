@@ -1,5 +1,8 @@
 'use strict';
 // Each test gets a fresh in-memory database with one user per role.
+const fs = require('fs');
+const os = require('os');
+const path = require('path');
 const bcrypt = require('bcryptjs');
 const request = require('supertest');
 const { openDatabase } = require('../server/db');
@@ -16,6 +19,7 @@ const USERS = [
 
 async function setup() {
   const db = await openDatabase(':memory:');
+  const uploadsDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pharmacy-uploads-'));
   const hash = bcrypt.hashSync(PASSWORD, 4);
   const users = {};
   for (const [username, fullName, role] of USERS) {
@@ -25,7 +29,7 @@ async function setup() {
     );
     users[username] = r.lastId;
   }
-  const app = createApp({ db, logErrors: false });
+  const app = createApp({ db, uploadsDir, logErrors: false });
 
   // Logged-in supertest agent (keeps the session cookie).
   async function login(username, { openShift = false, openingCash = 0 } = {}) {
@@ -69,7 +73,7 @@ async function setup() {
   const batchQty = async (id) => (await db.get('SELECT quantity FROM batches WHERE id = ?', [id])).quantity;
   const count = async (table) => (await db.get(`SELECT COUNT(*) AS n FROM ${table}`)).n;
 
-  return { db, app, users, login, addProduct, addBatch, addCustomer, batchQty, count };
+  return { db, app, uploadsDir, users, login, addProduct, addBatch, addCustomer, batchQty, count };
 }
 
 module.exports = { setup, PASSWORD };
