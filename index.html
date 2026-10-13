@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>نقطة البيع - الصيدلية</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+Arabic:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<div class="app">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+      </div>
+      <div class="brand-text">
+        <strong>[اسم الصيدلية]</strong>
+        <span>نقطة البيع</span>
+      </div>
+    </div>
+    <nav class="mainnav" aria-label="القائمة الرئيسية">
+      <a href="#" class="active">البيع</a>
+      <a href="#">المخزون</a>
+      <a href="#">المشتريات</a>
+      <a href="#">الوصفات</a>
+      <a href="#">التقارير</a>
+    </nav>
+    <div class="spacer"></div>
+    <div class="shift">
+      <span>الوردية: صباحية</span>
+      <span class="sep"></span>
+      <span>الصيدلاني: [الاسم]</span>
+    </div>
+  </header>
+
+  <main class="body">
+    <section class="catalog" aria-label="الأدوية">
+      <div class="searchrow">
+        <label for="q" class="sr-only">بحث عن دواء</label>
+        <div class="search">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#4E625B" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+          <input id="q" type="text" placeholder="ابحث بالاسم التجاري أو العلمي أو امسح الباركود (F2)" autocomplete="off">
+          <kbd>F2</kbd>
+        </div>
+        <button type="button" class="btn-outline">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6v12M8 6v12M12 6v12M16 6v12M20 6v12"/></svg>
+          مسح باركود
+        </button>
+      </div>
+
+      <div class="chips" id="cats" role="group" aria-label="التصنيفات"></div>
+      <div class="grid" id="products"></div>
+      <div class="noresults" id="noresults" hidden>لا توجد أدوية مطابقة للبحث</div>
+    </section>
+
+    <aside class="invoice" aria-label="الفاتورة">
+      <div class="inv-head">
+        <div>
+          <strong>فاتورة بيع</strong>
+          <span id="count">0 صنف</span>
+        </div>
+        <button type="button" class="link-danger" id="clear">مسح الكل</button>
+      </div>
+
+      <div class="inv-cust">
+        <label for="cust">الزبون (اختياري)</label>
+        <input id="cust" type="text" placeholder="الاسم أو رقم الهاتف">
+      </div>
+
+      <div class="inv-lines" id="cart"></div>
+
+      <div class="inv-foot">
+        <div class="row"><span>المجموع</span><span id="subtotal">0 د.ع</span></div>
+        <div class="row">
+          <label for="disc">الخصم %</label>
+          <input id="disc" type="number" min="0" max="100" value="0">
+        </div>
+        <div class="row total"><strong>الصافي</strong><strong id="total">0 د.ع</strong></div>
+        <div class="pays" id="pays"></div>
+        <button type="button" class="checkout" id="checkout">إتمام البيع وطباعة الفاتورة <kbd>F9</kbd></button>
+        <div class="success" id="done" role="status" hidden>تم حفظ الفاتورة بنجاح</div>
+      </div>
+    </aside>
+  </main>
+</div>
+<script src="js/data.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>
