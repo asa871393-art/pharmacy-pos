@@ -1,27 +1,5 @@
 {
   "name": "pharmacy-pos",
-<<<<<<< HEAD
-  "version": "1.0.0",
-  "private": true,
-  "description": "نظام نقطة بيع للصيدلية — Node.js + Express + SQLite",
-  "main": "server/index.js",
-  "scripts": {
-    "start": "node server/index.js",
-    "seed": "node scripts/seed.js",
-    "test": "node --test --test-reporter=spec \"test/**/*.test.js\""
-  },
-  "engines": {
-    "node": ">=20"
-  },
-  "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "better-sqlite3": "^13.0.3",
-    "express": "^4.22.3",
-    "multer": "^2.4.0"
-  },
-  "devDependencies": {
-    "supertest": "^7.3.1"
-=======
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -46,6 +24,5 @@
     "@vitejs/plugin-react": "^4.3.4",
     "typescript": "^5.6.3",
     "vite": "^5.4.11"
->>>>>>> ea4894bb21719294b4e8037ff2bcb77992cdaa0e
   }
 }
