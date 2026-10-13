@@ -37,6 +37,11 @@ export function addDaysIso(iso, days) {
 
 export const PAY_LABELS = { cash: 'نقداً', card: 'بطاقة', debt: 'آجل' };
 export const ROLE_LABELS = { admin: 'مدير', pharmacist: 'صيدلاني', cashier: 'كاشير' };
+export const MOVEMENT_LABELS = {
+  opening: 'رصيد افتتاحي', sale: 'بيع', return: 'إرجاع من زبون', purchase: 'شراء',
+  adjustment: 'تصحيح جرد', write_off: 'إتلاف', supplier_return: 'إرجاع إلى المورد'
+};
+export const signed = (n) => (n > 0 ? ltr('+' + n) : ltr(String(n)));
 
 export function debounce(fn, ms = 250) {
   let t;

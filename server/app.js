@@ -11,6 +11,7 @@ const { customerRoutes } = require('./routes/customers');
 const { shiftRoutes } = require('./routes/shifts');
 const { salesRoutes } = require('./routes/sales');
 const { prescriptionRoutes } = require('./routes/prescriptions');
+const { inventoryRoutes } = require('./routes/inventory');
 
 function createApp({ db, publicDir = config.publicDir, uploadsDir = config.uploadsDir, logErrors = true }) {
   const app = express();
@@ -40,6 +41,7 @@ function createApp({ db, publicDir = config.publicDir, uploadsDir = config.uploa
   api.use(requireAuth(db));
   api.get('/settings', wrap(async (req, res) => res.json(await getSettings(db))));
   api.use(catalogRoutes(db));
+  api.use(inventoryRoutes(db));
   api.use(customerRoutes(db));
   api.use(shiftRoutes(db));
   api.use(salesRoutes(db));
