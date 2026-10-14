@@ -115,6 +115,15 @@ await page.getByRole("tab", { name: "سجل الوصفات الطبية" }).clic
 await page.waitForSelector(".rep-table tbody tr");
 await page.screenshot({ path: "screenshots/14-report-rx.png" });
 
+// Employees (admin only)
+await page.getByRole("button", { name: "الموظفين", exact: true }).click();
+await page.waitForSelector(".users-table tbody tr");
+await page.screenshot({ path: "screenshots/15-users.png" });
+await page.locator(".users-table tbody tr", { hasText: "الكاشير" }).getByRole("button", { name: "الدور والصلاحيات" }).click();
+await page.waitForSelector(".perm-list");
+await page.screenshot({ path: "screenshots/16-user-access.png" });
+await page.keyboard.press("Escape");
+
 await browser.close();
 if (errors.length) {
   console.error(errors.join("\n"));

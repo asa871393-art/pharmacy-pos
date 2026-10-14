@@ -1,7 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { addDays, daysBetween, DEFAULT_THRESHOLDS } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
-import { INVENTORY_ROLES, type Category, type InventoryBatch, type InventoryItem, type User } from "../core/types.ts";
+import type { Category, InventoryBatch, InventoryItem, User } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
 import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
@@ -40,7 +40,7 @@ function matchesFilter(i: InventoryItem, f: Filter, today: string): boolean {
 
 export function InventoryScreen({ user }: { user: User }) {
   const today = localToday();
-  const canEdit = INVENTORY_ROLES.includes(user.role);
+  const canEdit = user.permissions.modifyInventory;
   const [items, setItems] = useState<InventoryItem[] | null>(null);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -186,7 +186,7 @@ export function InventoryScreen({ user }: { user: User }) {
         <div className="cart-foot">
           {canEdit
             ? "اضغط على صنف لعرض دفعاته، واستلام دفعة جديدة، أو تصحيح الكمية بعد الجرد."
-            : "عرض فقط: تعديل المخزون للمدير والصيدلاني وأمين المخزن."}
+            : "عرض فقط: ليست لديك صلاحية تعديل المخزون."}
         </div>
       </section>
 

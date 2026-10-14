@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
   AuthStatus,
@@ -9,12 +10,14 @@ import type {
   InventoryItem,
   NewProduct,
   NewSupplier,
+  NewUser,
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
   ReceiveBatchInput,
   ReorderRow,
   ReportFilter,
+  Role,
   RxReport,
   SaleDraft,
   SaleResult,
@@ -22,6 +25,8 @@ import type {
   SearchMode,
   Supplier,
   User,
+  UserRef,
+  UserRow,
 } from "../core/types.ts";
 import type { PharmacyRepo } from "./repo.ts";
 
@@ -45,10 +50,16 @@ export const tauriRepo: PharmacyRepo = {
   suppliers: () => invoke<Supplier[]>("list_suppliers"),
   addSupplier: (supplier: NewSupplier) => invoke<Supplier>("add_supplier", { supplier }),
   postPurchaseInvoice: (invoice: PurchaseInvoice) => invoke<PurchaseResult>("post_purchase_invoice", { invoice }),
-  reportUsers: () => invoke<User[]>("report_users"),
+  reportUsers: () => invoke<UserRef[]>("report_users"),
   reportSales: (filter: ReportFilter) => invoke<SalesReport>("report_sales", { filter }),
   reportExpiry: (filter: ReportFilter, withinDays: number) => invoke<ExpiryReport>("report_expiry", { filter, withinDays }),
   reportReorder: (categoryId?: string) => invoke<ReorderRow[]>("report_reorder", { categoryId: categoryId ?? null }),
   reportPrescriptions: (filter: ReportFilter) => invoke<RxReport>("report_prescriptions", { filter }),
   saveExport: (fileName: string, content: string) => invoke<string>("save_export", { fileName, content }),
+  listUsers: () => invoke<UserRow[]>("list_users"),
+  createUser: (user: NewUser) => invoke<UserRow>("create_user", { user }),
+  updateUserRole: (userId: string, role: Role, overrides: PermissionOverrides) =>
+    invoke<UserRow>("update_user_role", { userId, role, overrides }),
+  toggleUserStatus: (userId: string, active: boolean) => invoke<UserRow>("toggle_user_status", { userId, active }),
+  resetUserPassword: (userId: string, password: string) => invoke<UserRow>("reset_user_password", { userId, password }),
 };

@@ -3,9 +3,8 @@
 
 import { addDays, availableQty, daysBetween, sellableBatches } from "../core/fefo.ts";
 import { computeTotals, settle } from "../core/totals.ts";
+import { normalizeOverrides, resolvePermissions, ROLES, type Permission, type PermissionOverrides } from "../core/permissions.ts";
 import {
-  INVENTORY_ROLES,
-  REPORT_ROLES,
   type AdjustBatchInput,
   type Batch,
   type Category,
@@ -14,6 +13,7 @@ import {
   type InventoryItem,
   type NewProduct,
   type NewSupplier,
+  type NewUser,
   type PurchaseInvoice,
   type PrescriberRow,
   type PurchaseResult,
@@ -31,6 +31,7 @@ import {
   type SearchMode,
   type Supplier,
   type User,
+  type UserRow,
   type WriteOffRow,
 } from "../core/types.ts";
 import { localToday, type PharmacyRepo } from "./repo.ts";
@@ -140,24 +141,56 @@ function seedBatches(today: string): Batch[] {
   ];
 }
 
-// Demo accounts, one per role that sells. All use DEMO_PASSWORD; the login screen shows it in demo mode.
+// Demo accounts, one per role that sells. All start with DEMO_PASSWORD; the login screen shows it in demo mode.
 export const DEMO_PASSWORD = "demo1234";
-const users: User[] = [
-  { id: "u-admin", username: "admin", fullName: "مدير النظام", role: "admin" },
-  { id: "u-pharm", username: "pharm", fullName: "الصيدلاني", role: "pharmacist" },
-  { id: "u-cash", username: "cash", fullName: "الكاشير", role: "cashier" },
+
+interface DemoUser {
+  id: string;
+  username: string;
+  fullName: string;
+  role: Role;
+  active: boolean;
+  password: string; // demo only: kept in memory as typed, never persisted
+  overrides: PermissionOverrides;
+  lastLogin: string | null;
+}
+
+const demoUser = (id: string, username: string, fullName: string, role: Role): DemoUser => ({
+  id, username, fullName, role, active: true, password: DEMO_PASSWORD, overrides: {}, lastLogin: null,
+});
+
+const users: DemoUser[] = [
+  demoUser("u-admin", "admin", "مدير النظام", "admin"),
+  demoUser("u-pharm", "pharm", "الصيدلاني", "pharmacist"),
+  demoUser("u-cash", "cash", "الكاشير", "cashier"),
 ];
+
+const toUser = (u: DemoUser): User => ({
+  id: u.id, username: u.username, fullName: u.fullName, role: u.role, permissions: resolvePermissions(u.role, u.overrides),
+});
+
+const toRow = (u: DemoUser): UserRow => ({
+  ...toUser(u), active: u.active, hasPassword: true, lastLogin: u.lastLogin, overrides: { ...u.overrides },
+});
+
+const DENIED: Record<Permission, string> = {
+  giveDiscount: "ليست لديك صلاحية لإعطاء خصم",
+  dispenseRx: "الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني",
+  viewReports: "ليست لديك صلاحية لعرض هذا التقرير",
+  modifyInventory: "ليست لديك صلاحية لتعديل المخزون",
+};
 
 // Same rules as post_sale in src-tauri/src/lib.rs.
 const MAX_DISCOUNT_PCT = 10;
 const UNLIMITED_DISCOUNT_ROLES: Role[] = ["admin", "chief_pharmacist"];
-const RX_ROLES: Role[] = ["admin", "chief_pharmacist", "pharmacist"];
 
 export function createDemoRepo(): PharmacyRepo {
   const today = localToday();
   const batches = seedBatches(today);
   let counter = 0;
-  let current: User | null = null;
+  let currentId: string | null = null;
+  // Looked up on every call, so a deactivated account stops working at once (as in the desktop app).
+  const signedIn = () => users.find((u) => u.id === currentId && u.active) ?? null;
   const postedInvoices = new Set<string>(); // supplierId|invoiceNo
   const sales: DemoSale[] = [];
   const writeOffs: DemoWriteOff[] = [];
@@ -202,21 +235,37 @@ export function createDemoRepo(): PharmacyRepo {
     };
   };
 
-  const requireRole = (roles: Role[]) => {
-    if (!current) throw new Error("سجّل الدخول أولاً");
-    if (!roles.includes(current.role)) throw new Error("ليست لديك صلاحية لعرض هذا التقرير");
+  // Same checks as require_permission / require_admin in src-tauri/src/lib.rs: any one of `perms` is enough.
+  const requirePermission = (...perms: Permission[]) => {
+    const u = signedIn();
+    if (!u) throw new Error("الحساب غير موجود أو معطّل، سجّل الدخول من جديد");
+    const p = resolvePermissions(u.role, u.overrides);
+    if (!perms.some((x) => p[x])) throw new Error(DENIED[perms[0]]);
+    return u;
+  };
+  const requireAdmin = () => {
+    const u = signedIn();
+    if (!u) throw new Error("الحساب غير موجود أو معطّل، سجّل الدخول من جديد");
+    if (u.role !== "admin") throw new Error("إدارة الموظفين للمدير فقط");
+    return u;
+  };
+  const otherActiveAdmins = (except: string) => users.filter((u) => u.role === "admin" && u.active && u.id !== except).length;
+  const userById = (id: string) => {
+    const u = users.find((x) => x.id === id);
+    if (!u) throw new Error("الموظف غير موجود");
+    return u;
+  };
+  const checkPassword = (pw: string) => {
+    if ([...pw].length < 8) throw new Error("كلمة المرور يجب ألا تقل عن 8 أحرف");
+  };
+  const checkRole = (role: string) => {
+    if (!ROLES.some((r) => r.id === role)) throw new Error("الدور غير معروف");
   };
   const checkRange = (f: ReportFilter) => {
     if (!isIsoDate(f.from) || !isIsoDate(f.to)) throw new Error("تاريخ البداية أو النهاية غير صالح");
     if (f.from > f.to) throw new Error("تاريخ البداية بعد تاريخ النهاية");
   };
 
-  // Same checks as the inventory commands in src-tauri/src/lib.rs.
-  const requireInventoryRole = () => {
-    if (!current) throw new Error("سجّل الدخول أولاً");
-    if (!INVENTORY_ROLES.includes(current.role)) throw new Error("ليست لديك صلاحية لتعديل المخزون");
-    return current;
-  };
   const productById = (id: string) => {
     const p = products.find((x) => x.id === id);
     if (!p) throw new Error("صنف غير موجود أو موقوف");
@@ -229,7 +278,7 @@ export function createDemoRepo(): PharmacyRepo {
 
   // Same rules as post_purchase_invoice in src-tauri/src/lib.rs: validate every line, then write.
   const postPurchase = (inv: PurchaseInvoice): PurchaseResult => {
-    requireInventoryRole();
+    requirePermission("modifyInventory");
     const supplier = suppliers.find((s) => s.id === inv.supplierId);
     if (!supplier) throw new Error("اختر المورد");
     const invoiceNo = inv.supplierInvoiceNo.trim();
@@ -326,19 +375,21 @@ export function createDemoRepo(): PharmacyRepo {
   return {
     kind: "demo",
     async authStatus() {
-      return { needsSetup: false, user: current };
+      const u = signedIn();
+      return { needsSetup: false, user: u ? toUser(u) : null };
     },
     async setupAdmin() {
       throw new Error("تم إعداد كلمة المرور مسبقاً، سجّل الدخول");
     },
     async login(username: string, password: string) {
-      const u = users.find((x) => x.username === username.trim());
-      if (!u || password !== DEMO_PASSWORD) throw new Error("اسم المستخدم أو كلمة المرور غير صحيحة");
-      current = u;
-      return u;
+      const u = users.find((x) => x.username === username.trim().toLowerCase() && x.active);
+      if (!u || password !== u.password) throw new Error("اسم المستخدم أو كلمة المرور غير صحيحة");
+      currentId = u.id;
+      u.lastLogin = new Date().toLocaleString("sv-SE").slice(0, 19);
+      return toUser(u);
     },
     async logout() {
-      current = null;
+      currentId = null;
     },
     async search(query: string, mode: SearchMode) {
       const tokens = query.trim().split(/\s+/).filter(Boolean).map(norm);
@@ -364,8 +415,9 @@ export function createDemoRepo(): PharmacyRepo {
       return batches.filter((b) => b.productId === productId && b.qtyOnHand > 0).map((b) => ({ ...b }));
     },
     async postSale(draft: SaleDraft): Promise<SaleResult> {
-      const user = current;
-      if (!user) throw new Error("سجّل الدخول أولاً");
+      const user = signedIn();
+      if (!user) throw new Error("الحساب غير موجود أو معطّل، سجّل الدخول من جديد");
+      const perms = resolvePermissions(user.role, user.overrides);
       if (draft.lines.length === 0) throw new Error("الفاتورة فارغة");
       let needsRx = false;
       const lines = draft.lines.map((l) => {
@@ -383,11 +435,12 @@ export function createDemoRepo(): PharmacyRepo {
       totals.invoiceDiscount = draft.invoiceDiscount;
       totals.total -= draft.invoiceDiscount;
       const discount = totals.lineDiscounts + totals.invoiceDiscount;
+      if (discount > 0 && !perms.giveDiscount) throw new Error(DENIED.giveDiscount);
       if (!UNLIMITED_DISCOUNT_ROLES.includes(user.role) && discount * 100 > totals.subtotal * MAX_DISCOUNT_PCT) {
         throw new Error(`الخصم يتجاوز الحد المسموح (${MAX_DISCOUNT_PCT}٪ من المجموع)، يحتاج موافقة المدير`);
       }
       if (needsRx) {
-        if (!RX_ROLES.includes(user.role)) throw new Error("الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني");
+        if (!perms.dispenseRx) throw new Error(DENIED.dispenseRx);
         if (!draft.prescription?.rxNo.trim() || !draft.prescription.prescriber.trim()) {
           throw new Error("الفاتورة تحتوي دواءً بوصفة طبية: أدخل رقم الوصفة واسم الطبيب");
         }
@@ -431,7 +484,7 @@ export function createDemoRepo(): PharmacyRepo {
       };
     },
     async inventory() {
-      if (!current) throw new Error("سجّل الدخول أولاً");
+      if (!signedIn()) throw new Error("سجّل الدخول أولاً");
       return products.map(toInventory).sort((a, b) => a.tradeName.localeCompare(b.tradeName));
     },
     async inventoryBatches(productId: string) {
@@ -444,7 +497,7 @@ export function createDemoRepo(): PharmacyRepo {
       return categories;
     },
     async addProduct(input: NewProduct) {
-      requireInventoryRole();
+      requirePermission("modifyInventory");
       const [name, form, strength] = [input.tradeName.trim(), input.dosageForm.trim(), input.strength.trim()];
       if (!name || !form || !strength) throw new Error("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة");
       if (!(input.price > 0)) throw new Error("سعر البيع يجب أن يكون أكبر من صفر");
@@ -477,7 +530,7 @@ export function createDemoRepo(): PharmacyRepo {
       return toInventory(p);
     },
     async receiveBatch(input: ReceiveBatchInput) {
-      requireInventoryRole();
+      requirePermission("modifyInventory");
       const batchNo = input.batchNo.trim();
       if (!batchNo) throw new Error("رقم الدفعة مطلوب");
       if (!(input.qty > 0)) throw new Error("الكمية يجب أن تكون أكبر من صفر");
@@ -501,7 +554,7 @@ export function createDemoRepo(): PharmacyRepo {
       return toInventory(p);
     },
     async adjustBatch(input: AdjustBatchInput) {
-      requireInventoryRole();
+      requirePermission("modifyInventory");
       if (!input.reason.trim()) throw new Error("سبب التعديل مطلوب");
       if (input.newQty < 0) throw new Error("الكمية لا تكون سالبة");
       const b = batches.find((x) => x.id === input.batchId);
@@ -515,18 +568,18 @@ export function createDemoRepo(): PharmacyRepo {
           qty: b.qtyOnHand - input.newQty,
           unitCost: b.unitCost,
           reason: input.reason.trim(),
-          userId: current!.id,
+          userId: signedIn()!.id,
         });
       }
       b.qtyOnHand = input.newQty;
       return toInventory(productById(b.productId));
     },
     async suppliers() {
-      if (!current) throw new Error("سجّل الدخول أولاً");
+      if (!signedIn()) throw new Error("سجّل الدخول أولاً");
       return [...suppliers].sort((a, b) => a.name.localeCompare(b.name));
     },
     async addSupplier(input: NewSupplier) {
-      requireInventoryRole();
+      requirePermission("modifyInventory");
       const name = input.name.trim();
       if (!name) throw new Error("اسم المورد مطلوب");
       const terms = input.paymentTermsDays ?? 30;
@@ -542,11 +595,11 @@ export function createDemoRepo(): PharmacyRepo {
 
     // Reports: same definitions as the report_* commands in src-tauri/src/lib.rs.
     async reportUsers() {
-      requireRole(REPORT_ROLES);
-      return [...users].sort((a, b) => a.fullName.localeCompare(b.fullName));
+      requirePermission("viewReports");
+      return users.map((u) => ({ id: u.id, fullName: u.fullName })).sort((a, b) => a.fullName.localeCompare(b.fullName));
     },
     async reportSales(f: ReportFilter): Promise<SalesReport> {
-      requireRole(REPORT_ROLES);
+      requirePermission("viewReports");
       checkRange(f);
       // One row per sale line; the invoice discount is shared over the sale's lines by value.
       const items = sales
@@ -602,7 +655,7 @@ export function createDemoRepo(): PharmacyRepo {
       };
     },
     async reportExpiry(f: ReportFilter, withinDays: number): Promise<ExpiryReport> {
-      requireRole(INVENTORY_ROLES);
+      requirePermission("modifyInventory", "viewReports");
       checkRange(f);
       if (!(withinDays >= 0 && withinDays <= 730)) throw new Error("مدة التنبيه بين ٠ و٧٣٠ يوماً");
       const horizon = addDays(today, withinDays);
@@ -651,7 +704,7 @@ export function createDemoRepo(): PharmacyRepo {
       };
     },
     async reportReorder(categoryId?: string): Promise<ReorderRow[]> {
-      requireRole(INVENTORY_ROLES);
+      requirePermission("modifyInventory", "viewReports");
       const monthAgo = addDays(today, -30);
       return products
         .filter((p) => !categoryId || categoryOf(p) === categoryId)
@@ -689,7 +742,7 @@ export function createDemoRepo(): PharmacyRepo {
         );
     },
     async reportPrescriptions(f: ReportFilter): Promise<RxReport> {
-      requireRole(REPORT_ROLES);
+      requirePermission("viewReports");
       checkRange(f);
       const rows: RxRow[] = sales
         .filter((s) => s.prescription && s.day >= f.from && s.day <= f.to && (!f.cashierId || s.cashierId === f.cashierId))
@@ -730,6 +783,60 @@ export function createDemoRepo(): PharmacyRepo {
       a.click();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
       return `مجلد التنزيلات (${fileName})`;
+    },
+
+    // Employees: same rules as the user commands in src-tauri/src/lib.rs.
+    async listUsers() {
+      requireAdmin();
+      return [...users]
+        .sort((a, b) => Number(b.active) - Number(a.active) || a.fullName.localeCompare(b.fullName))
+        .map(toRow);
+    },
+    async createUser(input: NewUser) {
+      requireAdmin();
+      const username = input.username.trim().toLowerCase();
+      if (!/^[a-z0-9._-]{3,32}$/.test(username)) throw new Error("اسم المستخدم من ٣ إلى ٣٢ حرفاً لاتينياً صغيراً أو رقماً أو . _ -");
+      const fullName = input.fullName.trim();
+      if (!fullName || [...fullName].length > 80) throw new Error("الاسم الكامل مطلوب (حتى ٨٠ حرفاً)");
+      checkRole(input.role);
+      checkPassword(input.password);
+      if (users.some((u) => u.username === username)) throw new Error(`اسم المستخدم ${username} مستخدم مسبقاً`);
+      const u: DemoUser = {
+        ...demoUser(`u-demo-${Date.now()}`, username, fullName, input.role),
+        password: input.password,
+        overrides: normalizeOverrides(input.role, input.overrides ?? {}),
+      };
+      users.push(u);
+      return toRow(u);
+    },
+    async updateUserRole(userId: string, role: Role, overrides: PermissionOverrides) {
+      const me = requireAdmin();
+      checkRole(role);
+      const u = userById(userId);
+      if (u.role === "admin" && role !== "admin") {
+        if (u.id === me.id) throw new Error("لا يمكنك إزالة صلاحية المدير عن حسابك");
+        if (u.active && otherActiveAdmins(u.id) === 0) throw new Error("يجب أن يبقى مدير واحد نشط على الأقل");
+      }
+      u.role = role;
+      u.overrides = normalizeOverrides(role, overrides);
+      return toRow(u);
+    },
+    async toggleUserStatus(userId: string, active: boolean) {
+      const me = requireAdmin();
+      const u = userById(userId);
+      if (!active) {
+        if (u.id === me.id) throw new Error("لا يمكنك تعطيل حسابك");
+        if (u.role === "admin" && otherActiveAdmins(u.id) === 0) throw new Error("يجب أن يبقى مدير واحد نشط على الأقل");
+      }
+      u.active = active;
+      return toRow(u);
+    },
+    async resetUserPassword(userId: string, password: string) {
+      requireAdmin();
+      checkPassword(password);
+      const u = userById(userId);
+      u.password = password;
+      return toRow(u);
     },
   };
 }

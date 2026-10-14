@@ -1,3 +1,4 @@
+import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
   AuthStatus,
@@ -8,12 +9,14 @@ import type {
   InventoryItem,
   NewProduct,
   NewSupplier,
+  NewUser,
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
   ReceiveBatchInput,
   ReorderRow,
   ReportFilter,
+  Role,
   RxReport,
   SaleDraft,
   SaleResult,
@@ -21,6 +24,8 @@ import type {
   SearchMode,
   Supplier,
   User,
+  UserRef,
+  UserRow,
 } from "../core/types.ts";
 
 /** Everything the screens need from storage. Two implementations: SQLite in the desktop app, memory in the browser demo. */
@@ -41,7 +46,7 @@ export interface PharmacyRepo {
   /** All batches still holding stock, expired ones included, in FEFO order. */
   inventoryBatches(productId: string): Promise<InventoryBatch[]>;
   categories(): Promise<Category[]>;
-  // Inventory writes need an INVENTORY_ROLES user; each returns the product's updated row.
+  // Inventory writes need the modifyInventory permission; each returns the product's updated row.
   addProduct(product: NewProduct): Promise<InventoryItem>;
   receiveBatch(batch: ReceiveBatchInput): Promise<InventoryItem>;
   adjustBatch(adjustment: AdjustBatchInput): Promise<InventoryItem>;
@@ -49,14 +54,22 @@ export interface PharmacyRepo {
   addSupplier(supplier: NewSupplier): Promise<Supplier>;
   /** Posts a supplier invoice in one transaction; its stock is sellable at once. */
   postPurchaseInvoice(invoice: PurchaseInvoice): Promise<PurchaseResult>;
-  // Reports (read-only). Money and prescription reports need REPORT_ROLES; stock reports INVENTORY_ROLES.
-  reportUsers(): Promise<User[]>;
+  // Reports (read-only). Money and prescription reports need viewReports; stock reports modifyInventory or viewReports.
+  reportUsers(): Promise<UserRef[]>;
   reportSales(filter: ReportFilter): Promise<SalesReport>;
   reportExpiry(filter: ReportFilter, withinDays: number): Promise<ExpiryReport>;
   reportReorder(categoryId?: string): Promise<ReorderRow[]>;
   reportPrescriptions(filter: ReportFilter): Promise<RxReport>;
   /** Saves an exported file for the user; returns where it went. */
   saveExport(fileName: string, content: string): Promise<string>;
+  // Employees (admin only). Each change returns the updated row.
+  listUsers(): Promise<UserRow[]>;
+  createUser(user: NewUser): Promise<UserRow>;
+  /** Sets the role and the per-user permission overrides together. */
+  updateUserRole(userId: string, role: Role, overrides: PermissionOverrides): Promise<UserRow>;
+  /** Sets the account active or inactive (the wanted state, not a flip). */
+  toggleUserStatus(userId: string, active: boolean): Promise<UserRow>;
+  resetUserPassword(userId: string, password: string): Promise<UserRow>;
 }
 
 export function localToday(): string {

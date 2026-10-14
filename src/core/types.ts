@@ -1,5 +1,7 @@
 // Shared domain types. Money is integer dinars; dates are 'YYYY-MM-DD'.
 
+import type { PermissionOverrides, Permissions } from "./permissions.ts";
+
 export type SearchMode = "trade" | "generic" | "alternatives";
 
 export interface ProductHit {
@@ -68,6 +70,30 @@ export interface User {
   username: string;
   fullName: string;
   role: Role;
+  /** Effective permissions at sign-in: role defaults with any per-user overrides. The backend re-checks each call. */
+  permissions: Permissions;
+}
+
+/** For pick lists such as the report's cashier filter. */
+export interface UserRef {
+  id: string;
+  fullName: string;
+}
+
+/** A row of the employees screen (admin only). */
+export interface UserRow extends User {
+  active: boolean;
+  hasPassword: boolean;
+  lastLogin: string | null; // local "YYYY-MM-DD HH:MM:SS"
+  overrides: PermissionOverrides;
+}
+
+export interface NewUser {
+  username: string;
+  fullName: string;
+  password: string;
+  role: Role;
+  overrides?: PermissionOverrides;
 }
 
 export interface AuthStatus {
@@ -86,9 +112,6 @@ export interface SaleResult {
 }
 
 // ── Inventory ──
-
-/** Roles allowed to add products and change stock; every signed-in user may view inventory. */
-export const INVENTORY_ROLES: Role[] = ["admin", "chief_pharmacist", "pharmacist", "storekeeper"];
 
 export interface InventoryItem {
   id: string;
@@ -201,9 +224,6 @@ export interface PurchaseResult {
 }
 
 // ── Reports ──
-
-/** Roles that see sales, profit and prescription reports. Stock reports follow INVENTORY_ROLES. */
-export const REPORT_ROLES: Role[] = ["admin", "chief_pharmacist"];
 
 /** Local calendar days, both ends included. */
 export interface ReportFilter {

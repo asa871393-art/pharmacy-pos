@@ -2,14 +2,7 @@ import { useEffect, useRef, useState, type FormEvent, type KeyboardEvent as Reac
 import { addDays } from "../core/fefo.ts";
 import { gtinLookupKeys, looksLikeScan, parseScan } from "../core/gs1.ts";
 import { formatIqd } from "../core/totals.ts";
-import {
-  INVENTORY_ROLES,
-  type ProductHit,
-  type PurchasePayment,
-  type PurchaseResult,
-  type Supplier,
-  type User,
-} from "../core/types.ts";
+import type { ProductHit, PurchasePayment, PurchaseResult, Supplier, User } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
 import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
@@ -46,7 +39,7 @@ function lineProblem(l: Line, today: string): string {
 
 export function PurchasingScreen({ user }: { user: User }) {
   const today = localToday();
-  const canPost = INVENTORY_ROLES.includes(user.role);
+  const canPost = user.permissions.modifyInventory;
 
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [supplierId, setSupplierId] = useState("");
@@ -208,7 +201,7 @@ export function PurchasingScreen({ user }: { user: User }) {
           <div className="inv-head">
             <h2>المشتريات</h2>
           </div>
-          <p className="empty-note">إدخال فواتير الشراء للمدير والصيدلاني وأمين المخزن فقط.</p>
+          <p className="empty-note">إدخال فواتير الشراء يتطلب صلاحية تعديل المخزون.</p>
         </section>
       </main>
     );

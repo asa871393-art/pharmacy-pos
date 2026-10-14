@@ -1,27 +1,22 @@
 import { useEffect, useState } from "react";
 import { Login } from "./auth/Login.tsx";
-import type { AuthStatus, Role, User } from "./core/types.ts";
+import { ROLE_LABEL } from "./core/permissions.ts";
+import type { AuthStatus, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
 import { InventoryScreen } from "./inventory/InventoryScreen.tsx";
 import { PosScreen } from "./pos/PosScreen.tsx";
 import { PurchasingScreen } from "./purchasing/PurchasingScreen.tsx";
 import { ReportsScreen } from "./reports/ReportsScreen.tsx";
+import { UsersScreen } from "./users/UsersScreen.tsx";
 
-const ROLE_LABEL: Record<Role, string> = {
-  admin: "مدير",
-  chief_pharmacist: "صيدلاني مسؤول",
-  pharmacist: "صيدلاني",
-  cashier: "كاشير",
-  storekeeper: "أمين مخزن",
-};
+type View = "pos" | "inventory" | "purchasing" | "reports" | "users";
 
-type View = "pos" | "inventory" | "purchasing" | "reports";
-
-const VIEWS: { id: View; label: string }[] = [
+const VIEWS: { id: View; label: string; adminOnly?: boolean }[] = [
   { id: "pos", label: "نقطة البيع" },
   { id: "inventory", label: "المخزون" },
   { id: "purchasing", label: "المشتريات" },
   { id: "reports", label: "التقارير" },
+  { id: "users", label: "الموظفين", adminOnly: true },
 ];
 
 export function App() {
@@ -40,6 +35,7 @@ export function App() {
   }
 
   const user = auth.user;
+  const isAdmin = user.role === "admin";
   async function logout() {
     await repo.logout();
     setAuth({ needsSetup: false, user: null });
@@ -52,7 +48,7 @@ export function App() {
         <div className="topbar-start">
           <strong className="brand">نظام الصيدلية</strong>
           <nav aria-label="الوحدات" className="modules">
-            {VIEWS.map((v) => (
+            {VIEWS.filter((v) => !v.adminOnly || isAdmin).map((v) => (
               <button
                 key={v.id}
                 type="button"
@@ -81,7 +77,7 @@ export function App() {
       {/* POS, Purchasing and Reports stay mounted while hidden, so a half-built sale, an invoice or report filters
           survive switching screens. Inventory reloads each time it opens; Reports reloads each time it is shown. */}
       <div className="view" hidden={view !== "pos"}>
-        <PosScreen key={user.id} visible={view === "pos"} />
+        <PosScreen key={user.id} visible={view === "pos"} canDiscount={user.permissions.giveDiscount} />
       </div>
       {view === "inventory" && <InventoryScreen key={user.id} user={user} />}
       <div className="view" hidden={view !== "purchasing"}>
@@ -90,6 +86,8 @@ export function App() {
       <div className="view" hidden={view !== "reports"}>
         <ReportsScreen key={user.id} user={user} visible={view === "reports"} />
       </div>
+      {/* Only rendered for an admin; the user commands also refuse anyone else. */}
+      {view === "users" && isAdmin && <UsersScreen key={user.id} me={user} />}
     </div>
   );
 }

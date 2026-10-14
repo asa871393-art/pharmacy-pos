@@ -275,3 +275,24 @@ button.module:hover:not(.active) { background: #24413b; color: #fff; }
   .rep-print-head h1 { font-size: 16pt; margin: 0 0 4px; }
   .rep-print-head { font-size: 10pt; color: #333; border-bottom: 1px solid #999; padding-bottom: 6px; }
 }
+
+/* ── Employees ── */
+.users-table tr.inactive td { color: var(--muted); }
+.users-table td .tag { margin-inline-start: 6px; }
+.users-table .tags .tag { margin: 0; }
+.tag.custom { outline: 1px dashed currentColor; outline-offset: -1px; }
+.row-actions { display: flex; flex-wrap: wrap; gap: 4px 0; }
+.row-actions .link-btn { padding: 0 8px; }
+.link-btn:disabled { color: var(--muted); }
+.link-btn.danger { color: var(--bad); }
+.link-btn.danger:disabled { color: var(--muted); }
+.btn.danger { border-color: var(--bad); background: var(--bad); color: #fff; }
+.access-editor { display: flex; flex-direction: column; gap: 10px; }
+.access-editor .form-field { max-width: 280px; }
+.perm-list { border: 1px solid var(--line); border-radius: 10px; padding: 4px 12px; margin: 0; }
+.perm-list legend { padding: 0 6px; }
+.perm-row { display: grid; grid-template-columns: 1fr auto 64px; align-items: center; gap: 12px; padding: 8px 0; border-bottom: 1px solid var(--line-soft); }
+.perm-row:last-child { border-bottom: 0; }
+.perm-row .tag { justify-self: start; }
+.small-seg { height: 34px; }
+.small-seg .seg-btn { padding: 0 10px; font-size: 13px; white-space: nowrap; }

@@ -18,6 +18,7 @@ pub struct Session(pub Mutex<Option<String>>);
 
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 const SALE_CONTROLS_SQL: &str = include_str!("../migrations/0002_sale_controls.sql");
+const USER_PERMISSIONS_SQL: &str = include_str!("../migrations/0003_user_permissions.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -34,6 +35,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(SALE_CONTROLS_SQL)?;
         tx.execute_batch("PRAGMA user_version = 2;")?;
+        tx.commit()?;
+    }
+    if version < 3 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(USER_PERMISSIONS_SQL)?;
+        tx.execute_batch("PRAGMA user_version = 3;")?;
         tx.commit()?;
     }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
@@ -132,6 +139,139 @@ pub struct UserDto {
     username: String,
     full_name: String,
     role: String,
+    /// What this user may do: the role's defaults with any per-user overrides applied.
+    permissions: Permissions,
+}
+
+// ── Roles and permissions ──
+
+const ROLES: [&str; 5] = ["admin", "chief_pharmacist", "pharmacist", "cashier", "storekeeper"];
+
+/// Permissions that can be granted or denied per user. Every check in this file goes through `has_permission`.
+const PERMISSIONS: [&str; 4] = ["give_discount", "dispense_rx", "view_reports", "modify_inventory"];
+
+/// What each role may do when the user has no override.
+fn role_default(role: &str, permission: &str) -> bool {
+    match permission {
+        // Within the max_discount_pct ceiling, except admin and chief pharmacist (see post_sale).
+        "give_discount" => matches!(role, "admin" | "chief_pharmacist" | "pharmacist" | "cashier"),
+        "dispense_rx" => matches!(role, "admin" | "chief_pharmacist" | "pharmacist"),
+        // Sales, profit and prescription reports.
+        "view_reports" => matches!(role, "admin" | "chief_pharmacist"),
+        // Products, stock, purchasing and suppliers.
+        "modify_inventory" => matches!(role, "admin" | "chief_pharmacist" | "pharmacist" | "storekeeper"),
+        _ => false,
+    }
+}
+
+#[derive(Serialize, Debug, Clone, Copy, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Permissions {
+    give_discount: bool,
+    dispense_rx: bool,
+    view_reports: bool,
+    modify_inventory: bool,
+}
+
+/// Per-user overrides: Some(true) grants, Some(false) denies, None follows the role.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PermissionOverrides {
+    give_discount: Option<bool>,
+    dispense_rx: Option<bool>,
+    view_reports: Option<bool>,
+    modify_inventory: Option<bool>,
+}
+
+impl PermissionOverrides {
+    fn get(&self, permission: &str) -> Option<bool> {
+        match permission {
+            "give_discount" => self.give_discount,
+            "dispense_rx" => self.dispense_rx,
+            "view_reports" => self.view_reports,
+            "modify_inventory" => self.modify_inventory,
+            _ => None,
+        }
+    }
+
+    fn set(&mut self, permission: &str, value: Option<bool>) {
+        match permission {
+            "give_discount" => self.give_discount = value,
+            "dispense_rx" => self.dispense_rx = value,
+            "view_reports" => self.view_reports = value,
+            "modify_inventory" => self.modify_inventory = value,
+            _ => {}
+        }
+    }
+}
+
+fn load_overrides(conn: &Connection, user_id: &str) -> Result<PermissionOverrides, String> {
+    let mut o = PermissionOverrides::default();
+    let mut stmt = conn.prepare("SELECT permission, granted FROM user_permissions WHERE user_id = ?1").map_err(err)?;
+    let rows = stmt
+        .query_map(params![user_id], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? != 0)))
+        .map_err(err)?;
+    for row in rows {
+        let (p, granted) = row.map_err(err)?;
+        o.set(&p, Some(granted));
+    }
+    Ok(o)
+}
+
+/// Admins always have every permission; anyone else gets the override if there is one, else the role's default.
+fn resolve(role: &str, overrides: &PermissionOverrides, permission: &str) -> bool {
+    role == "admin" || overrides.get(permission).unwrap_or_else(|| role_default(role, permission))
+}
+
+fn effective_permissions(conn: &Connection, user_id: &str, role: &str) -> Result<Permissions, String> {
+    let o = load_overrides(conn, user_id)?;
+    Ok(Permissions {
+        give_discount: resolve(role, &o, "give_discount"),
+        dispense_rx: resolve(role, &o, "dispense_rx"),
+        view_reports: resolve(role, &o, "view_reports"),
+        modify_inventory: resolve(role, &o, "modify_inventory"),
+    })
+}
+
+fn has_permission(conn: &Connection, user_id: &str, role: &str, permission: &str) -> Result<bool, String> {
+    Ok(resolve(role, &load_overrides(conn, user_id)?, permission))
+}
+
+/// Role of an active account, read from the database on every call so a disabled account stops working at once.
+fn active_role(conn: &Connection, user_id: &str) -> Result<String, String> {
+    conn.query_row("SELECT role FROM users WHERE id = ?1 AND is_active = 1", params![user_id], |r| r.get(0))
+        .optional()
+        .map_err(err)?
+        .ok_or_else(|| "الحساب غير موجود أو معطّل، سجّل الدخول من جديد".to_string())
+}
+
+fn denied_message(permission: &str) -> &'static str {
+    match permission {
+        "give_discount" => "ليست لديك صلاحية لإعطاء خصم",
+        "dispense_rx" => "الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني",
+        "view_reports" => "ليست لديك صلاحية لعرض هذا التقرير",
+        "modify_inventory" => "ليست لديك صلاحية لتعديل المخزون",
+        _ => "ليست لديك صلاحية",
+    }
+}
+
+/// Fails unless the account is active and holds at least one of `permissions`. Returns the role.
+fn require_permission(conn: &Connection, user_id: &str, permissions: &[&str]) -> Result<String, String> {
+    let role = active_role(conn, user_id)?;
+    let o = load_overrides(conn, user_id)?;
+    if permissions.iter().any(|p| resolve(&role, &o, p)) {
+        Ok(role)
+    } else {
+        Err(denied_message(permissions[0]).into())
+    }
+}
+
+/// User management is for the admin role only; it cannot be granted by an override.
+fn require_admin(conn: &Connection, user_id: &str) -> Result<(), String> {
+    if active_role(conn, user_id)? != "admin" {
+        return Err("إدارة الموظفين للمدير فقط".into());
+    }
+    Ok(())
 }
 
 #[derive(Serialize)]
@@ -334,13 +474,21 @@ fn verify_password(password: &str, stored: &str) -> bool {
 }
 
 fn active_user(conn: &Connection, user_id: &str) -> Result<Option<UserDto>, String> {
-    conn.query_row(
-        "SELECT id, username, full_name, role FROM users WHERE id = ?1 AND is_active = 1",
-        params![user_id],
-        |r| Ok(UserDto { id: r.get(0)?, username: r.get(1)?, full_name: r.get(2)?, role: r.get(3)? }),
-    )
-    .optional()
-    .map_err(err)
+    let found: Option<(String, String, String, String)> = conn
+        .query_row(
+            "SELECT id, username, full_name, role FROM users WHERE id = ?1 AND is_active = 1",
+            params![user_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()
+        .map_err(err)?;
+    match found {
+        Some((id, username, full_name, role)) => {
+            let permissions = effective_permissions(conn, &id, &role)?;
+            Ok(Some(UserDto { id, username, full_name, role, permissions }))
+        }
+        None => Ok(None),
+    }
 }
 
 /// No active user has a password yet: a fresh install, before the admin has chosen one.
@@ -440,10 +588,8 @@ fn logout(session: State<'_, Session>) -> Result<(), String> {
 
 // ── Sale rules ──
 
-/// Roles that may give any discount; everyone else is held to the `max_discount_pct` setting.
+/// Roles that may give any discount; everyone else with `give_discount` is held to the `max_discount_pct` setting.
 const UNLIMITED_DISCOUNT_ROLES: [&str; 2] = ["admin", "chief_pharmacist"];
-/// Roles allowed to dispense prescription-only medicines.
-const RX_ROLES: [&str; 3] = ["admin", "chief_pharmacist", "pharmacist"];
 
 #[tauri::command]
 fn post_sale(db: State<'_, Db>, session: State<'_, Session>, draft: SaleDraft) -> Result<SaleResult, String> {
@@ -459,11 +605,7 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
     let tx = conn.transaction().map_err(err)?;
 
     // The role is read from the database inside the transaction, so a disabled account cannot keep selling.
-    let role: String = tx
-        .query_row("SELECT role FROM users WHERE id = ?1 AND is_active = 1", params![user_id], |r| r.get(0))
-        .optional()
-        .map_err(err)?
-        .ok_or("الحساب غير موجود أو معطّل، سجّل الدخول من جديد")?;
+    let role = active_role(&tx, user_id)?;
 
     // Totals are recomputed here from database prices; the screen's numbers are only checked, never used.
     let mut subtotal = 0i64;
@@ -501,6 +643,9 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
     let invoice_discount = draft.invoice_discount;
     let total = after_lines - invoice_discount;
 
+    if line_discounts + invoice_discount > 0 && !has_permission(&tx, user_id, &role, "give_discount")? {
+        return Err(denied_message("give_discount").into());
+    }
     if !UNLIMITED_DISCOUNT_ROLES.contains(&role.as_str()) {
         let max_pct: i64 = tx
             .query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0))
@@ -513,8 +658,8 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
     }
 
     let prescription = if needs_rx {
-        if !RX_ROLES.contains(&role.as_str()) {
-            return Err("الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني".into());
+        if !has_permission(&tx, user_id, &role, "dispense_rx")? {
+            return Err(denied_message("dispense_rx").into());
         }
         let rx = draft.prescription.as_ref().map(|p| (p.rx_no.trim(), p.prescriber.trim()));
         match rx {
@@ -701,24 +846,8 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
 
 // ── Inventory ──
 
-/// Roles allowed to create products and change stock. Every signed-in user may view inventory.
-const INVENTORY_ROLES: [&str; 4] = ["admin", "chief_pharmacist", "pharmacist", "storekeeper"];
-
 fn session_user(session: &State<'_, Session>) -> Result<String, String> {
     session.0.lock().map_err(err)?.clone().ok_or_else(|| "سجّل الدخول أولاً".to_string())
-}
-
-/// The user's role, read from the database; fails if the account is disabled or the role is not in `allowed`.
-fn require_role(conn: &Connection, user_id: &str, allowed: &[&str]) -> Result<String, String> {
-    let role: String = conn
-        .query_row("SELECT role FROM users WHERE id = ?1 AND is_active = 1", params![user_id], |r| r.get(0))
-        .optional()
-        .map_err(err)?
-        .ok_or("الحساب غير موجود أو معطّل، سجّل الدخول من جديد")?;
-    if !allowed.contains(&role.as_str()) {
-        return Err("ليست لديك صلاحية لتعديل المخزون".into());
-    }
-    Ok(role)
 }
 
 /// True when `d` is a real calendar date written as YYYY-MM-DD.
@@ -884,7 +1013,7 @@ fn non_empty(s: &Option<String>) -> Option<String> {
 
 fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Result<InventoryItem, String> {
     let tx = conn.transaction().map_err(err)?;
-    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
     let (name, form, strength) = (p.trade_name.trim(), p.dosage_form.trim(), p.strength.trim());
     if name.is_empty() || form.is_empty() || strength.is_empty() {
         return Err("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة".into());
@@ -972,7 +1101,7 @@ pub struct ReceiveBatch {
 /// Adds stock as a new batch (goods received without a purchase invoice).
 fn receive_batch_inner(conn: &mut Connection, user_id: &str, b: ReceiveBatch) -> Result<InventoryItem, String> {
     let tx = conn.transaction().map_err(err)?;
-    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
     let batch_no = b.batch_no.trim();
     if batch_no.is_empty() {
         return Err("رقم الدفعة مطلوب".into());
@@ -1051,7 +1180,7 @@ pub struct AdjustBatch {
 /// Stock count correction: sets a batch to the counted quantity and records the difference as an 'adjust' movement.
 fn adjust_batch_inner(conn: &mut Connection, user_id: &str, a: AdjustBatch) -> Result<InventoryItem, String> {
     let tx = conn.transaction().map_err(err)?;
-    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
     let reason = a.reason.trim();
     if reason.is_empty() {
         return Err("سبب التعديل مطلوب".into());
@@ -1131,7 +1260,7 @@ pub struct NewSupplier {
 
 fn add_supplier_inner(conn: &mut Connection, user_id: &str, s: NewSupplier) -> Result<Supplier, String> {
     let tx = conn.transaction().map_err(err)?;
-    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
     let name = s.name.trim();
     if name.is_empty() {
         return Err("اسم المورد مطلوب".into());
@@ -1212,7 +1341,7 @@ pub struct PurchaseResult {
 /// Stock posted here is sellable immediately: post_sale draws from the same batches in FEFO order.
 fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoiceIn) -> Result<PurchaseResult, String> {
     let tx = conn.transaction().map_err(err)?;
-    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
 
     let (supplier_name, terms): (String, i64) = tx
         .query_row("SELECT name, payment_terms_days FROM suppliers WHERE id = ?1", params![inv.supplier_id], |r| {
@@ -1486,10 +1615,9 @@ fn post_purchase_invoice(
 }
 
 // ── Reports ──
-// All read-only. Sales, profit and prescription reports are for managers; stock reports for anyone who manages stock.
+// All read-only. Sales, profit and prescription reports need `view_reports`; stock reports `modify_inventory` or
+// `view_reports`.
 // Dates in filters are local calendar days (YYYY-MM-DD), both ends included.
-
-const REPORT_ROLES: [&str; 2] = ["admin", "chief_pharmacist"];
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1510,16 +1638,21 @@ fn check_range(conn: &Connection, f: &ReportFilter) -> Result<(), String> {
     Ok(())
 }
 
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRef {
+    id: String,
+    full_name: String,
+}
+
 /// Users who can appear in a report filter (everyone who has sold, active or not).
 #[tauri::command]
-fn report_users(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<UserDto>, String> {
+fn report_users(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<UserRef>, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
-    require_role(&conn, &user_id, &REPORT_ROLES)?;
-    let mut stmt = conn.prepare("SELECT id, username, full_name, role FROM users ORDER BY full_name").map_err(err)?;
-    let rows = stmt
-        .query_map([], |r| Ok(UserDto { id: r.get(0)?, username: r.get(1)?, full_name: r.get(2)?, role: r.get(3)? }))
-        .map_err(err)?;
+    require_permission(&conn, &user_id, &["view_reports"])?;
+    let mut stmt = conn.prepare("SELECT id, full_name FROM users ORDER BY full_name").map_err(err)?;
+    let rows = stmt.query_map([], |r| Ok(UserRef { id: r.get(0)?, full_name: r.get(1)? })).map_err(err)?;
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 
@@ -1644,7 +1777,7 @@ fn report_sales_inner(conn: &Connection, f: &ReportFilter) -> Result<SalesReport
 fn report_sales(db: State<'_, Db>, session: State<'_, Session>, filter: ReportFilter) -> Result<SalesReport, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
-    require_role(&conn, &user_id, &REPORT_ROLES)?;
+    require_permission(&conn, &user_id, &["view_reports"])?;
     report_sales_inner(&conn, &filter)
 }
 
@@ -1778,7 +1911,7 @@ fn report_expiry(
 ) -> Result<ExpiryReport, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
-    require_role(&conn, &user_id, &INVENTORY_ROLES)?;
+    require_permission(&conn, &user_id, &["modify_inventory", "view_reports"])?;
     report_expiry_inner(&conn, &filter, within_days)
 }
 
@@ -1861,7 +1994,7 @@ fn report_reorder(
 ) -> Result<Vec<ReorderRow>, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
-    require_role(&conn, &user_id, &INVENTORY_ROLES)?;
+    require_permission(&conn, &user_id, &["modify_inventory", "view_reports"])?;
     report_reorder_inner(&conn, category_id.as_deref())
 }
 
@@ -1952,7 +2085,7 @@ fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxR
 fn report_prescriptions(db: State<'_, Db>, session: State<'_, Session>, filter: ReportFilter) -> Result<RxReport, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
-    require_role(&conn, &user_id, &REPORT_ROLES)?;
+    require_permission(&conn, &user_id, &["view_reports"])?;
     report_prescriptions_inner(&conn, &filter)
 }
 
@@ -1986,6 +2119,284 @@ fn save_export(
     }
     std::fs::write(&path, content).map_err(err)?;
     Ok(path.display().to_string())
+}
+
+// ── Employees ──
+// Admin only. Passwords are stored as Argon2 hashes and never leave this file; every change is audit-logged.
+// Safety rules: an admin cannot disable or demote themselves, and the last active admin cannot be removed.
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserRow {
+    id: String,
+    username: String,
+    full_name: String,
+    role: String,
+    active: bool,
+    has_password: bool,
+    last_login: Option<String>,
+    overrides: PermissionOverrides,
+    permissions: Permissions,
+}
+
+fn user_rows(conn: &Connection, only_id: Option<&str>) -> Result<Vec<UserRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT u.id, u.username, u.full_name, u.role, u.is_active, u.password_hash IS NOT NULL,
+                    (SELECT datetime(MAX(a.occurred_at), 'localtime') FROM audit_log a
+                      WHERE a.action = 'user.login' AND a.user_id = u.id)
+             FROM users u WHERE (?1 IS NULL OR u.id = ?1)
+             ORDER BY u.is_active DESC, u.full_name",
+        )
+        .map_err(err)?;
+    let base = stmt
+        .query_map(params![only_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)? != 0,
+                r.get::<_, bool>(5)?,
+                r.get::<_, Option<String>>(6)?,
+            ))
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    base.into_iter()
+        .map(|(id, username, full_name, role, active, has_password, last_login)| {
+            let overrides = load_overrides(conn, &id)?;
+            let permissions = effective_permissions(conn, &id, &role)?;
+            Ok(UserRow { id, username, full_name, role, active, has_password, last_login, overrides, permissions })
+        })
+        .collect()
+}
+
+fn user_row(conn: &Connection, id: &str) -> Result<UserRow, String> {
+    user_rows(conn, Some(id))?.pop().ok_or_else(|| "الموظف غير موجود".to_string())
+}
+
+fn check_password(password: &str) -> Result<(), String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!("كلمة المرور يجب ألا تقل عن {MIN_PASSWORD_LEN} أحرف"));
+    }
+    Ok(())
+}
+
+fn check_role(role: &str) -> Result<(), String> {
+    if !ROLES.contains(&role) {
+        return Err("الدور غير معروف".into());
+    }
+    Ok(())
+}
+
+/// Replaces a user's overrides. Admins have every permission, so they never keep overrides.
+fn write_overrides(conn: &Connection, user_id: &str, role: &str, o: &PermissionOverrides) -> Result<(), String> {
+    conn.execute("DELETE FROM user_permissions WHERE user_id = ?1", params![user_id]).map_err(err)?;
+    if role == "admin" {
+        return Ok(());
+    }
+    for p in PERMISSIONS {
+        // An override equal to the role's default changes nothing; store only real exceptions.
+        if let Some(granted) = o.get(p).filter(|g| *g != role_default(role, p)) {
+            conn.execute(
+                "INSERT INTO user_permissions(user_id, permission, granted) VALUES (?1, ?2, ?3)",
+                params![user_id, p, granted],
+            )
+            .map_err(err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Active admins other than `except` that can sign in.
+fn other_active_admins(conn: &Connection, except: &str) -> Result<i64, String> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM users WHERE role = 'admin' AND is_active = 1 AND password_hash IS NOT NULL AND id != ?1",
+        params![except],
+        |r| r.get(0),
+    )
+    .map_err(err)
+}
+
+fn list_users_inner(conn: &Connection, admin_id: &str) -> Result<Vec<UserRow>, String> {
+    require_admin(conn, admin_id)?;
+    user_rows(conn, None)
+}
+
+#[tauri::command]
+fn list_users(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<UserRow>, String> {
+    let admin_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    list_users_inner(&conn, &admin_id)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewUser {
+    username: String,
+    full_name: String,
+    password: String,
+    role: String,
+    #[serde(default)]
+    overrides: PermissionOverrides,
+}
+
+fn create_user_inner(conn: &mut Connection, admin_id: &str, u: NewUser) -> Result<UserRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_admin(&tx, admin_id)?;
+    let username = u.username.trim().to_lowercase();
+    let valid = (3..=32).contains(&username.len())
+        && username.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-'));
+    if !valid {
+        return Err("اسم المستخدم من ٣ إلى ٣٢ حرفاً لاتينياً صغيراً أو رقماً أو . _ -".into());
+    }
+    let full_name = u.full_name.trim();
+    if full_name.is_empty() || full_name.chars().count() > 80 {
+        return Err("الاسم الكامل مطلوب (حتى ٨٠ حرفاً)".into());
+    }
+    check_role(&u.role)?;
+    check_password(&u.password)?;
+    let taken: bool = tx
+        .query_row("SELECT EXISTS (SELECT 1 FROM users WHERE username = ?1 COLLATE NOCASE)", params![username], |r| {
+            r.get(0)
+        })
+        .map_err(err)?;
+    if taken {
+        return Err(format!("اسم المستخدم {username} مستخدم مسبقاً"));
+    }
+    let id = new_id();
+    let now = utc_now(&tx)?;
+    tx.execute(
+        "INSERT INTO users(id, username, full_name, role, password_hash, is_active, created_at) VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        params![id, username, full_name, u.role, hash_password(&u.password)?, now],
+    )
+    .map_err(err)?;
+    write_overrides(&tx, &id, &u.role, &u.overrides)?;
+    let row = user_row(&tx, &id)?;
+    let payload = serde_json::json!({ "username": username, "fullName": full_name, "role": u.role, "overrides": row.overrides })
+        .to_string();
+    append_audit(&tx, admin_id, "user.create", "users", &id, &payload, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+#[tauri::command]
+fn create_user(db: State<'_, Db>, session: State<'_, Session>, user: NewUser) -> Result<UserRow, String> {
+    let admin_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    create_user_inner(&mut conn, &admin_id, user)
+}
+
+/// Sets a user's role and permission overrides together.
+fn update_user_role_inner(
+    conn: &mut Connection,
+    admin_id: &str,
+    user_id: &str,
+    role: &str,
+    overrides: PermissionOverrides,
+) -> Result<UserRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_admin(&tx, admin_id)?;
+    check_role(role)?;
+    let before = user_row(&tx, user_id)?;
+    if before.role == "admin" && role != "admin" {
+        if user_id == admin_id {
+            return Err("لا يمكنك إزالة صلاحية المدير عن حسابك".into());
+        }
+        if before.active && other_active_admins(&tx, user_id)? == 0 {
+            return Err("يجب أن يبقى مدير واحد نشط على الأقل".into());
+        }
+    }
+    tx.execute("UPDATE users SET role = ?1 WHERE id = ?2", params![role, user_id]).map_err(err)?;
+    write_overrides(&tx, user_id, role, &overrides)?;
+    let after = user_row(&tx, user_id)?;
+    let now = utc_now(&tx)?;
+    let payload = serde_json::json!({
+        "from": { "role": before.role, "overrides": before.overrides },
+        "to": { "role": after.role, "overrides": after.overrides },
+    })
+    .to_string();
+    append_audit(&tx, admin_id, "user.role", "users", user_id, &payload, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(after)
+}
+
+#[tauri::command]
+fn update_user_role(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    user_id: String,
+    role: String,
+    overrides: PermissionOverrides,
+) -> Result<UserRow, String> {
+    let admin_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    update_user_role_inner(&mut conn, &admin_id, &user_id, &role, overrides)
+}
+
+/// Activates or deactivates an account. Takes the wanted state, so a repeated click cannot flip it back.
+fn toggle_user_status_inner(conn: &mut Connection, admin_id: &str, user_id: &str, active: bool) -> Result<UserRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_admin(&tx, admin_id)?;
+    let before = user_row(&tx, user_id)?;
+    if !active {
+        if user_id == admin_id {
+            return Err("لا يمكنك تعطيل حسابك".into());
+        }
+        if before.role == "admin" && other_active_admins(&tx, user_id)? == 0 {
+            return Err("يجب أن يبقى مدير واحد نشط على الأقل".into());
+        }
+    }
+    if before.active != active {
+        tx.execute("UPDATE users SET is_active = ?1 WHERE id = ?2", params![active, user_id]).map_err(err)?;
+        let now = utc_now(&tx)?;
+        let payload = serde_json::json!({ "active": active }).to_string();
+        append_audit(&tx, admin_id, "user.status", "users", user_id, &payload, &now).map_err(err)?;
+    }
+    let row = user_row(&tx, user_id)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+#[tauri::command]
+fn toggle_user_status(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    user_id: String,
+    active: bool,
+) -> Result<UserRow, String> {
+    let admin_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    toggle_user_status_inner(&mut conn, &admin_id, &user_id, active)
+}
+
+fn reset_user_password_inner(conn: &mut Connection, admin_id: &str, user_id: &str, password: &str) -> Result<UserRow, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_admin(&tx, admin_id)?;
+    check_password(password)?;
+    user_row(&tx, user_id)?;
+    tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![hash_password(password)?, user_id])
+        .map_err(err)?;
+    let now = utc_now(&tx)?;
+    // Never the password itself, not even hashed.
+    append_audit(&tx, admin_id, "user.password_reset", "users", user_id, "{}", &now).map_err(err)?;
+    let row = user_row(&tx, user_id)?;
+    tx.commit().map_err(err)?;
+    Ok(row)
+}
+
+#[tauri::command]
+fn reset_user_password(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    user_id: String,
+    password: String,
+) -> Result<UserRow, String> {
+    let admin_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    reset_user_password_inner(&mut conn, &admin_id, &user_id, &password)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -2024,7 +2435,12 @@ pub fn run() {
             report_expiry,
             report_reorder,
             report_prescriptions,
-            save_export
+            save_export,
+            list_users,
+            create_user,
+            update_user_role,
+            toggle_user_status,
+            reset_user_password
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -2381,7 +2797,7 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 2);
+        assert_eq!(v, 3);
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
@@ -2814,11 +3230,13 @@ mod tests {
         let conn = db();
         for (id, role) in [("u-cash", "cashier"), ("u-ph", "pharmacist"), ("u-store", "storekeeper")] {
             add_user(&conn, id, role);
-            assert!(require_role(&conn, id, &REPORT_ROLES).is_err(), "{role}");
+            assert!(require_permission(&conn, id, &["view_reports"]).is_err(), "{role}");
         }
         add_user(&conn, "u-chief", "chief_pharmacist");
-        assert!(require_role(&conn, "u-chief", &REPORT_ROLES).is_ok());
-        assert!(require_role(&conn, "u-store", &INVENTORY_ROLES).is_ok(), "stock reports for the storekeeper");
+        assert!(require_permission(&conn, "u-chief", &["view_reports"]).is_ok());
+        let stock_reports = ["modify_inventory", "view_reports"];
+        assert!(require_permission(&conn, "u-store", &stock_reports).is_ok(), "stock reports for the storekeeper");
+        assert!(require_permission(&conn, "u-cash", &stock_reports).is_err());
     }
 
     #[test]
@@ -2905,5 +3323,201 @@ mod tests {
 
         let only_ph = report_prescriptions_inner(&conn, &filter(&conn, Some("u-ph"), None)).unwrap();
         assert_eq!(only_ph.rows.len(), 1);
+    }
+
+    // ── Employees and permissions ──
+
+    const PW: &str = "strong-pass-1";
+
+    /// Demo database where the admin has chosen a password.
+    fn admin_db() -> Connection {
+        let mut conn = db();
+        setup_admin_inner(&mut conn, PW).unwrap();
+        conn
+    }
+
+    fn new_user(username: &str, role: &str) -> NewUser {
+        NewUser {
+            username: username.into(),
+            full_name: format!("موظف {username}"),
+            password: PW.into(),
+            role: role.into(),
+            overrides: PermissionOverrides::default(),
+        }
+    }
+
+    fn grant(p: &str, value: bool) -> PermissionOverrides {
+        let mut o = PermissionOverrides::default();
+        o.set(p, Some(value));
+        o
+    }
+
+    fn audits(conn: &Connection, action: &str) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM audit_log WHERE action = ?1", params![action], |r| r.get(0)).unwrap()
+    }
+
+    #[test]
+    fn admin_creates_an_employee_who_can_sign_in() {
+        let mut conn = admin_db();
+        let u = create_user_inner(&mut conn, ADMIN, new_user("Sara.K", "cashier")).unwrap();
+        assert_eq!((u.username.as_str(), u.role.as_str(), u.active, u.has_password), ("sara.k", "cashier", true, true));
+        assert_eq!(
+            u.permissions,
+            Permissions { give_discount: true, dispense_rx: false, view_reports: false, modify_inventory: false }
+        );
+        let stored: String = conn.query_row("SELECT password_hash FROM users WHERE id = ?1", params![u.id], |r| r.get(0)).unwrap();
+        assert!(stored.starts_with("$argon2"));
+        let logged = login_inner(&mut conn, "sara.k", PW).unwrap();
+        assert_eq!(logged.id, u.id);
+        assert!(!logged.permissions.dispense_rx);
+
+        assert_eq!(audits(&conn, "user.create"), 1);
+        let payload: String = conn.query_row("SELECT payload FROM audit_log WHERE action = 'user.create'", [], |r| r.get(0)).unwrap();
+        assert!(!payload.contains(PW) && !payload.contains("argon2"), "{payload}");
+        let rows = list_users_inner(&conn, ADMIN).unwrap();
+        assert!(rows.iter().find(|r| r.id == u.id).unwrap().last_login.is_some());
+    }
+
+    #[test]
+    fn create_user_rejects_bad_input() {
+        let mut conn = admin_db();
+        let cases = [
+            (NewUser { username: "ADMIN".into(), ..new_user("x", "cashier") }, "مستخدم مسبقاً"),
+            (new_user("ab", "cashier"), "اسم المستخدم"),
+            (new_user("سارة", "cashier"), "اسم المستخدم"),
+            (new_user("has space", "cashier"), "اسم المستخدم"),
+            (NewUser { password: "short".into(), ..new_user("sara", "cashier") }, "كلمة المرور"),
+            (NewUser { full_name: " ".into(), ..new_user("sara", "cashier") }, "الاسم الكامل"),
+            (new_user("sara", "owner"), "الدور"),
+        ];
+        for (u, reason) in cases {
+            let e = create_user_inner(&mut conn, ADMIN, u).unwrap_err();
+            assert!(e.contains(reason), "expected {reason:?}, got {e:?}");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM users"), 1);
+    }
+
+    #[test]
+    fn only_admins_manage_employees() {
+        let mut conn = admin_db();
+        add_user(&conn, "u-ph", "pharmacist");
+        add_user(&conn, "u-chief", "chief_pharmacist");
+        // Overrides cannot turn anyone into a user manager.
+        let all = PermissionOverrides {
+            give_discount: Some(true),
+            dispense_rx: Some(true),
+            view_reports: Some(true),
+            modify_inventory: Some(true),
+        };
+        update_user_role_inner(&mut conn, ADMIN, "u-chief", "chief_pharmacist", all).unwrap();
+        for who in ["u-ph", "u-chief"] {
+            let denied = |e: String| assert!(e.contains("للمدير فقط"), "{who}: {e}");
+            denied(list_users_inner(&conn, who).unwrap_err());
+            denied(create_user_inner(&mut conn, who, new_user("sara", "admin")).unwrap_err());
+            denied(update_user_role_inner(&mut conn, who, who, "admin", PermissionOverrides::default()).unwrap_err());
+            denied(toggle_user_status_inner(&mut conn, who, ADMIN, false).unwrap_err());
+            denied(reset_user_password_inner(&mut conn, who, ADMIN, "takeover-123").unwrap_err());
+        }
+        assert_eq!(active_role(&conn, ADMIN).unwrap(), "admin");
+        assert!(login_inner(&mut conn, "admin", PW).is_ok(), "admin password unchanged");
+    }
+
+    #[test]
+    fn overrides_grant_and_deny_at_the_till() {
+        let mut conn = admin_db();
+        add_user(&conn, "u-cash", "cashier");
+        add_user(&conn, "u-ph", "pharmacist");
+        // Cashier allowed to dispense, pharmacist not.
+        update_user_role_inner(&mut conn, ADMIN, "u-cash", "cashier", grant("dispense_rx", true)).unwrap();
+        update_user_role_inner(&mut conn, ADMIN, "u-ph", "pharmacist", grant("dispense_rx", false)).unwrap();
+        post_sale_inner(&mut conn, "u-cash", cash_sale(vec![augmentin()], 18_500)).unwrap();
+        let e = post_sale_inner(&mut conn, "u-ph", cash_sale(vec![augmentin()], 18_500)).unwrap_err();
+        assert!(e.contains("صيدلاني"), "{e}");
+
+        // Cashier barred from discounts: any discount refused, a full-price sale still fine.
+        update_user_role_inner(&mut conn, ADMIN, "u-cash", "cashier", grant("give_discount", false)).unwrap();
+        let e = post_sale_inner(&mut conn, "u-cash", cash_sale(vec![brufen(10, 100)], 35_000)).unwrap_err();
+        assert!(e.contains("خصم"), "{e}");
+        post_sale_inner(&mut conn, "u-cash", cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        assert!(!user_row(&conn, "u-cash").unwrap().permissions.dispense_rx, "the role change reset the old override");
+    }
+
+    #[test]
+    fn overrides_grant_and_deny_inventory_and_reports() {
+        let mut conn = admin_db();
+        add_user(&conn, "u-store", "storekeeper");
+        add_user(&conn, "u-ph", "pharmacist");
+        update_user_role_inner(&mut conn, ADMIN, "u-store", "storekeeper", grant("view_reports", true)).unwrap();
+        update_user_role_inner(&mut conn, ADMIN, "u-ph", "pharmacist", grant("modify_inventory", false)).unwrap();
+        assert!(require_permission(&conn, "u-store", &["view_reports"]).is_ok());
+        let e = add_product_inner(&mut conn, "u-ph", new_product("X", None)).unwrap_err();
+        assert!(e.contains("صلاحية"), "{e}");
+        assert!(require_permission(&conn, "u-ph", &["modify_inventory", "view_reports"]).is_err());
+    }
+
+    #[test]
+    fn only_real_exceptions_are_stored_and_admins_keep_everything() {
+        let mut conn = admin_db();
+        add_user(&conn, "u-ph", "pharmacist");
+        // Granting a pharmacist what the role already has is not an exception.
+        let same = PermissionOverrides { dispense_rx: Some(true), view_reports: Some(true), ..Default::default() };
+        let r = update_user_role_inner(&mut conn, ADMIN, "u-ph", "pharmacist", same).unwrap();
+        assert_eq!(r.overrides, PermissionOverrides { view_reports: Some(true), ..Default::default() });
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM user_permissions"), 1);
+
+        // Promoting to admin drops overrides; an admin always has every permission.
+        let r = update_user_role_inner(&mut conn, ADMIN, "u-ph", "admin", grant("dispense_rx", false)).unwrap();
+        assert_eq!(r.overrides, PermissionOverrides::default());
+        assert!(r.permissions.dispense_rx && r.permissions.view_reports);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM user_permissions"), 0);
+        assert_eq!(audits(&conn, "user.role"), 2);
+    }
+
+    #[test]
+    fn deactivated_accounts_stop_working_at_once() {
+        let mut conn = admin_db();
+        let u = create_user_inner(&mut conn, ADMIN, new_user("sara", "cashier")).unwrap();
+        let off = toggle_user_status_inner(&mut conn, ADMIN, &u.id, false).unwrap();
+        assert!(!off.active);
+        assert_eq!(login_inner(&mut conn, "sara", PW).unwrap_err(), BAD_LOGIN);
+        // Already signed in elsewhere: the next sale is refused.
+        assert!(post_sale_inner(&mut conn, &u.id, cash_sale(vec![brufen(1, 0)], 3500)).unwrap_err().contains("معطّل"));
+        toggle_user_status_inner(&mut conn, ADMIN, &u.id, false).unwrap();
+        assert_eq!(audits(&conn, "user.status"), 1, "repeating the same state changes nothing");
+
+        toggle_user_status_inner(&mut conn, ADMIN, &u.id, true).unwrap();
+        assert!(login_inner(&mut conn, "sara", PW).is_ok());
+        assert_eq!(audits(&conn, "user.status"), 2);
+    }
+
+    #[test]
+    fn admins_cannot_lock_themselves_out() {
+        let mut conn = admin_db();
+        let e = toggle_user_status_inner(&mut conn, ADMIN, ADMIN, false).unwrap_err();
+        assert!(e.contains("حسابك"), "{e}");
+        let e = update_user_role_inner(&mut conn, ADMIN, ADMIN, "pharmacist", PermissionOverrides::default()).unwrap_err();
+        assert!(e.contains("حسابك"), "{e}");
+
+        // With a second admin, one admin may demote the other.
+        let second = create_user_inner(&mut conn, ADMIN, new_user("boss2", "admin")).unwrap();
+        update_user_role_inner(&mut conn, &second.id, ADMIN, "pharmacist", PermissionOverrides::default()).unwrap();
+        assert!(list_users_inner(&conn, ADMIN).unwrap_err().contains("للمدير فقط"));
+        // Now boss2 is the last admin; nobody else can remove them.
+        assert!(toggle_user_status_inner(&mut conn, &second.id, &second.id, false).is_err());
+        assert_eq!(other_active_admins(&conn, &second.id).unwrap(), 0);
+    }
+
+    #[test]
+    fn reset_password_replaces_the_hash_and_logs_no_secret() {
+        let mut conn = admin_db();
+        let u = create_user_inner(&mut conn, ADMIN, new_user("sara", "cashier")).unwrap();
+        assert!(reset_user_password_inner(&mut conn, ADMIN, &u.id, "short").unwrap_err().contains("كلمة المرور"));
+        reset_user_password_inner(&mut conn, ADMIN, &u.id, "new-secret-99").unwrap();
+        assert_eq!(login_inner(&mut conn, "sara", PW).unwrap_err(), BAD_LOGIN);
+        assert!(login_inner(&mut conn, "sara", "new-secret-99").is_ok());
+        let payload: String =
+            conn.query_row("SELECT payload FROM audit_log WHERE action = 'user.password_reset'", [], |r| r.get(0)).unwrap();
+        assert_eq!(payload, "{}");
+        assert!(reset_user_password_inner(&mut conn, ADMIN, "u-ghost", "new-secret-99").is_err());
     }
 }

@@ -32,8 +32,9 @@ function toInt(s: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-/** `visible` is false while another screen is shown; the shortcuts (F12 completes a sale) are then ignored. */
-export function PosScreen({ visible = true }: { visible?: boolean }) {
+/** `visible` is false while another screen is shown; the shortcuts (F12 completes a sale) are then ignored.
+ *  `canDiscount` false locks the discount fields (the backend refuses discounts from such a user anyway). */
+export function PosScreen({ visible = true, canDiscount = true }: { visible?: boolean; canDiscount?: boolean }) {
   const today = localToday();
   const searchRef = useRef<HTMLInputElement>(null);
   const tenderedRef = useRef<HTMLInputElement>(null);
@@ -423,6 +424,7 @@ export function PosScreen({ visible = true }: { visible?: boolean }) {
                     <input
                       aria-label={`خصم ${l.product.tradeName}`}
                       className="num small-input"
+                      disabled={!canDiscount}
                       value={l.discount || ""}
                       placeholder="0"
                       onChange={(e) => setDiscount(l.product.id, e.target.value)}
@@ -451,7 +453,15 @@ export function PosScreen({ visible = true }: { visible?: boolean }) {
         <div className="sum"><span>خصومات الأسطر</span><bdi className="num">{formatIqd(totals.lineDiscounts)}</bdi></div>
         <div className="sum">
           <label htmlFor="inv-disc">خصم على الفاتورة</label>
-          <input id="inv-disc" className="num small-input" value={invoiceDiscount} placeholder="0" onChange={(e) => setInvoiceDiscount(e.target.value)} />
+          <input
+            id="inv-disc"
+            className="num small-input"
+            value={invoiceDiscount}
+            placeholder="0"
+            disabled={!canDiscount}
+            title={canDiscount ? undefined : "ليست لديك صلاحية لإعطاء خصم"}
+            onChange={(e) => setInvoiceDiscount(e.target.value)}
+          />
         </div>
         <div className="grand">
           <span>المطلوب</span>

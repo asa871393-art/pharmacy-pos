@@ -1,18 +1,17 @@
 import { useEffect, useState, type ReactNode } from "react";
 import { addDays } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
+import type { Permissions } from "../core/permissions.ts";
 import {
-  INVENTORY_ROLES,
-  REPORT_ROLES,
   type Category,
   type ExpiryReport,
   type ReorderRow,
   type ReportFilter,
-  type Role,
   type RxReport,
   type SalesReport,
   type SalesRow,
   type User,
+  type UserRef,
 } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
@@ -20,11 +19,15 @@ import { errorText } from "../ui/Modal.tsx";
 
 type Tab = "sales" | "expiry" | "reorder" | "rx";
 
-const TABS: { id: Tab; label: string; roles: Role[]; usesDates: boolean; usesCashier: boolean }[] = [
-  { id: "sales", label: "المبيعات والأرباح", roles: REPORT_ROLES, usesDates: true, usesCashier: true },
-  { id: "expiry", label: "الصلاحية والتالف", roles: INVENTORY_ROLES, usesDates: true, usesCashier: false },
-  { id: "reorder", label: "إعادة الطلب", roles: INVENTORY_ROLES, usesDates: false, usesCashier: false },
-  { id: "rx", label: "سجل الوصفات الطبية", roles: REPORT_ROLES, usesDates: true, usesCashier: true },
+// Same rules as the report_* commands: money and prescription reports need viewReports; stock reports either.
+const moneyReports = (p: Permissions) => p.viewReports;
+const stockReports = (p: Permissions) => p.viewReports || p.modifyInventory;
+
+const TABS: { id: Tab; label: string; allowed: (p: Permissions) => boolean; usesDates: boolean; usesCashier: boolean }[] = [
+  { id: "sales", label: "المبيعات والأرباح", allowed: moneyReports, usesDates: true, usesCashier: true },
+  { id: "expiry", label: "الصلاحية والتالف", allowed: stockReports, usesDates: true, usesCashier: false },
+  { id: "reorder", label: "إعادة الطلب", allowed: stockReports, usesDates: false, usesCashier: false },
+  { id: "rx", label: "سجل الوصفات الطبية", allowed: moneyReports, usesDates: true, usesCashier: true },
 ];
 
 const HORIZONS = [30, 90, 180];
@@ -239,14 +242,14 @@ function toCsv(title: string, meta: string[], view: View): string {
 /** Stays mounted (filters survive switching screens); reloads whenever it becomes `visible`, so figures are current. */
 export function ReportsScreen({ user, visible = true }: { user: User; visible?: boolean }) {
   const today = localToday();
-  const tabs = TABS.filter((t) => t.roles.includes(user.role));
+  const tabs = TABS.filter((t) => t.allowed(user.permissions));
   const [tab, setTab] = useState<Tab | undefined>(tabs[0]?.id);
   const [from, setFrom] = useState(today.slice(0, 8) + "01");
   const [to, setTo] = useState(today);
   const [cashierId, setCashierId] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [withinDays, setWithinDays] = useState(90);
-  const [users, setUsers] = useState<User[]>([]);
+  const [users, setUsers] = useState<UserRef[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   // The view is kept with the tab it belongs to, so a tab never shows another tab's numbers while loading.
   const [loaded, setLoaded] = useState<{ tab: Tab; view: View } | null>(null);
@@ -256,7 +259,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
 
   const current = TABS.find((t) => t.id === tab);
   const view = loaded && loaded.tab === tab ? loaded.view : null;
-  const canSeeMoney = REPORT_ROLES.includes(user.role);
+  const canSeeMoney = user.permissions.viewReports;
 
   useEffect(() => {
     repo.categories().then(setCategories, () => {});
@@ -296,7 +299,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
       <main className="rep">
         <section className="panel rep-panel">
           <div className="inv-head"><h2>التقارير</h2></div>
-          <p className="empty-note">التقارير للمدير والصيدلاني المسؤول، وتقارير المخزون للصيدلاني وأمين المخزن.</p>
+          <p className="empty-note">ليست لديك صلاحية لعرض التقارير.</p>
         </section>
       </main>
     );
