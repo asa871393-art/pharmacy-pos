@@ -10,6 +10,8 @@ import type {
   NewProduct,
   NewSupplier,
   NewUser,
+  PhoneScan,
+  PhoneScannerInfo,
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
@@ -70,6 +72,11 @@ export interface PharmacyRepo {
   /** Sets the account active or inactive (the wanted state, not a flip). */
   toggleUserStatus(userId: string, active: boolean): Promise<UserRow>;
   resetUserPassword(userId: string, password: string): Promise<UserRow>;
+  // Phone scanner (desktop app only).
+  /** Link, QR code and status for pairing a phone; null where there is no scanner server (browser demo). */
+  phoneScanner(): Promise<PhoneScannerInfo | null>;
+  /** Calls `handler` for every barcode scanned on a paired phone; returns a function that stops listening. */
+  onPhoneScan(handler: (scan: PhoneScan) => void): Promise<() => void>;
 }
 
 export function localToday(): string {

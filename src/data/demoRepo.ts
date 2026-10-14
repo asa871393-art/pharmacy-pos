@@ -838,5 +838,13 @@ export function createDemoRepo(): PharmacyRepo {
       u.password = password;
       return toRow(u);
     },
+
+    // No scanner server in a browser tab.
+    async phoneScanner() {
+      return null;
+    },
+    async onPhoneScan() {
+      return () => {};
+    },
   };
 }

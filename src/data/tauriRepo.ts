@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
@@ -11,6 +12,8 @@ import type {
   NewProduct,
   NewSupplier,
   NewUser,
+  PhoneScan,
+  PhoneScannerInfo,
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
@@ -62,4 +65,6 @@ export const tauriRepo: PharmacyRepo = {
     invoke<UserRow>("update_user_role", { userId, role, overrides }),
   toggleUserStatus: (userId: string, active: boolean) => invoke<UserRow>("toggle_user_status", { userId, active }),
   resetUserPassword: (userId: string, password: string) => invoke<UserRow>("reset_user_password", { userId, password }),
+  phoneScanner: () => invoke<PhoneScannerInfo>("phone_scanner_info"),
+  onPhoneScan: (handler: (scan: PhoneScan) => void) => listen<PhoneScan>("phone-barcode-scanned", (e) => handler(e.payload)),
 };

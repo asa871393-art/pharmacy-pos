@@ -296,3 +296,14 @@ button.module:hover:not(.active) { background: #24413b; color: #fff; }
 .perm-row .tag { justify-self: start; }
 .small-seg { height: 34px; }
 .small-seg .seg-btn { padding: 0 10px; font-size: 13px; white-space: nowrap; }
+
+/* ── Phone scanner ── */
+.search-label-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.phone-btn { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; padding: 4px 10px; }
+.phone-btn svg { fill: none; stroke: currentColor; stroke-width: 2; }
+.phone-grid { display: grid; grid-template-columns: auto 1fr; gap: 20px; align-items: start; }
+.phone-qr { display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.phone-qr img { background: #fff; border: 1px solid var(--line); border-radius: 10px; padding: 6px; }
+.phone-url { color: var(--muted); }
+.phone-steps { margin: 0; padding-inline-start: 20px; display: flex; flex-direction: column; gap: 10px; line-height: 1.6; }
+@media (max-width: 640px) { .phone-grid { grid-template-columns: 1fr; justify-items: center; } }

@@ -7,8 +7,10 @@ use argon2::Argon2;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::sync::Mutex;
-use tauri::{Manager, State};
+use std::sync::{Arc, Mutex};
+use tauri::{Emitter, Manager, State};
+
+mod phone_scanner;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -2399,6 +2401,60 @@ fn reset_user_password(
     reset_user_password_inner(&mut conn, &admin_id, &user_id, &password)
 }
 
+// ── Phone scanner ──
+
+/// The computer's address on the local network (e.g. 192.168.1.20).
+#[tauri::command]
+fn get_local_ip() -> Result<String, String> {
+    phone_scanner::local_ip().map(|ip| ip.to_string())
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScannerDevice {
+    device: String,
+    seconds_ago: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PhoneScannerInfo {
+    /// What the QR code opens; carries this run's pairing token.
+    url: String,
+    ip: String,
+    port: u16,
+    qr_svg: String,
+    running: bool,
+    error: Option<String>,
+    /// Phones heard from in the last 10 seconds.
+    devices: Vec<ScannerDevice>,
+}
+
+#[tauri::command]
+fn phone_scanner_info(
+    session: State<'_, Session>,
+    scanner: State<'_, Arc<phone_scanner::Scanner>>,
+) -> Result<PhoneScannerInfo, String> {
+    session_user(&session)?;
+    let ip = phone_scanner::local_ip()?.to_string();
+    let url = format!("https://{ip}:{}/scan?t={}", phone_scanner::PORT, scanner.token());
+    let status = scanner.status.lock().map_err(err)?.clone();
+    let devices = scanner
+        .connected(std::time::Duration::from_secs(10))
+        .into_iter()
+        .map(|(device, seconds_ago)| ScannerDevice { device, seconds_ago })
+        .collect();
+    Ok(PhoneScannerInfo {
+        qr_svg: phone_scanner::qr_svg(&url)?,
+        url,
+        ip,
+        port: phone_scanner::PORT,
+        running: status.running,
+        error: status.error,
+        devices,
+    })
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -2409,6 +2465,15 @@ pub fn run() {
             migrate(&conn)?;
             app.manage(Db(Mutex::new(conn)));
             app.manage(Session::default());
+
+            // Phone scanner: scans arrive as the `phone-barcode-scanned` event. A new pairing token on every start.
+            let handle = app.handle().clone();
+            let sink: phone_scanner::Sink = Arc::new(move |scan| {
+                let _ = handle.emit(phone_scanner::EVENT, scan);
+            });
+            let scanner = Arc::new(phone_scanner::Scanner::new(uuid::Uuid::new_v4().simple().to_string(), sink));
+            phone_scanner::start(dir.clone(), scanner.clone());
+            app.manage(scanner);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -2440,7 +2505,9 @@ pub fn run() {
             create_user,
             update_user_role,
             toggle_user_status,
-            reset_user_password
+            reset_user_password,
+            get_local_ip,
+            phone_scanner_info
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");

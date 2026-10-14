@@ -5,6 +5,7 @@ import { computeTotals, formatIqd, settle, type PaymentInput } from "../core/tot
 import type { Allocation, Batch, ProductHit, SaleResult, SearchMode } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "./ExpiryTag.tsx";
+import { PhoneScannerDialog } from "./PhoneScannerDialog.tsx";
 import { Receipt, type ReceiptLine } from "./Receipt.tsx";
 
 interface CartLine {
@@ -46,6 +47,13 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
   const [active, setActive] = useState(0);
 
   const [cart, setCart] = useState<CartLine[]>([]);
+  // The latest cart, readable before React re-renders: adding a product awaits its batches, and a second scan can
+  // arrive meanwhile (phone scanner). All cart changes go through commitCart so the two never disagree.
+  const cartRef = useRef<CartLine[]>([]);
+  const commitCart = (next: CartLine[]) => {
+    cartRef.current = next;
+    setCart(next);
+  };
   const [invoiceDiscount, setInvoiceDiscount] = useState("");
   const [payMode, setPayMode] = useState<PayMode>("cash");
   const [tendered, setTendered] = useState("");
@@ -100,7 +108,8 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
     }
     try {
       const batches = await repo.batches(hit.id);
-      const existing = cart.find((l) => l.product.id === hit.id);
+      const latest = cartRef.current;
+      const existing = latest.find((l) => l.product.id === hit.id);
       const scanned = scan?.batchNo ? batches.find((b) => b.batchNo === scan.batchNo) : undefined;
       const line = allocateLine({
         product: hit,
@@ -109,7 +118,7 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
         discount: existing?.discount ?? 0,
         preferredBatchId: scanned?.id ?? existing?.preferredBatchId,
       });
-      setCart(existing ? cart.map((l) => (l.product.id === hit.id ? line : l)) : [...cart, line]);
+      commitCart(existing ? latest.map((l) => (l.product.id === hit.id ? line : l)) : [...latest, line]);
       setMessage(
         hit.requiresRx ? { kind: "info", text: `${hit.tradeName} يُصرف بوصفة طبية — أدخل رقم الوصفة واسم الطبيب قبل الإتمام.` } : null,
       );
@@ -127,7 +136,7 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
     if (!current) return;
     try {
       const line = allocateLine({ ...current, qty });
-      setCart(cart.map((l) => (l.product.id === productId ? line : l)));
+      commitCart(cart.map((l) => (l.product.id === productId ? line : l)));
       setMessage(null);
     } catch (e) {
       setMessage({ kind: "error", text: explain(e, current.product.tradeName) });
@@ -135,11 +144,11 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
   }
 
   function setDiscount(productId: string, value: string) {
-    setCart(cart.map((l) => (l.product.id === productId ? { ...l, discount: toInt(value) } : l)));
+    commitCart(cart.map((l) => (l.product.id === productId ? { ...l, discount: toInt(value) } : l)));
   }
 
   function removeLine(productId: string) {
-    setCart(cart.filter((l) => l.product.id !== productId));
+    commitCart(cart.filter((l) => l.product.id !== productId));
   }
 
   async function handleScan(raw: string) {
@@ -203,7 +212,7 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
         batches: l.allocations.map((a) => a.batchNo).join("، "),
       }));
       setLastSale({ sale, lines, method: PAY_LABEL[payMode] });
-      setCart([]);
+      commitCart([]);
       setTendered("");
       setCardAmount("");
       setInvoiceDiscount("");
@@ -253,6 +262,30 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
     if (visible) searchRef.current?.focus();
   }, [visible]);
 
+  // ── Phone scanner: codes from a paired phone take the same path as a USB scanner. One at a time, in order;
+  // ignored while another screen is shown, so nothing lands in a sale unseen. ──
+  const [phoneOpen, setPhoneOpen] = useState(false);
+  const phoneHandler = useRef<(code: string) => Promise<void>>(async () => {});
+  phoneHandler.current = async (code: string) => {
+    if (!visible) return;
+    setPhoneOpen(false);
+    await handleScan(code);
+  };
+  const phoneQueue = useRef<Promise<void>>(Promise.resolve());
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+    let unmounted = false;
+    repo
+      .onPhoneScan((scan) => {
+        phoneQueue.current = phoneQueue.current.then(() => phoneHandler.current(scan.code)).catch(() => {});
+      })
+      .then((fn) => (unmounted ? fn() : (stop = fn)));
+    return () => {
+      unmounted = true;
+      stop?.();
+    };
+  }, []);
+
   function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
@@ -275,9 +308,18 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
     <main className="pos">
       <section className="panel search-panel" aria-label="البحث">
         <div className="search-head">
-          <label htmlFor="pos-search" className="label">
-            امسح الباركود أو ابحث <kbd>F2</kbd>
-          </label>
+          <div className="search-label-row">
+            <label htmlFor="pos-search" className="label">
+              امسح الباركود أو ابحث <kbd>F2</kbd>
+            </label>
+            <button type="button" className="btn phone-btn" onClick={() => setPhoneOpen(true)}>
+              <svg width="14" height="14" viewBox="0 0 24 24" aria-hidden="true">
+                <rect x="6" y="2" width="12" height="20" rx="2" />
+                <path d="M10 18 H14" />
+              </svg>
+              قارئ الموبايل
+            </button>
+          </div>
           <div className="search-box">
             <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
               <circle cx="11" cy="11" r="7" />
@@ -535,6 +577,7 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
       </footer>
 
       {lastSale && <Receipt sale={lastSale.sale} lines={lastSale.lines} method={lastSale.method} />}
+      {phoneOpen && <PhoneScannerDialog onClose={() => setPhoneOpen(false)} />}
     </main>
   );
 }

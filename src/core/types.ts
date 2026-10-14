@@ -328,3 +328,20 @@ export interface RxReport {
   rows: RxRow[];
   byPrescriber: PrescriberRow[];
 }
+
+// ── Phone scanner ──
+
+export interface PhoneScannerInfo {
+  url: string; // what the QR code opens; includes this run's pairing token
+  ip: string;
+  port: number;
+  qrSvg: string;
+  running: boolean;
+  error: string | null;
+  devices: { device: string; secondsAgo: number }[]; // phones heard from in the last 10 seconds
+}
+
+export interface PhoneScan {
+  code: string;
+  device: string;
+}
