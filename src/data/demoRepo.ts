@@ -3,7 +3,7 @@
 
 import { addDays, availableQty, sellableBatches } from "../core/fefo.ts";
 import { computeTotals, settle } from "../core/totals.ts";
-import type { Batch, ProductHit, SaleDraft, SaleResult, SearchMode } from "../core/types.ts";
+import type { Batch, ProductHit, Role, SaleDraft, SaleResult, SearchMode, User } from "../core/types.ts";
 import { localToday, type PharmacyRepo } from "./repo.ts";
 
 interface DemoProduct {
@@ -69,10 +69,24 @@ function seedBatches(today: string): Batch[] {
   ];
 }
 
+// Demo accounts, one per role that sells. All use DEMO_PASSWORD; the login screen shows it in demo mode.
+export const DEMO_PASSWORD = "demo1234";
+const users: User[] = [
+  { id: "u-admin", username: "admin", fullName: "مدير النظام", role: "admin" },
+  { id: "u-pharm", username: "pharm", fullName: "الصيدلاني", role: "pharmacist" },
+  { id: "u-cash", username: "cash", fullName: "الكاشير", role: "cashier" },
+];
+
+// Same rules as post_sale in src-tauri/src/lib.rs.
+const MAX_DISCOUNT_PCT = 10;
+const UNLIMITED_DISCOUNT_ROLES: Role[] = ["admin", "chief_pharmacist"];
+const RX_ROLES: Role[] = ["admin", "chief_pharmacist", "pharmacist"];
+
 export function createDemoRepo(): PharmacyRepo {
   const today = localToday();
   const batches = seedBatches(today);
   let counter = 0;
+  let current: User | null = null;
 
   const toHit = (p: DemoProduct): ProductHit => {
     const own = batches.filter((b) => b.productId === p.id);
@@ -102,6 +116,21 @@ export function createDemoRepo(): PharmacyRepo {
 
   return {
     kind: "demo",
+    async authStatus() {
+      return { needsSetup: false, user: current };
+    },
+    async setupAdmin() {
+      throw new Error("تم إعداد كلمة المرور مسبقاً، سجّل الدخول");
+    },
+    async login(username: string, password: string) {
+      const u = users.find((x) => x.username === username.trim());
+      if (!u || password !== DEMO_PASSWORD) throw new Error("اسم المستخدم أو كلمة المرور غير صحيحة");
+      current = u;
+      return u;
+    },
+    async logout() {
+      current = null;
+    },
     async search(query: string, mode: SearchMode) {
       const tokens = query.trim().split(/\s+/).filter(Boolean).map(norm);
       if (tokens.length === 0) return [];
@@ -126,15 +155,41 @@ export function createDemoRepo(): PharmacyRepo {
       return batches.filter((b) => b.productId === productId && b.qtyOnHand > 0).map((b) => ({ ...b }));
     },
     async postSale(draft: SaleDraft): Promise<SaleResult> {
-      const lines = draft.lines.map((l) => ({ unitPrice: l.unitPrice, qty: l.allocations.reduce((s, a) => s + a.qty, 0), discount: l.discount }));
-      const totals = computeTotals(lines, draft.invoiceDiscount);
+      const user = current;
+      if (!user) throw new Error("سجّل الدخول أولاً");
+      if (draft.lines.length === 0) throw new Error("الفاتورة فارغة");
+      let needsRx = false;
+      const lines = draft.lines.map((l) => {
+        const p = products.find((x) => x.id === l.productId);
+        if (!p) throw new Error("صنف غير موجود أو موقوف، حدّث السلة");
+        if (l.unitPrice !== p.price) throw new Error(`سعر ${p.tradeName} أصبح ${p.price} د.ع، حدّث السلة`);
+        const qty = l.allocations.reduce((s, a) => s + a.qty, 0);
+        if (qty <= 0 || l.allocations.some((a) => a.qty <= 0)) throw new Error("كمية غير صالحة في أحد الأسطر");
+        if (l.discount < 0 || l.discount > p.price * qty) throw new Error(`خصم غير صالح على ${p.tradeName}`);
+        needsRx ||= p.rx;
+        return { unitPrice: p.price, qty, discount: l.discount };
+      });
+      const totals = computeTotals(lines, 0);
+      if (draft.invoiceDiscount < 0 || draft.invoiceDiscount > totals.total) throw new Error("خصم الفاتورة غير صالح");
+      totals.invoiceDiscount = draft.invoiceDiscount;
+      totals.total -= draft.invoiceDiscount;
+      const discount = totals.lineDiscounts + totals.invoiceDiscount;
+      if (!UNLIMITED_DISCOUNT_ROLES.includes(user.role) && discount * 100 > totals.subtotal * MAX_DISCOUNT_PCT) {
+        throw new Error(`الخصم يتجاوز الحد المسموح (${MAX_DISCOUNT_PCT}٪ من المجموع)، يحتاج موافقة المدير`);
+      }
+      if (needsRx) {
+        if (!RX_ROLES.includes(user.role)) throw new Error("الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني");
+        if (!draft.prescription?.rxNo.trim() || !draft.prescription.prescriber.trim()) {
+          throw new Error("الفاتورة تحتوي دواءً بوصفة طبية: أدخل رقم الوصفة واسم الطبيب");
+        }
+      }
       const s = settle(totals.total, draft.payments);
       if (s.remaining > 0) throw new Error(`المبلغ المدفوع أقل من المطلوب بـ ${s.remaining} د.ع`);
       if (s.onCredit > 0 && !draft.patientId) throw new Error("البيع بالآجل يتطلب اختيار عميل");
       for (const l of draft.lines) {
         for (const a of l.allocations) {
           const b = batches.find((x) => x.id === a.batchId);
-          if (!b || b.qtyOnHand < a.qty) throw new Error(`الدفعة ${a.batchNo} لم تعد تكفي، حدّث السلة`);
+          if (!b || b.productId !== l.productId || b.qtyOnHand < a.qty) throw new Error(`الدفعة ${a.batchNo} لم تعد تكفي، حدّث السلة`);
         }
       }
       for (const l of draft.lines) for (const a of l.allocations) batches.find((x) => x.id === a.batchId)!.qtyOnHand -= a.qty;

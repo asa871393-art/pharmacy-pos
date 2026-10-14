@@ -46,12 +46,34 @@ export interface SaleLineDraft {
   fefoOverrideReason?: string;
 }
 
+export interface Prescription {
+  rxNo: string;
+  prescriber: string; // doctor who wrote it
+}
+
+/** The seller is whoever is signed in; the backend takes it from the session, not from the draft. */
 export interface SaleDraft {
   lines: SaleLineDraft[];
   invoiceDiscount: number;
   payments: { method: PaymentMethod; amount: number; reference?: string }[];
   patientId?: string;
-  userId: string;
+  /** Required when any line is a prescription-only medicine. */
+  prescription?: Prescription;
+}
+
+export type Role = "admin" | "chief_pharmacist" | "pharmacist" | "cashier" | "storekeeper";
+
+export interface User {
+  id: string;
+  username: string;
+  fullName: string;
+  role: Role;
+}
+
+export interface AuthStatus {
+  /** No password has been set yet (first run): the admin must choose one. */
+  needsSetup: boolean;
+  user: User | null;
 }
 
 export interface SaleResult {

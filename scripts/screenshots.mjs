@@ -10,6 +10,11 @@ page.on("pageerror", (e) => errors.push(String(e)));
 page.on("console", (m) => m.type() === "error" && errors.push(m.text()));
 
 await page.goto("http://localhost:4173/");
+await page.waitForSelector("#login-user");
+await page.screenshot({ path: "screenshots/0-login.png" });
+await page.fill("#login-user", "pharm");
+await page.fill("#login-pass", "demo1234");
+await page.keyboard.press("Enter");
 await page.waitForSelector("#pos-search");
 await page.screenshot({ path: "screenshots/1-empty.png" });
 
@@ -29,6 +34,10 @@ for (const code of ["2000000000046", "2000000000046", "(01)02000000000077(17)301
 await page.getByLabel("كمية Panadol Extra").fill("30");
 await page.waitForTimeout(200);
 await page.screenshot({ path: "screenshots/3-cart.png" });
+
+// Augmentin is prescription-only: the sale cannot complete until the prescription is entered.
+await page.fill("#rx-no", "RX-2026-0042");
+await page.fill("#rx-by", "د. سارة الجبوري");
 
 await page.fill("#tendered", "200000");
 await page.keyboard.press("F12");

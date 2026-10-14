@@ -1,10 +1,37 @@
+import { useEffect, useState } from "react";
+import { Login } from "./auth/Login.tsx";
+import type { AuthStatus, Role, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
 import { PosScreen } from "./pos/PosScreen.tsx";
 
-// Until login lands (step 15), the app runs as the seeded admin user.
-const CURRENT_USER = { id: "u-admin", name: "مدير النظام" };
+const ROLE_LABEL: Record<Role, string> = {
+  admin: "مدير",
+  chief_pharmacist: "صيدلاني مسؤول",
+  pharmacist: "صيدلاني",
+  cashier: "كاشير",
+  storekeeper: "أمين مخزن",
+};
 
 export function App() {
+  const [auth, setAuth] = useState<AuthStatus | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    repo.authStatus().then(setAuth, (e) => setError(String(e)));
+  }, []);
+
+  if (error) return <div role="alert" className="banner error">{error}</div>;
+  if (!auth) return null;
+  if (!auth.user) {
+    return <Login needsSetup={auth.needsSetup} onSignedIn={(user: User) => setAuth({ needsSetup: false, user })} />;
+  }
+
+  const user = auth.user;
+  async function logout() {
+    await repo.logout();
+    setAuth({ needsSetup: false, user: null });
+  }
+
   return (
     <div className="app">
       <header className="topbar">
@@ -23,10 +50,14 @@ export function App() {
             {repo.kind === "sqlite" ? "قاعدة بيانات محلية · يعمل دون إنترنت" : "وضع العرض في المتصفح · البيانات لا تُحفظ"}
           </span>
           <span>الفرع الرئيسي</span>
-          <strong>{CURRENT_USER.name}</strong>
+          <strong>{user.fullName}</strong>
+          <span>{ROLE_LABEL[user.role]}</span>
+          <button type="button" className="logout" onClick={() => void logout()}>
+            خروج
+          </button>
         </div>
       </header>
-      <PosScreen userId={CURRENT_USER.id} />
+      <PosScreen key={user.id} />
     </div>
   );
 }

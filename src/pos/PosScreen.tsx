@@ -32,7 +32,7 @@ function toInt(s: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-export function PosScreen({ userId }: { userId: string }) {
+export function PosScreen() {
   const today = localToday();
   const searchRef = useRef<HTMLInputElement>(null);
   const tenderedRef = useRef<HTMLInputElement>(null);
@@ -48,6 +48,8 @@ export function PosScreen({ userId }: { userId: string }) {
   const [payMode, setPayMode] = useState<PayMode>("cash");
   const [tendered, setTendered] = useState("");
   const [cardAmount, setCardAmount] = useState("");
+  const [rxNo, setRxNo] = useState("");
+  const [prescriber, setPrescriber] = useState("");
 
   const [message, setMessage] = useState<{ kind: "error" | "info"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -107,7 +109,7 @@ export function PosScreen({ userId }: { userId: string }) {
       });
       setCart(existing ? cart.map((l) => (l.product.id === hit.id ? line : l)) : [...cart, line]);
       setMessage(
-        hit.requiresRx ? { kind: "info", text: `${hit.tradeName} يُصرف بوصفة طبية — تحقّق من الوصفة.` } : null,
+        hit.requiresRx ? { kind: "info", text: `${hit.tradeName} يُصرف بوصفة طبية — أدخل رقم الوصفة واسم الطبيب قبل الإتمام.` } : null,
       );
       setQuery("");
       setLastSale(null);
@@ -171,7 +173,9 @@ export function PosScreen({ userId }: { userId: string }) {
             { method: "cash", amount: tendered ? toInt(tendered) : Math.max(0, totals.total - toInt(cardAmount)) },
           ];
   const settlement = settle(totals.total, payments);
-  const canComplete = cart.length > 0 && settlement.remaining === 0 && !busy;
+  const needsRx = cart.some((l) => l.product.requiresRx);
+  const rxReady = !needsRx || (rxNo.trim() !== "" && prescriber.trim() !== "");
+  const canComplete = cart.length > 0 && settlement.remaining === 0 && rxReady && !busy;
 
   async function complete() {
     if (!canComplete) return;
@@ -187,7 +191,7 @@ export function PosScreen({ userId }: { userId: string }) {
         })),
         invoiceDiscount: toInt(invoiceDiscount),
         payments,
-        userId,
+        prescription: needsRx ? { rxNo: rxNo.trim(), prescriber: prescriber.trim() } : undefined,
       });
       const lines: ReceiptLine[] = cart.map((l) => ({
         name: l.product.tradeName,
@@ -201,6 +205,8 @@ export function PosScreen({ userId }: { userId: string }) {
       setTendered("");
       setCardAmount("");
       setInvoiceDiscount("");
+      setRxNo("");
+      setPrescriber("");
       setPayMode("cash");
       setMessage(null);
       if (query.trim()) setHits(await repo.search(query.trim(), mode));
@@ -481,6 +487,15 @@ export function PosScreen({ userId }: { userId: string }) {
               }}
             />
           </>
+        )}
+        {needsRx && (
+          <fieldset className="rx-box">
+            <legend className="label">وصفة طبية (مطلوبة)</legend>
+            <label htmlFor="rx-no" className="label">رقم الوصفة</label>
+            <input id="rx-no" className="field" value={rxNo} onChange={(e) => setRxNo(e.target.value)} />
+            <label htmlFor="rx-by" className="label">الطبيب</label>
+            <input id="rx-by" className="field" value={prescriber} onChange={(e) => setPrescriber(e.target.value)} />
+          </fieldset>
         )}
         <div className="sum">
           <span>{settlement.remaining > 0 ? "المتبقي" : "الباقي للعميل"}</span>

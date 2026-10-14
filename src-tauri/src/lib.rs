@@ -2,6 +2,8 @@
 //! Everything is stored in one SQLite file in the app's data folder, so the shop keeps selling with no internet.
 //! All stock-changing writes happen here inside a single transaction.
 
+use argon2::password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::Argon2;
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,7 +12,12 @@ use tauri::{Manager, State};
 
 pub struct Db(pub Mutex<Connection>);
 
+/// Id of the user signed in on this device. Write commands take the user from here, never from the screen.
+#[derive(Default)]
+pub struct Session(pub Mutex<Option<String>>);
+
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
+const SALE_CONTROLS_SQL: &str = include_str!("../migrations/0002_sale_controls.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -21,6 +28,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(INIT_SQL)?;
         tx.execute_batch("PRAGMA user_version = 1;")?;
+        tx.commit()?;
+    }
+    if version < 2 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SALE_CONTROLS_SQL)?;
+        tx.execute_batch("PRAGMA user_version = 2;")?;
         tx.commit()?;
     }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
@@ -96,12 +109,37 @@ pub struct PaymentIn {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PrescriptionIn {
+    rx_no: String,
+    prescriber: String,
+}
+
+/// What the screen sends. The seller is the signed-in user, not a field of the draft.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SaleDraft {
     lines: Vec<SaleLineIn>,
     invoice_discount: i64,
     payments: Vec<PaymentIn>,
     patient_id: Option<String>,
-    user_id: String,
+    prescription: Option<PrescriptionIn>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct UserDto {
+    id: String,
+    username: String,
+    full_name: String,
+    role: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthStatus {
+    /// True until the first password is set; the screen then asks the admin to choose one.
+    needs_setup: bool,
+    user: Option<UserDto>,
 }
 
 #[derive(Serialize)]
@@ -279,33 +317,213 @@ fn append_audit(
     Ok(())
 }
 
-#[tauri::command]
-fn post_sale(db: State<'_, Db>, draft: SaleDraft) -> Result<SaleResult, String> {
-    let mut conn = db.0.lock().map_err(err)?;
-    post_sale_inner(&mut conn, draft)
+// ── Sign-in ──
+
+const MIN_PASSWORD_LEN: usize = 8;
+const BAD_LOGIN: &str = "اسم المستخدم أو كلمة المرور غير صحيحة";
+
+fn hash_password(password: &str) -> Result<String, String> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default().hash_password(password.as_bytes(), &salt).map(|h| h.to_string()).map_err(err)
 }
 
-fn post_sale_inner(conn: &mut Connection, draft: SaleDraft) -> Result<SaleResult, String> {
+fn verify_password(password: &str, stored: &str) -> bool {
+    PasswordHash::new(stored)
+        .map(|h| Argon2::default().verify_password(password.as_bytes(), &h).is_ok())
+        .unwrap_or(false)
+}
+
+fn active_user(conn: &Connection, user_id: &str) -> Result<Option<UserDto>, String> {
+    conn.query_row(
+        "SELECT id, username, full_name, role FROM users WHERE id = ?1 AND is_active = 1",
+        params![user_id],
+        |r| Ok(UserDto { id: r.get(0)?, username: r.get(1)?, full_name: r.get(2)?, role: r.get(3)? }),
+    )
+    .optional()
+    .map_err(err)
+}
+
+/// No active user has a password yet: a fresh install, before the admin has chosen one.
+fn needs_setup(conn: &Connection) -> Result<bool, String> {
+    conn.query_row(
+        "SELECT NOT EXISTS (SELECT 1 FROM users WHERE is_active = 1 AND password_hash IS NOT NULL)",
+        [],
+        |r| r.get(0),
+    )
+    .map_err(err)
+}
+
+fn utc_now(conn: &Connection) -> Result<String, String> {
+    conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| r.get(0)).map_err(err)
+}
+
+/// First run only: sets the password of the first admin account and signs it in.
+fn setup_admin_inner(conn: &mut Connection, password: &str) -> Result<UserDto, String> {
+    if password.chars().count() < MIN_PASSWORD_LEN {
+        return Err(format!("كلمة المرور يجب ألا تقل عن {MIN_PASSWORD_LEN} أحرف"));
+    }
+    let tx = conn.transaction().map_err(err)?;
+    if !needs_setup(&tx)? {
+        return Err("تم إعداد كلمة المرور مسبقاً، سجّل الدخول".into());
+    }
+    let admin_id: String = tx
+        .query_row(
+            "SELECT id FROM users WHERE role = 'admin' AND is_active = 1 ORDER BY created_at, id LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()
+        .map_err(err)?
+        .ok_or("لا يوجد حساب مدير لإعداده")?;
+    tx.execute("UPDATE users SET password_hash = ?1 WHERE id = ?2", params![hash_password(password)?, admin_id])
+        .map_err(err)?;
+    let now = utc_now(&tx)?;
+    append_audit(&tx, &admin_id, "user.setup", "users", &admin_id, "{}", &now).map_err(err)?;
+    let user = active_user(&tx, &admin_id)?.ok_or(BAD_LOGIN)?;
+    tx.commit().map_err(err)?;
+    Ok(user)
+}
+
+fn login_inner(conn: &mut Connection, username: &str, password: &str) -> Result<UserDto, String> {
+    let found: Option<(String, Option<String>)> = conn
+        .query_row(
+            "SELECT id, password_hash FROM users WHERE username = ?1 AND is_active = 1",
+            params![username.trim()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(err)?;
+    let user_id = match found {
+        Some((id, Some(hash))) if verify_password(password, &hash) => id,
+        _ => return Err(BAD_LOGIN.into()),
+    };
+    let tx = conn.transaction().map_err(err)?;
+    let now = utc_now(&tx)?;
+    append_audit(&tx, &user_id, "user.login", "users", &user_id, "{}", &now).map_err(err)?;
+    let user = active_user(&tx, &user_id)?.ok_or(BAD_LOGIN)?;
+    tx.commit().map_err(err)?;
+    Ok(user)
+}
+
+#[tauri::command]
+fn auth_status(db: State<'_, Db>, session: State<'_, Session>) -> Result<AuthStatus, String> {
+    let conn = db.0.lock().map_err(err)?;
+    let current = session.0.lock().map_err(err)?.clone();
+    let user = match current {
+        Some(id) => active_user(&conn, &id)?,
+        None => None,
+    };
+    Ok(AuthStatus { needs_setup: needs_setup(&conn)?, user })
+}
+
+#[tauri::command]
+fn setup_admin(db: State<'_, Db>, session: State<'_, Session>, password: String) -> Result<UserDto, String> {
+    let mut conn = db.0.lock().map_err(err)?;
+    let user = setup_admin_inner(&mut conn, &password)?;
+    *session.0.lock().map_err(err)? = Some(user.id.clone());
+    Ok(user)
+}
+
+#[tauri::command]
+fn login(db: State<'_, Db>, session: State<'_, Session>, username: String, password: String) -> Result<UserDto, String> {
+    let mut conn = db.0.lock().map_err(err)?;
+    let user = login_inner(&mut conn, &username, &password)?;
+    *session.0.lock().map_err(err)? = Some(user.id.clone());
+    Ok(user)
+}
+
+#[tauri::command]
+fn logout(session: State<'_, Session>) -> Result<(), String> {
+    *session.0.lock().map_err(err)? = None;
+    Ok(())
+}
+
+// ── Sale rules ──
+
+/// Roles that may give any discount; everyone else is held to the `max_discount_pct` setting.
+const UNLIMITED_DISCOUNT_ROLES: [&str; 2] = ["admin", "chief_pharmacist"];
+/// Roles allowed to dispense prescription-only medicines.
+const RX_ROLES: [&str; 3] = ["admin", "chief_pharmacist", "pharmacist"];
+
+#[tauri::command]
+fn post_sale(db: State<'_, Db>, session: State<'_, Session>, draft: SaleDraft) -> Result<SaleResult, String> {
+    let user_id = session.0.lock().map_err(err)?.clone().ok_or("سجّل الدخول أولاً")?;
+    let mut conn = db.0.lock().map_err(err)?;
+    post_sale_inner(&mut conn, &user_id, draft)
+}
+
+fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Result<SaleResult, String> {
     if draft.lines.is_empty() {
         return Err("الفاتورة فارغة".into());
     }
     let tx = conn.transaction().map_err(err)?;
 
-    // Totals are recomputed here; the screen's numbers are never trusted blindly.
+    // The role is read from the database inside the transaction, so a disabled account cannot keep selling.
+    let role: String = tx
+        .query_row("SELECT role FROM users WHERE id = ?1 AND is_active = 1", params![user_id], |r| r.get(0))
+        .optional()
+        .map_err(err)?
+        .ok_or("الحساب غير موجود أو معطّل، سجّل الدخول من جديد")?;
+
+    // Totals are recomputed here from database prices; the screen's numbers are only checked, never used.
     let mut subtotal = 0i64;
     let mut line_discounts = 0i64;
+    let mut needs_rx = false;
     for l in &draft.lines {
         let qty: i64 = l.allocations.iter().map(|a| a.qty).sum();
         if qty <= 0 || l.allocations.iter().any(|a| a.qty <= 0) {
             return Err("كمية غير صالحة في أحد الأسطر".into());
         }
-        let gross = l.unit_price * qty;
+        let (name, price, requires_rx): (String, i64, bool) = tx
+            .query_row(
+                "SELECT trade_name, sell_price, requires_rx FROM products WHERE id = ?1 AND is_active = 1",
+                params![l.product_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)),
+            )
+            .optional()
+            .map_err(err)?
+            .ok_or("صنف غير موجود أو موقوف، حدّث السلة")?;
+        if l.unit_price != price {
+            return Err(format!("سعر {name} أصبح {price} د.ع، حدّث السلة"));
+        }
+        needs_rx |= requires_rx;
+        let gross = price.checked_mul(qty).ok_or("كمية غير صالحة في أحد الأسطر")?;
+        if l.discount < 0 || l.discount > gross {
+            return Err(format!("خصم غير صالح على {name}"));
+        }
         subtotal += gross;
-        line_discounts += l.discount.clamp(0, gross);
+        line_discounts += l.discount;
     }
     let after_lines = subtotal - line_discounts;
-    let invoice_discount = draft.invoice_discount.clamp(0, after_lines);
+    if draft.invoice_discount < 0 || draft.invoice_discount > after_lines {
+        return Err("خصم الفاتورة غير صالح".into());
+    }
+    let invoice_discount = draft.invoice_discount;
     let total = after_lines - invoice_discount;
+
+    if !UNLIMITED_DISCOUNT_ROLES.contains(&role.as_str()) {
+        let max_pct: i64 = tx
+            .query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0))
+            .optional()
+            .map_err(err)?
+            .unwrap_or(0);
+        if (line_discounts + invoice_discount) * 100 > subtotal * max_pct {
+            return Err(format!("الخصم يتجاوز الحد المسموح ({max_pct}٪ من المجموع)، يحتاج موافقة المدير"));
+        }
+    }
+
+    let prescription = if needs_rx {
+        if !RX_ROLES.contains(&role.as_str()) {
+            return Err("الفاتورة تحتوي دواءً بوصفة طبية ويجب أن يصرفها صيدلاني".into());
+        }
+        let rx = draft.prescription.as_ref().map(|p| (p.rx_no.trim(), p.prescriber.trim()));
+        match rx {
+            Some((no, by)) if !no.is_empty() && !by.is_empty() => Some((no.to_string(), by.to_string())),
+            _ => return Err("الفاتورة تحتوي دواءً بوصفة طبية: أدخل رقم الوصفة واسم الطبيب".into()),
+        }
+    } else {
+        None
+    };
 
     // Settle: card and credit first (never more than owed), cash last (may produce change).
     let mut remaining = total;
@@ -371,7 +589,7 @@ fn post_sale_inner(conn: &mut Connection, draft: SaleDraft) -> Result<SaleResult
             invoice_no,
             branch_id,
             draft.patient_id,
-            draft.user_id,
+            user_id,
             subtotal,
             line_discounts + invoice_discount,
             total,
@@ -381,6 +599,14 @@ fn post_sale_inner(conn: &mut Connection, draft: SaleDraft) -> Result<SaleResult
         ],
     )
     .map_err(err)?;
+    if let Some((rx_no, prescriber)) = &prescription {
+        tx.execute(
+            "INSERT INTO sale_prescriptions(sale_id, rx_no, prescriber, verified_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![sale_id, rx_no, prescriber, user_id, now],
+        )
+        .map_err(err)?;
+    }
 
     for l in &draft.lines {
         let mut discount_left = l.discount.max(0);
@@ -433,7 +659,7 @@ fn post_sale_inner(conn: &mut Connection, draft: SaleDraft) -> Result<SaleResult
             tx.execute(
                 "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, ref_id, user_id, occurred_at)
                  VALUES (?1, ?2, 'sale', ?3, ?4, 'sale', ?5, ?6, ?7)",
-                params![new_id(), a.batch_id, -a.qty, unit_cost, sale_id, draft.user_id, now],
+                params![new_id(), a.batch_id, -a.qty, unit_cost, sale_id, user_id, now],
             )
             .map_err(err)?;
         }
@@ -459,8 +685,15 @@ fn post_sale_inner(conn: &mut Connection, draft: SaleDraft) -> Result<SaleResult
         }
     }
 
-    let payload = serde_json::json!({ "invoiceNo": invoice_no, "total": total, "lines": draft.lines.len() }).to_string();
-    append_audit(&tx, &draft.user_id, "sale.create", "sales", &sale_id, &payload, &now).map_err(err)?;
+    let payload = serde_json::json!({
+        "invoiceNo": invoice_no,
+        "total": total,
+        "lines": draft.lines.len(),
+        "discount": line_discounts + invoice_discount,
+        "rxNo": prescription.as_ref().map(|(no, _)| no),
+    })
+    .to_string();
+    append_audit(&tx, user_id, "sale.create", "sales", &sale_id, &payload, &now).map_err(err)?;
     tx.commit().map_err(err)?;
 
     Ok(SaleResult { sale_id, invoice_no, total, paid, change, created_at: now })
@@ -475,9 +708,14 @@ pub fn run() {
             let conn = Connection::open(dir.join("pharmacy.db"))?;
             migrate(&conn)?;
             app.manage(Db(Mutex::new(conn)));
+            app.manage(Session::default());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            auth_status,
+            setup_admin,
+            login,
+            logout,
             search_products,
             find_by_code,
             alternatives,
@@ -502,13 +740,24 @@ mod tests {
         conn.query_row("SELECT qty_on_hand FROM batches WHERE id = ?1", params![batch], |r| r.get(0)).unwrap()
     }
 
+    const ADMIN: &str = "u-admin";
+
+    fn add_user(conn: &Connection, id: &str, role: &str) {
+        conn.execute(
+            "INSERT INTO users(id, username, full_name, role) VALUES (?1, ?1, ?1, ?2)",
+            params![id, role],
+        )
+        .unwrap();
+    }
+
+    /// Cash sale with a prescription attached, so prescription-only items pass unless a test removes it.
     fn cash_sale(lines: Vec<SaleLineIn>, cash: i64) -> SaleDraft {
         SaleDraft {
             lines,
             invoice_discount: 0,
             payments: vec![PaymentIn { method: "cash".into(), amount: cash, reference: None }],
             patient_id: None,
-            user_id: "u-admin".into(),
+            prescription: Some(PrescriptionIn { rx_no: "RX-1".into(), prescriber: "د. علي".into() }),
         }
     }
 
@@ -557,7 +806,7 @@ mod tests {
     fn sale_reduces_stock_and_writes_ledger() {
         let mut conn = db();
         let draft = cash_sale(vec![line("p-panadol-extra", 3000, &[("b-px-0921", 24), ("b-px-1104", 6)])], 100_000);
-        let r = post_sale_inner(&mut conn, draft).unwrap();
+        let r = post_sale_inner(&mut conn, ADMIN, draft).unwrap();
         assert_eq!(r.total, 90_000);
         assert_eq!(r.change, 10_000);
         assert!(r.invoice_no.ends_with("-000001"));
@@ -578,7 +827,7 @@ mod tests {
             vec![line("p-brufen-400", 3500, &[("b-br-400", 1)]), line("p-ventolin", 7000, &[("b-vt-501", 99)])],
             10_000_000,
         );
-        assert!(post_sale_inner(&mut conn, draft).is_err());
+        assert_rejected(&mut conn, ADMIN, draft, "لم تعد تكفي");
         assert_eq!(qty(&conn, "b-br-400"), 55, "first line must roll back too");
     }
 
@@ -586,14 +835,14 @@ mod tests {
     fn expired_batch_cannot_be_sold() {
         let mut conn = db();
         let draft = cash_sale(vec![line("p-amoxil-500", 4500, &[("b-am-009", 1)])], 4500);
-        assert!(post_sale_inner(&mut conn, draft).is_err());
+        assert_rejected(&mut conn, ADMIN, draft, "انتهت صلاحيتها");
     }
 
     #[test]
     fn underpayment_is_rejected() {
         let mut conn = db();
         let draft = cash_sale(vec![line("p-concor-5", 9000, &[("b-cn-118", 1)])], 5000);
-        assert!(post_sale_inner(&mut conn, draft).is_err());
+        assert_rejected(&mut conn, ADMIN, draft, "أقل من المطلوب");
     }
 
     #[test]
@@ -601,7 +850,7 @@ mod tests {
         let mut conn = db();
         for _ in 0..2 {
             let d = cash_sale(vec![line("p-brufen-400", 3500, &[("b-br-400", 1)])], 3500);
-            post_sale_inner(&mut conn, d).unwrap();
+            post_sale_inner(&mut conn, ADMIN, d).unwrap();
         }
         let (prev2, hash1): (String, String) = conn
             .query_row(
@@ -612,5 +861,225 @@ mod tests {
             .unwrap();
         assert_eq!(prev2, hash1);
         assert!(conn.execute("DELETE FROM audit_log", []).is_err());
+    }
+
+    /// The sale must fail with a message containing `reason`, and leave no sale behind.
+    fn assert_rejected(conn: &mut Connection, user: &str, draft: SaleDraft, reason: &str) {
+        match post_sale_inner(conn, user, draft) {
+            Ok(r) => panic!("sale {} was accepted; expected rejection: {reason}", r.invoice_no),
+            Err(e) => assert!(e.contains(reason), "expected {reason:?}, got {e:?}"),
+        }
+        let sales: i64 = conn.query_row("SELECT COUNT(*) FROM sales", [], |r| r.get(0)).unwrap();
+        assert_eq!(sales, 0, "a rejected sale must roll back");
+    }
+
+    fn brufen(qty: i64, discount: i64) -> SaleLineIn {
+        SaleLineIn { discount, ..line("p-brufen-400", 3500, &[("b-br-400", qty)]) }
+    }
+
+    // ── Prices ──
+
+    #[test]
+    fn price_lower_than_database_is_rejected() {
+        let mut conn = db();
+        let draft = cash_sale(vec![line("p-brufen-400", 1, &[("b-br-400", 10)])], 10);
+        assert_rejected(&mut conn, ADMIN, draft, "أصبح 3500");
+        assert_eq!(qty(&conn, "b-br-400"), 55);
+    }
+
+    #[test]
+    fn price_higher_than_database_is_rejected() {
+        let mut conn = db();
+        let draft = cash_sale(vec![line("p-brufen-400", 9999, &[("b-br-400", 1)])], 9999);
+        assert_rejected(&mut conn, ADMIN, draft, "أصبح 3500");
+    }
+
+    #[test]
+    fn inactive_or_unknown_product_is_rejected() {
+        let mut conn = db();
+        conn.execute("UPDATE products SET is_active = 0 WHERE id = 'p-brufen-400'", []).unwrap();
+        assert_rejected(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500), "موقوف");
+        let ghost = cash_sale(vec![line("p-nope", 3500, &[("b-br-400", 1)])], 3500);
+        assert_rejected(&mut conn, ADMIN, ghost, "غير موجود");
+    }
+
+    #[test]
+    fn batch_of_another_product_is_rejected() {
+        let mut conn = db();
+        // Brufen's price, but stock taken from a Panadol Extra batch.
+        let draft = cash_sale(vec![line("p-brufen-400", 3500, &[("b-px-1104", 1)])], 3500);
+        assert_rejected(&mut conn, ADMIN, draft, "دفعة غير موجودة");
+        assert_eq!(qty(&conn, "b-px-1104"), 60);
+    }
+
+    // ── Discounts ──
+
+    #[test]
+    fn negative_line_discount_is_rejected() {
+        let mut conn = db();
+        assert_rejected(&mut conn, ADMIN, cash_sale(vec![brufen(1, -500)], 4000), "خصم غير صالح");
+    }
+
+    #[test]
+    fn line_discount_above_line_total_is_rejected() {
+        let mut conn = db();
+        assert_rejected(&mut conn, ADMIN, cash_sale(vec![brufen(1, 3501)], 0), "خصم غير صالح");
+    }
+
+    #[test]
+    fn invoice_discount_out_of_range_is_rejected() {
+        let mut conn = db();
+        let mut d = cash_sale(vec![brufen(1, 0)], 0);
+        d.invoice_discount = 3501;
+        assert_rejected(&mut conn, ADMIN, d, "خصم الفاتورة");
+        let mut d = cash_sale(vec![brufen(1, 0)], 4000);
+        d.invoice_discount = -500;
+        assert_rejected(&mut conn, ADMIN, d, "خصم الفاتورة");
+    }
+
+    #[test]
+    fn cashier_discount_is_capped_by_setting() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        // 10 × 3500 = 35,000; the default 10% ceiling allows 3,500 in total (line + invoice).
+        let mut over = cash_sale(vec![brufen(10, 3000)], 35_000);
+        over.invoice_discount = 501;
+        assert_rejected(&mut conn, "u-cash", over, "الحد المسموح (10٪");
+
+        let mut at_limit = cash_sale(vec![brufen(10, 3000)], 31_500);
+        at_limit.invoice_discount = 500;
+        let r = post_sale_inner(&mut conn, "u-cash", at_limit).unwrap();
+        assert_eq!(r.total, 31_500);
+    }
+
+    #[test]
+    fn discount_ceiling_follows_the_setting() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        conn.execute("UPDATE settings SET value = '0' WHERE key = 'max_discount_pct'", []).unwrap();
+        assert_rejected(&mut conn, "u-cash", cash_sale(vec![brufen(1, 1)], 3500), "الحد المسموح (0٪");
+    }
+
+    #[test]
+    fn admin_may_exceed_the_discount_ceiling() {
+        let mut conn = db();
+        let r = post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(1, 1750)], 1750)).unwrap();
+        assert_eq!(r.total, 1750);
+        let stored: i64 = conn.query_row("SELECT discount_total FROM sales", [], |r| r.get(0)).unwrap();
+        assert_eq!(stored, 1750);
+    }
+
+    // ── Prescriptions ──
+
+    fn augmentin() -> SaleLineIn {
+        line("p-augmentin-1g", 18500, &[("b-au-2311", 1)])
+    }
+
+    #[test]
+    fn rx_item_without_prescription_is_rejected() {
+        let mut conn = db();
+        let mut d = cash_sale(vec![brufen(1, 0), augmentin()], 22_000);
+        d.prescription = None;
+        assert_rejected(&mut conn, ADMIN, d, "أدخل رقم الوصفة");
+        assert_eq!(qty(&conn, "b-au-2311"), 18);
+    }
+
+    #[test]
+    fn rx_item_with_blank_prescription_is_rejected() {
+        let mut conn = db();
+        let mut d = cash_sale(vec![augmentin()], 18_500);
+        d.prescription = Some(PrescriptionIn { rx_no: "  ".into(), prescriber: "د. علي".into() });
+        assert_rejected(&mut conn, ADMIN, d, "أدخل رقم الوصفة");
+    }
+
+    #[test]
+    fn cashier_cannot_dispense_rx_items_even_with_prescription() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        assert_rejected(&mut conn, "u-cash", cash_sale(vec![augmentin()], 18_500), "يصرفها صيدلاني");
+        assert_eq!(qty(&conn, "b-au-2311"), 18);
+    }
+
+    #[test]
+    fn cashier_can_sell_otc_items_without_prescription() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        let mut d = cash_sale(vec![brufen(2, 0)], 7000);
+        d.prescription = None;
+        post_sale_inner(&mut conn, "u-cash", d).unwrap();
+        let rx: i64 = conn.query_row("SELECT COUNT(*) FROM sale_prescriptions", [], |r| r.get(0)).unwrap();
+        assert_eq!(rx, 0);
+    }
+
+    #[test]
+    fn pharmacist_rx_sale_records_the_prescription() {
+        let mut conn = db();
+        add_user(&conn, "u-ph", "pharmacist");
+        let r = post_sale_inner(&mut conn, "u-ph", cash_sale(vec![augmentin()], 18_500)).unwrap();
+        let (rx_no, by, verified): (String, String, String) = conn
+            .query_row(
+                "SELECT rx_no, prescriber, verified_by FROM sale_prescriptions WHERE sale_id = ?1",
+                params![r.sale_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rx_no.as_str(), by.as_str(), verified.as_str()), ("RX-1", "د. علي", "u-ph"));
+    }
+
+    // ── Users and sign-in ──
+
+    #[test]
+    fn sale_is_recorded_under_the_given_user() {
+        let mut conn = db();
+        add_user(&conn, "u-ph", "pharmacist");
+        let r = post_sale_inner(&mut conn, "u-ph", cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        let cashier: String =
+            conn.query_row("SELECT cashier_id FROM sales WHERE id = ?1", params![r.sale_id], |r| r.get(0)).unwrap();
+        assert_eq!(cashier, "u-ph");
+    }
+
+    #[test]
+    fn unknown_or_disabled_user_cannot_sell() {
+        let mut conn = db();
+        assert_rejected(&mut conn, "u-ghost", cash_sale(vec![brufen(1, 0)], 3500), "معطّل");
+        add_user(&conn, "u-gone", "pharmacist");
+        conn.execute("UPDATE users SET is_active = 0 WHERE id = 'u-gone'", []).unwrap();
+        assert_rejected(&mut conn, "u-gone", cash_sale(vec![brufen(1, 0)], 3500), "معطّل");
+    }
+
+    #[test]
+    fn first_run_setup_then_login() {
+        let mut conn = db();
+        assert!(needs_setup(&conn).unwrap());
+        assert!(login_inner(&mut conn, "admin", "").is_err(), "no password set yet: nobody can sign in");
+        assert!(setup_admin_inner(&mut conn, "short").unwrap_err().contains("8"));
+
+        let u = setup_admin_inner(&mut conn, "correct horse").unwrap();
+        assert_eq!((u.id.as_str(), u.role.as_str()), (ADMIN, "admin"));
+        assert!(!needs_setup(&conn).unwrap());
+        let stored: String =
+            conn.query_row("SELECT password_hash FROM users WHERE id = ?1", params![ADMIN], |r| r.get(0)).unwrap();
+        assert!(stored.starts_with("$argon2") && !stored.contains("correct horse"));
+
+        assert!(setup_admin_inner(&mut conn, "another password").is_err(), "setup runs only once");
+        assert_eq!(login_inner(&mut conn, "admin", "correct horse").unwrap().id, ADMIN);
+        assert_eq!(login_inner(&mut conn, "admin", "wrong password").unwrap_err(), BAD_LOGIN);
+        assert_eq!(login_inner(&mut conn, "nobody", "correct horse").unwrap_err(), BAD_LOGIN);
+
+        conn.execute("UPDATE users SET is_active = 0 WHERE id = ?1", params![ADMIN]).unwrap();
+        assert_eq!(login_inner(&mut conn, "admin", "correct horse").unwrap_err(), BAD_LOGIN);
+    }
+
+    #[test]
+    fn upgrades_a_version_1_database() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INIT_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        migrate(&conn).unwrap();
+        let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, 2);
+        let pct: String =
+            conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
+        assert_eq!(pct, "10");
     }
 }
