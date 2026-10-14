@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Login } from "./auth/Login.tsx";
 import type { AuthStatus, Role, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
+import { InventoryScreen } from "./inventory/InventoryScreen.tsx";
 import { PosScreen } from "./pos/PosScreen.tsx";
 
 const ROLE_LABEL: Record<Role, string> = {
@@ -12,9 +13,17 @@ const ROLE_LABEL: Record<Role, string> = {
   storekeeper: "أمين مخزن",
 };
 
+type View = "pos" | "inventory";
+
+const VIEWS: { id: View; label: string }[] = [
+  { id: "pos", label: "نقطة البيع" },
+  { id: "inventory", label: "المخزون" },
+];
+
 export function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [error, setError] = useState("");
+  const [view, setView] = useState<View>("pos");
 
   useEffect(() => {
     repo.authStatus().then(setAuth, (e) => setError(String(e)));
@@ -30,6 +39,7 @@ export function App() {
   async function logout() {
     await repo.logout();
     setAuth({ needsSetup: false, user: null });
+    setView("pos");
   }
 
   return (
@@ -38,8 +48,17 @@ export function App() {
         <div className="topbar-start">
           <strong className="brand">نظام الصيدلية</strong>
           <nav aria-label="الوحدات" className="modules">
-            <a href="#pos" className="module active" aria-current="page">نقطة البيع</a>
-            <span className="module soon" title="المرحلة التالية">المخزون</span>
+            {VIEWS.map((v) => (
+              <button
+                key={v.id}
+                type="button"
+                className={`module ${view === v.id ? "active" : ""}`}
+                aria-current={view === v.id ? "page" : undefined}
+                onClick={() => setView(v.id)}
+              >
+                {v.label}
+              </button>
+            ))}
             <span className="module soon" title="المرحلة التالية">المشتريات</span>
             <span className="module soon" title="المرحلة التالية">التقارير</span>
           </nav>
@@ -57,7 +76,11 @@ export function App() {
           </button>
         </div>
       </header>
-      <PosScreen key={user.id} />
+      {/* The POS stays mounted while hidden so a half-built sale survives a look at the stock. */}
+      <div className="view" hidden={view !== "pos"}>
+        <PosScreen key={user.id} visible={view === "pos"} />
+      </div>
+      {view === "inventory" && <InventoryScreen key={user.id} user={user} />}
     </div>
   );
 }

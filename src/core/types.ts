@@ -84,3 +84,70 @@ export interface SaleResult {
   change: number;
   createdAt: string;
 }
+
+// ── Inventory ──
+
+/** Roles allowed to add products and change stock; every signed-in user may view inventory. */
+export const INVENTORY_ROLES: Role[] = ["admin", "chief_pharmacist", "pharmacist", "storekeeper"];
+
+export interface InventoryItem {
+  id: string;
+  barcode: string | null;
+  tradeName: string;
+  tradeNameAr: string | null;
+  category: string | null;
+  form: string;
+  strength: string;
+  packSize: number;
+  price: number;
+  requiresRx: boolean;
+  stock: number; // sellable (non-expired) quantity
+  expiredQty: number; // still on the shelf in expired batches
+  nearestExpiry: string | null; // next batch FEFO will sell
+  reorderLevel: number | null; // at or below this the item is low
+}
+
+export interface InventoryBatch {
+  id: string;
+  batchNo: string;
+  expiryDate: string;
+  qtyOnHand: number;
+  unitCost: number;
+  sellPrice: number;
+  status: string;
+  receivedAt: string;
+}
+
+export interface Category {
+  id: string;
+  nameAr: string;
+}
+
+export interface NewProduct {
+  tradeName: string;
+  tradeNameAr?: string;
+  categoryId?: string;
+  dosageForm: string;
+  strength: string;
+  packSize: number;
+  price: number;
+  requiresRx: boolean;
+  barcode?: string;
+  reorderLevel?: number;
+}
+
+/** Goods received as a new batch. */
+export interface ReceiveBatchInput {
+  productId: string;
+  batchNo: string;
+  expiryDate: string;
+  qty: number;
+  unitCost: number;
+}
+
+/** Stock count: sets a batch to the counted quantity. */
+export interface AdjustBatchInput {
+  batchId: string;
+  newQty: number;
+  reason: string;
+}

@@ -44,6 +44,36 @@ await page.keyboard.press("F12");
 await page.waitForSelector(".banner.success");
 await page.screenshot({ path: "screenshots/4-sold.png" });
 
+// Inventory: stock reflects the sale, filters, a new product and its first batch
+await page.getByRole("button", { name: "المخزون" }).click();
+await page.waitForSelector(".inv-table tbody tr");
+await page.screenshot({ path: "screenshots/5-inventory.png" });
+await page.getByRole("button", { name: /مخزون منخفض/ }).click();
+await page.screenshot({ path: "screenshots/6-inventory-low.png" });
+await page.getByRole("button", { name: /^الكل/ }).click();
+
+await page.getByRole("button", { name: "+ صنف جديد" }).click();
+await page.fill("#np-name", "Zyrtec 10 mg");
+await page.fill("#np-name-ar", "زيرتك");
+await page.fill("#np-strength", "10 mg");
+await page.fill("#np-pack", "10");
+await page.fill("#np-price", "5000");
+await page.selectOption("#np-cat", "cat-otc");
+await page.fill("#np-barcode", "6281000000017");
+await page.fill("#np-reorder", "20");
+await page.screenshot({ path: "screenshots/7-new-product.png" });
+await page.getByRole("button", { name: "حفظ الصنف" }).click();
+
+// Saving opens the batches dialog so the first stock can be received straight away
+await page.waitForSelector("#rc-batch");
+await page.fill("#rc-batch", "ZY001");
+await page.fill("#rc-exp", "2028-06-30");
+await page.fill("#rc-qty", "40");
+await page.fill("#rc-cost", "3500");
+await page.getByRole("button", { name: "استلام", exact: true }).click();
+await page.waitForSelector(".modal .banner.success");
+await page.screenshot({ path: "screenshots/8-received.png" });
+
 await browser.close();
 if (errors.length) {
   console.error(errors.join("\n"));

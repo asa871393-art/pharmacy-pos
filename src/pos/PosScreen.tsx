@@ -32,7 +32,8 @@ function toInt(s: string): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-export function PosScreen() {
+/** `visible` is false while another screen is shown; the shortcuts (F12 completes a sale) are then ignored. */
+export function PosScreen({ visible = true }: { visible?: boolean }) {
   const today = localToday();
   const searchRef = useRef<HTMLInputElement>(null);
   const tenderedRef = useRef<HTMLInputElement>(null);
@@ -221,6 +222,7 @@ export function PosScreen() {
   // ── Keyboard shortcuts ──
   const keyHandler = useRef<(e: KeyboardEvent) => void>(() => {});
   keyHandler.current = (e: KeyboardEvent) => {
+    if (!visible) return;
     const map: Record<string, () => void> = {
       F2: () => searchRef.current?.focus(),
       F4: () => {
@@ -246,6 +248,9 @@ export function PosScreen() {
     searchRef.current?.focus();
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+  useEffect(() => {
+    if (visible) searchRef.current?.focus();
+  }, [visible]);
 
   function onSearchKey(e: ReactKeyboardEvent<HTMLInputElement>) {
     if (e.key === "ArrowDown") {

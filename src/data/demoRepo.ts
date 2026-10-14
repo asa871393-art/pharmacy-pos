@@ -3,12 +3,29 @@
 
 import { addDays, availableQty, sellableBatches } from "../core/fefo.ts";
 import { computeTotals, settle } from "../core/totals.ts";
-import type { Batch, ProductHit, Role, SaleDraft, SaleResult, SearchMode, User } from "../core/types.ts";
+import {
+  INVENTORY_ROLES,
+  type AdjustBatchInput,
+  type Batch,
+  type Category,
+  type InventoryItem,
+  type NewProduct,
+  type ProductHit,
+  type ReceiveBatchInput,
+  type Role,
+  type SaleDraft,
+  type SaleResult,
+  type SearchMode,
+  type User,
+} from "../core/types.ts";
 import { localToday, type PharmacyRepo } from "./repo.ts";
 
 interface DemoProduct {
   id: string;
   tradeName: string;
+  tradeNameAr?: string;
+  /** Seeded products leave this out and are filed under Rx/OTC; added products set it (null = none). */
+  categoryId?: string | null;
   ingredients: { inn: string; ar: string; cls: string }[];
   strength: string;
   form: string;
@@ -16,8 +33,16 @@ interface DemoProduct {
   price: number;
   rx: boolean;
   key: string;
-  barcode: string;
+  barcode?: string;
 }
+
+const categories: Category[] = [
+  { id: "cat-rx", nameAr: "أدوية بوصفة" },
+  { id: "cat-otc", nameAr: "أدوية بدون وصفة" },
+];
+
+// Same as reorder_rules in demo_seed.sql.
+const reorderLevels: Record<string, number> = { "p-panadol-extra": 60, "p-amoxil-500": 25, "p-ventolin": 15 };
 
 const ing = {
   metformin: { inn: "Metformin", ar: "ميتفورمين", cls: "biguanide" },
@@ -107,6 +132,40 @@ export function createDemoRepo(): PharmacyRepo {
     };
   };
 
+  const toInventory = (p: DemoProduct): InventoryItem => {
+    const own = batches.filter((b) => b.productId === p.id);
+    const categoryId = p.categoryId === undefined ? (p.rx ? "cat-rx" : "cat-otc") : p.categoryId;
+    return {
+      id: p.id,
+      barcode: p.barcode ?? null,
+      tradeName: p.tradeName,
+      tradeNameAr: p.tradeNameAr ?? null,
+      category: categories.find((c) => c.id === categoryId)?.nameAr ?? null,
+      form: p.form,
+      strength: p.strength,
+      packSize: p.packSize,
+      price: p.price,
+      requiresRx: p.rx,
+      stock: availableQty(own, { today }),
+      expiredQty: own.filter((b) => b.expiryDate <= today).reduce((s, b) => s + b.qtyOnHand, 0),
+      nearestExpiry: sellableBatches(own, { today })[0]?.expiryDate ?? null,
+      reorderLevel: reorderLevels[p.id] ?? null,
+    };
+  };
+
+  // Same checks as the inventory commands in src-tauri/src/lib.rs.
+  const requireInventoryRole = () => {
+    if (!current) throw new Error("سجّل الدخول أولاً");
+    if (!INVENTORY_ROLES.includes(current.role)) throw new Error("ليست لديك صلاحية لتعديل المخزون");
+    return current;
+  };
+  const productById = (id: string) => {
+    const p = products.find((x) => x.id === id);
+    if (!p) throw new Error("صنف غير موجود أو موقوف");
+    return p;
+  };
+  const isIsoDate = (d: string) => /^\d{4}-\d{2}-\d{2}$/.test(d) && new Date(d + "T00:00:00Z").toISOString().slice(0, 10) === d;
+
   const norm = (s: string) => s.toLowerCase();
   const matchesTrade = (p: DemoProduct, t: string) => norm(p.tradeName).includes(t) || norm(p.strength).includes(t);
   const matchesGeneric = (p: DemoProduct, t: string) =>
@@ -144,7 +203,7 @@ export function createDemoRepo(): PharmacyRepo {
       return sortHits(found.map(toHit));
     },
     async findByCode(codes: string[]) {
-      const p = products.find((x) => codes.includes(x.barcode));
+      const p = products.find((x) => x.barcode !== undefined && codes.includes(x.barcode));
       return p ? toHit(p) : null;
     },
     async alternatives(productId: string) {
@@ -202,6 +261,86 @@ export function createDemoRepo(): PharmacyRepo {
         change: s.change,
         createdAt: new Date().toISOString(),
       };
+    },
+    async inventory() {
+      if (!current) throw new Error("سجّل الدخول أولاً");
+      return products.map(toInventory).sort((a, b) => a.tradeName.localeCompare(b.tradeName));
+    },
+    async inventoryBatches(productId: string) {
+      return batches
+        .filter((b) => b.productId === productId && b.qtyOnHand > 0)
+        .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate) || a.receivedAt.localeCompare(b.receivedAt))
+        .map((b) => ({ ...b, status: "active" }));
+    },
+    async categories() {
+      return categories;
+    },
+    async addProduct(input: NewProduct) {
+      requireInventoryRole();
+      const [name, form, strength] = [input.tradeName.trim(), input.dosageForm.trim(), input.strength.trim()];
+      if (!name || !form || !strength) throw new Error("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة");
+      if (!(input.price > 0)) throw new Error("سعر البيع يجب أن يكون أكبر من صفر");
+      if (!(input.packSize >= 1)) throw new Error("حجم العبوة يجب أن يكون ١ على الأقل");
+      if (input.reorderLevel !== undefined && input.reorderLevel < 0) throw new Error("حد إعادة الطلب لا يكون سالباً");
+      const barcode = input.barcode?.trim() || undefined;
+      if (barcode) {
+        if (!/^\d{8,14}$/.test(barcode)) throw new Error("الباركود يجب أن يكون من ٨ إلى ١٤ رقماً");
+        const owner = products.find((p) => p.barcode === barcode);
+        if (owner) throw new Error(`الباركود مسجّل مسبقاً للصنف ${owner.tradeName}`);
+      }
+      const categoryId = input.categoryId?.trim() || null;
+      if (categoryId && !categories.some((c) => c.id === categoryId)) throw new Error("التصنيف غير موجود");
+      const p: DemoProduct = {
+        id: `p-demo-${Date.now()}`,
+        tradeName: name,
+        tradeNameAr: input.tradeNameAr?.trim() || undefined,
+        categoryId,
+        ingredients: [],
+        strength,
+        form,
+        packSize: input.packSize,
+        price: input.price,
+        rx: input.requiresRx,
+        key: "",
+        barcode,
+      };
+      products.push(p);
+      if (input.reorderLevel !== undefined) reorderLevels[p.id] = input.reorderLevel;
+      return toInventory(p);
+    },
+    async receiveBatch(input: ReceiveBatchInput) {
+      requireInventoryRole();
+      const batchNo = input.batchNo.trim();
+      if (!batchNo) throw new Error("رقم الدفعة مطلوب");
+      if (!(input.qty > 0)) throw new Error("الكمية يجب أن تكون أكبر من صفر");
+      if (input.unitCost < 0) throw new Error("سعر الشراء لا يكون سالباً");
+      if (!isIsoDate(input.expiryDate)) throw new Error("تاريخ الانتهاء غير صالح");
+      if (input.expiryDate <= today) throw new Error("لا يُستلم مخزون منتهي الصلاحية");
+      const p = productById(input.productId);
+      if (batches.some((b) => b.productId === p.id && b.batchNo === batchNo)) {
+        throw new Error(`الدفعة ${batchNo} موجودة مسبقاً لهذا الصنف، عدّل كميتها بدلاً من ذلك`);
+      }
+      batches.push({
+        id: `b-demo-${Date.now()}`,
+        productId: p.id,
+        batchNo,
+        expiryDate: input.expiryDate,
+        qtyOnHand: input.qty,
+        unitCost: input.unitCost,
+        sellPrice: p.price,
+        receivedAt: new Date().toISOString(),
+      });
+      return toInventory(p);
+    },
+    async adjustBatch(input: AdjustBatchInput) {
+      requireInventoryRole();
+      if (!input.reason.trim()) throw new Error("سبب التعديل مطلوب");
+      if (input.newQty < 0) throw new Error("الكمية لا تكون سالبة");
+      const b = batches.find((x) => x.id === input.batchId);
+      if (!b) throw new Error("الدفعة غير موجودة");
+      if (input.newQty === b.qtyOnHand) throw new Error("الكمية الجديدة مساوية للحالية");
+      b.qtyOnHand = input.newQty;
+      return toInventory(productById(b.productId));
     },
   };
 }

@@ -699,6 +699,400 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
     Ok(SaleResult { sale_id, invoice_no, total, paid, change, created_at: now })
 }
 
+// ── Inventory ──
+
+/// Roles allowed to create products and change stock. Every signed-in user may view inventory.
+const INVENTORY_ROLES: [&str; 4] = ["admin", "chief_pharmacist", "pharmacist", "storekeeper"];
+
+fn session_user(session: &State<'_, Session>) -> Result<String, String> {
+    session.0.lock().map_err(err)?.clone().ok_or_else(|| "سجّل الدخول أولاً".to_string())
+}
+
+/// The user's role, read from the database; fails if the account is disabled or the role is not in `allowed`.
+fn require_role(conn: &Connection, user_id: &str, allowed: &[&str]) -> Result<String, String> {
+    let role: String = conn
+        .query_row("SELECT role FROM users WHERE id = ?1 AND is_active = 1", params![user_id], |r| r.get(0))
+        .optional()
+        .map_err(err)?
+        .ok_or("الحساب غير موجود أو معطّل، سجّل الدخول من جديد")?;
+    if !allowed.contains(&role.as_str()) {
+        return Err("ليست لديك صلاحية لتعديل المخزون".into());
+    }
+    Ok(role)
+}
+
+/// True when `d` is a real calendar date written as YYYY-MM-DD.
+fn is_iso_date(conn: &Connection, d: &str) -> Result<bool, String> {
+    conn.query_row("SELECT date(?1) IS NOT NULL AND date(?1) = ?1", params![d], |r| r.get(0)).map_err(err)
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryItem {
+    id: String,
+    barcode: Option<String>,
+    trade_name: String,
+    trade_name_ar: Option<String>,
+    category: Option<String>,
+    form: String,
+    strength: String,
+    pack_size: i64,
+    price: i64,
+    requires_rx: bool,
+    /// Sellable quantity: active batches that have not expired.
+    stock: i64,
+    /// Quantity still on the shelf in expired batches (must be removed, never sold).
+    expired_qty: i64,
+    /// Earliest expiry among sellable batches — the next one FEFO will sell.
+    nearest_expiry: Option<String>,
+    /// From reorder_rules; at or below this the item counts as low stock.
+    reorder_level: Option<i64>,
+}
+
+const INVENTORY_SELECT: &str = "SELECT p.id,
+  (SELECT code FROM product_barcodes pb WHERE pb.product_id = p.id ORDER BY code LIMIT 1),
+  p.trade_name, p.trade_name_ar, c.name_ar, p.dosage_form, p.strength_label, p.pack_size, p.sell_price, p.requires_rx,
+  COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
+            AND b.expiry_date > date('now', 'localtime')), 0),
+  COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id
+            AND (b.status = 'expired' OR b.expiry_date <= date('now', 'localtime'))), 0),
+  (SELECT MIN(b.expiry_date) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
+            AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime')),
+  (SELECT rr.reorder_level FROM reorder_rules rr WHERE rr.product_id = p.id LIMIT 1)
+  FROM products p LEFT JOIN categories c ON c.id = p.category_id
+  WHERE p.is_active = 1";
+
+fn map_inventory(r: &rusqlite::Row) -> rusqlite::Result<InventoryItem> {
+    Ok(InventoryItem {
+        id: r.get(0)?,
+        barcode: r.get(1)?,
+        trade_name: r.get(2)?,
+        trade_name_ar: r.get(3)?,
+        category: r.get(4)?,
+        form: r.get(5)?,
+        strength: r.get(6)?,
+        pack_size: r.get(7)?,
+        price: r.get(8)?,
+        requires_rx: r.get::<_, i64>(9)? != 0,
+        stock: r.get(10)?,
+        expired_qty: r.get(11)?,
+        nearest_expiry: r.get(12)?,
+        reorder_level: r.get(13)?,
+    })
+}
+
+fn inventory_list_inner(conn: &Connection) -> Result<Vec<InventoryItem>, String> {
+    let mut stmt = conn.prepare(&format!("{INVENTORY_SELECT} ORDER BY p.trade_name")).map_err(err)?;
+    let rows = stmt.query_map([], map_inventory).map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+fn inventory_item(conn: &Connection, product_id: &str) -> Result<InventoryItem, String> {
+    conn.query_row(&format!("{INVENTORY_SELECT} AND p.id = ?1"), params![product_id], map_inventory).map_err(err)
+}
+
+#[tauri::command]
+fn inventory_list(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<InventoryItem>, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    inventory_list_inner(&conn)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InventoryBatch {
+    id: String,
+    batch_no: String,
+    expiry_date: String,
+    qty_on_hand: i64,
+    unit_cost: i64,
+    sell_price: i64,
+    status: String,
+    received_at: String,
+}
+
+/// Every batch of a product that still holds stock, expired ones included, in FEFO order.
+fn inventory_batches_inner(conn: &Connection, product_id: &str) -> Result<Vec<InventoryBatch>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, batch_no, expiry_date, qty_on_hand, unit_cost, sell_price, status, received_at
+             FROM batches WHERE product_id = ?1 AND qty_on_hand > 0 ORDER BY expiry_date, received_at",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![product_id], |r| {
+            Ok(InventoryBatch {
+                id: r.get(0)?,
+                batch_no: r.get(1)?,
+                expiry_date: r.get(2)?,
+                qty_on_hand: r.get(3)?,
+                unit_cost: r.get(4)?,
+                sell_price: r.get(5)?,
+                status: r.get(6)?,
+                received_at: r.get(7)?,
+            })
+        })
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+#[tauri::command]
+fn inventory_batches(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    product_id: String,
+) -> Result<Vec<InventoryBatch>, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    inventory_batches_inner(&conn, &product_id)
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Category {
+    id: String,
+    name_ar: String,
+}
+
+#[tauri::command]
+fn list_categories(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<Category>, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    let mut stmt = conn.prepare("SELECT id, name_ar FROM categories ORDER BY name_ar").map_err(err)?;
+    let rows = stmt.query_map([], |r| Ok(Category { id: r.get(0)?, name_ar: r.get(1)? })).map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewProduct {
+    trade_name: String,
+    trade_name_ar: Option<String>,
+    category_id: Option<String>,
+    dosage_form: String,
+    strength: String,
+    pack_size: i64,
+    price: i64,
+    requires_rx: bool,
+    barcode: Option<String>,
+    reorder_level: Option<i64>,
+}
+
+fn non_empty(s: &Option<String>) -> Option<String> {
+    s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+}
+
+fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Result<InventoryItem, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    let (name, form, strength) = (p.trade_name.trim(), p.dosage_form.trim(), p.strength.trim());
+    if name.is_empty() || form.is_empty() || strength.is_empty() {
+        return Err("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة".into());
+    }
+    if p.price <= 0 {
+        return Err("سعر البيع يجب أن يكون أكبر من صفر".into());
+    }
+    if p.pack_size < 1 {
+        return Err("حجم العبوة يجب أن يكون ١ على الأقل".into());
+    }
+    if p.reorder_level.is_some_and(|n| n < 0) {
+        return Err("حد إعادة الطلب لا يكون سالباً".into());
+    }
+    let barcode = non_empty(&p.barcode);
+    if let Some(code) = &barcode {
+        if !code.chars().all(|c| c.is_ascii_digit()) || !(8..=14).contains(&code.len()) {
+            return Err("الباركود يجب أن يكون من ٨ إلى ١٤ رقماً".into());
+        }
+        let owner: Option<String> = tx
+            .query_row(
+                "SELECT p.trade_name FROM product_barcodes b JOIN products p ON p.id = b.product_id WHERE b.code = ?1",
+                params![code],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(err)?;
+        if let Some(owner) = owner {
+            return Err(format!("الباركود مسجّل مسبقاً للصنف {owner}"));
+        }
+    }
+    let category = non_empty(&p.category_id);
+    if let Some(c) = &category {
+        let exists: bool = tx
+            .query_row("SELECT EXISTS (SELECT 1 FROM categories WHERE id = ?1)", params![c], |r| r.get(0))
+            .map_err(err)?;
+        if !exists {
+            return Err("التصنيف غير موجود".into());
+        }
+    }
+
+    let id = new_id();
+    tx.execute(
+        "INSERT INTO products(id, trade_name, trade_name_ar, category_id, dosage_form, strength_label, pack_size,
+                              requires_rx, sell_price)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, name, non_empty(&p.trade_name_ar), category, form, strength, p.pack_size, p.requires_rx, p.price],
+    )
+    .map_err(err)?;
+    if let Some(code) = &barcode {
+        tx.execute("INSERT INTO product_barcodes(code, product_id) VALUES (?1, ?2)", params![code, id]).map_err(err)?;
+    }
+    if let Some(level) = p.reorder_level {
+        tx.execute(
+            "INSERT INTO reorder_rules(product_id, branch_id, reorder_level)
+             SELECT ?1, id, ?2 FROM branches ORDER BY created_at LIMIT 1",
+            params![id, level],
+        )
+        .map_err(err)?;
+    }
+    let now = utc_now(&tx)?;
+    let payload = serde_json::json!({ "tradeName": name, "price": p.price, "barcode": barcode }).to_string();
+    append_audit(&tx, user_id, "product.create", "products", &id, &payload, &now).map_err(err)?;
+    let item = inventory_item(&tx, &id)?;
+    tx.commit().map_err(err)?;
+    Ok(item)
+}
+
+#[tauri::command]
+fn add_product(db: State<'_, Db>, session: State<'_, Session>, product: NewProduct) -> Result<InventoryItem, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    add_product_inner(&mut conn, &user_id, product)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiveBatch {
+    product_id: String,
+    batch_no: String,
+    expiry_date: String,
+    qty: i64,
+    unit_cost: i64,
+}
+
+/// Adds stock as a new batch (goods received without a purchase invoice).
+fn receive_batch_inner(conn: &mut Connection, user_id: &str, b: ReceiveBatch) -> Result<InventoryItem, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    let batch_no = b.batch_no.trim();
+    if batch_no.is_empty() {
+        return Err("رقم الدفعة مطلوب".into());
+    }
+    if b.qty <= 0 {
+        return Err("الكمية يجب أن تكون أكبر من صفر".into());
+    }
+    if b.unit_cost < 0 {
+        return Err("سعر الشراء لا يكون سالباً".into());
+    }
+    if !is_iso_date(&tx, &b.expiry_date)? {
+        return Err("تاريخ الانتهاء غير صالح".into());
+    }
+    let future: bool = tx
+        .query_row("SELECT ?1 > date('now', 'localtime')", params![b.expiry_date], |r| r.get(0))
+        .map_err(err)?;
+    if !future {
+        return Err("لا يُستلم مخزون منتهي الصلاحية".into());
+    }
+    let price: i64 = tx
+        .query_row("SELECT sell_price FROM products WHERE id = ?1 AND is_active = 1", params![b.product_id], |r| r.get(0))
+        .optional()
+        .map_err(err)?
+        .ok_or("صنف غير موجود أو موقوف")?;
+    let branch_id: String = tx
+        .query_row("SELECT id FROM branches ORDER BY created_at LIMIT 1", [], |r| r.get(0))
+        .map_err(err)?;
+    let duplicate: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM batches WHERE product_id = ?1 AND branch_id = ?2 AND batch_no = ?3)",
+            params![b.product_id, branch_id, batch_no],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if duplicate {
+        return Err(format!("الدفعة {batch_no} موجودة مسبقاً لهذا الصنف، عدّل كميتها بدلاً من ذلك"));
+    }
+
+    let id = new_id();
+    let now = utc_now(&tx)?;
+    tx.execute(
+        "INSERT INTO batches(id, product_id, branch_id, batch_no, expiry_date, unit_cost, sell_price, qty_on_hand, received_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![id, b.product_id, branch_id, batch_no, b.expiry_date, b.unit_cost, price, b.qty, now],
+    )
+    .map_err(err)?;
+    tx.execute(
+        "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, user_id, occurred_at)
+         VALUES (?1, ?2, 'purchase', ?3, ?4, 'manual_receipt', ?5, ?6)",
+        params![new_id(), id, b.qty, b.unit_cost, user_id, now],
+    )
+    .map_err(err)?;
+    let payload = serde_json::json!({ "productId": b.product_id, "batchNo": batch_no, "qty": b.qty }).to_string();
+    append_audit(&tx, user_id, "batch.receive", "batches", &id, &payload, &now).map_err(err)?;
+    let item = inventory_item(&tx, &b.product_id)?;
+    tx.commit().map_err(err)?;
+    Ok(item)
+}
+
+#[tauri::command]
+fn receive_batch(db: State<'_, Db>, session: State<'_, Session>, batch: ReceiveBatch) -> Result<InventoryItem, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    receive_batch_inner(&mut conn, &user_id, batch)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustBatch {
+    batch_id: String,
+    /// The quantity actually counted on the shelf.
+    new_qty: i64,
+    reason: String,
+}
+
+/// Stock count correction: sets a batch to the counted quantity and records the difference as an 'adjust' movement.
+fn adjust_batch_inner(conn: &mut Connection, user_id: &str, a: AdjustBatch) -> Result<InventoryItem, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    let reason = a.reason.trim();
+    if reason.is_empty() {
+        return Err("سبب التعديل مطلوب".into());
+    }
+    if a.new_qty < 0 {
+        return Err("الكمية لا تكون سالبة".into());
+    }
+    let (product_id, old_qty, unit_cost): (String, i64, i64) = tx
+        .query_row("SELECT product_id, qty_on_hand, unit_cost FROM batches WHERE id = ?1", params![a.batch_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .optional()
+        .map_err(err)?
+        .ok_or("الدفعة غير موجودة")?;
+    let delta = a.new_qty - old_qty;
+    if delta == 0 {
+        return Err("الكمية الجديدة مساوية للحالية".into());
+    }
+    let now = utc_now(&tx)?;
+    tx.execute("UPDATE batches SET qty_on_hand = ?1 WHERE id = ?2", params![a.new_qty, a.batch_id]).map_err(err)?;
+    tx.execute(
+        "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, user_id, occurred_at)
+         VALUES (?1, ?2, 'adjust', ?3, ?4, 'stock_count', ?5, ?6)",
+        params![new_id(), a.batch_id, delta, unit_cost, user_id, now],
+    )
+    .map_err(err)?;
+    let payload =
+        serde_json::json!({ "from": old_qty, "to": a.new_qty, "reason": reason }).to_string();
+    append_audit(&tx, user_id, "batch.adjust", "batches", &a.batch_id, &payload, &now).map_err(err)?;
+    let item = inventory_item(&tx, &product_id)?;
+    tx.commit().map_err(err)?;
+    Ok(item)
+}
+
+#[tauri::command]
+fn adjust_batch(db: State<'_, Db>, session: State<'_, Session>, adjustment: AdjustBatch) -> Result<InventoryItem, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    adjust_batch_inner(&mut conn, &user_id, adjustment)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -720,7 +1114,13 @@ pub fn run() {
             find_by_code,
             alternatives,
             product_batches,
-            post_sale
+            post_sale,
+            inventory_list,
+            inventory_batches,
+            list_categories,
+            add_product,
+            receive_batch,
+            adjust_batch
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -1081,5 +1481,166 @@ mod tests {
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
+    }
+
+    // ── Inventory ──
+
+    fn find<'a>(items: &'a [InventoryItem], id: &str) -> &'a InventoryItem {
+        items.iter().find(|i| i.id == id).unwrap()
+    }
+
+    fn count(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |r| r.get(0)).unwrap()
+    }
+
+    fn new_product(name: &str, barcode: Option<&str>) -> NewProduct {
+        NewProduct {
+            trade_name: name.into(),
+            trade_name_ar: Some("زيرتك".into()),
+            category_id: Some("cat-otc".into()),
+            dosage_form: "قرص".into(),
+            strength: "10 mg".into(),
+            pack_size: 10,
+            price: 5000,
+            requires_rx: false,
+            barcode: barcode.map(String::from),
+            reorder_level: Some(20),
+        }
+    }
+
+    fn receive(product: &str, batch_no: &str, expiry: &str, qty: i64) -> ReceiveBatch {
+        ReceiveBatch {
+            product_id: product.into(),
+            batch_no: batch_no.into(),
+            expiry_date: expiry.into(),
+            qty,
+            unit_cost: 3500,
+        }
+    }
+
+    #[test]
+    fn inventory_lists_every_product_with_stock_expiry_and_category() {
+        let conn = db();
+        let items = inventory_list_inner(&conn).unwrap();
+        assert_eq!(items.len(), 12);
+        let amoxil = find(&items, "p-amoxil-500");
+        assert_eq!((amoxil.stock, amoxil.expired_qty), (18, 4), "expired batch is counted apart");
+        assert_eq!(amoxil.reorder_level, Some(25));
+        assert_eq!(amoxil.barcode.as_deref(), Some("2000000000084"));
+        assert_eq!(amoxil.category.as_deref(), Some("أدوية بوصفة"));
+        let px = find(&items, "p-panadol-extra");
+        assert_eq!(px.stock, 180);
+        let earliest: String = conn
+            .query_row("SELECT expiry_date FROM batches WHERE id = 'b-px-0921'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(px.nearest_expiry.as_deref(), Some(earliest.as_str()));
+    }
+
+    #[test]
+    fn inventory_batches_include_expired_stock_in_fefo_order() {
+        let conn = db();
+        let batches = inventory_batches_inner(&conn, "p-amoxil-500").unwrap();
+        let nos: Vec<_> = batches.iter().map(|b| b.batch_no.as_str()).collect();
+        assert_eq!(nos, ["AM009", "AM014"]);
+    }
+
+    #[test]
+    fn add_product_creates_product_barcode_reorder_rule_and_audit() {
+        let mut conn = db();
+        let item = add_product_inner(&mut conn, ADMIN, new_product("Zyrtec 10 mg", Some("6281000000017"))).unwrap();
+        assert_eq!((item.stock, item.price, item.reorder_level), (0, 5000, Some(20)));
+        assert_eq!(item.category.as_deref(), Some("أدوية بدون وصفة"));
+        let hit = search_inner(&conn, "zyrtec", "trade").unwrap();
+        assert_eq!(hit.len(), 1, "a new product is searchable at the till");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'product.create'"), 1);
+    }
+
+    #[test]
+    fn add_product_rejects_bad_input() {
+        let mut conn = db();
+        let dup = new_product("Copy", Some("2000000000046"));
+        assert!(add_product_inner(&mut conn, ADMIN, dup).unwrap_err().contains("Panadol Extra"));
+        let bad_code = new_product("X", Some("12ab"));
+        assert!(add_product_inner(&mut conn, ADMIN, bad_code).unwrap_err().contains("الباركود"));
+        let free = NewProduct { price: 0, ..new_product("X", None) };
+        assert!(add_product_inner(&mut conn, ADMIN, free).unwrap_err().contains("سعر البيع"));
+        let blank = NewProduct { trade_name: "  ".into(), ..new_product("X", None) };
+        assert!(add_product_inner(&mut conn, ADMIN, blank).unwrap_err().contains("مطلوبة"));
+        let ghost_cat = NewProduct { category_id: Some("cat-nope".into()), ..new_product("X", None) };
+        assert!(add_product_inner(&mut conn, ADMIN, ghost_cat).unwrap_err().contains("التصنيف"));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM products"), 12, "nothing was saved");
+    }
+
+    #[test]
+    fn cashier_cannot_change_inventory() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        let e = add_product_inner(&mut conn, "u-cash", new_product("X", None)).unwrap_err();
+        assert!(e.contains("صلاحية"));
+        let e = receive_batch_inner(&mut conn, "u-cash", receive("p-brufen-400", "BR9", "2099-01-01", 5)).unwrap_err();
+        assert!(e.contains("صلاحية"));
+        let adj = AdjustBatch { batch_id: "b-br-400".into(), new_qty: 0, reason: "جرد".into() };
+        assert!(adjust_batch_inner(&mut conn, "u-cash", adj).unwrap_err().contains("صلاحية"));
+        assert_eq!(qty(&conn, "b-br-400"), 55);
+    }
+
+    #[test]
+    fn storekeeper_receives_a_new_batch() {
+        let mut conn = db();
+        add_user(&conn, "u-store", "storekeeper");
+        let item = receive_batch_inner(&mut conn, "u-store", receive("p-brufen-400", "BR500", "2099-06-30", 40)).unwrap();
+        assert_eq!(item.stock, 95);
+        let (sell, kind, moved): (i64, String, i64) = conn
+            .query_row(
+                "SELECT b.sell_price, m.type, m.qty FROM batches b JOIN stock_movements m ON m.batch_id = b.id
+                 WHERE b.batch_no = 'BR500'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((sell, kind.as_str(), moved), (3500, "purchase", 40), "priced from the product, logged as a movement");
+    }
+
+    #[test]
+    fn receive_batch_rejects_bad_input() {
+        let mut conn = db();
+        let cases = [
+            (receive("p-brufen-400", "BR400", "2099-01-01", 5), "موجودة مسبقاً"),
+            (receive("p-brufen-400", "X1", "2020-01-01", 5), "منتهي الصلاحية"),
+            (receive("p-brufen-400", "X1", "2099-02-30", 5), "تاريخ الانتهاء غير صالح"),
+            (receive("p-brufen-400", "X1", "next year", 5), "تاريخ الانتهاء غير صالح"),
+            (receive("p-brufen-400", "X1", "2099-01-01", 0), "الكمية"),
+            (receive("p-brufen-400", " ", "2099-01-01", 5), "رقم الدفعة"),
+            (receive("p-nope", "X1", "2099-01-01", 5), "غير موجود"),
+        ];
+        for (input, reason) in cases {
+            let e = receive_batch_inner(&mut conn, ADMIN, input).unwrap_err();
+            assert!(e.contains(reason), "expected {reason:?}, got {e:?}");
+        }
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM batches"), 15);
+    }
+
+    #[test]
+    fn stock_count_adjustment_records_the_difference() {
+        let mut conn = db();
+        let adj = AdjustBatch { batch_id: "b-br-400".into(), new_qty: 50, reason: "جرد شهري".into() };
+        let item = adjust_batch_inner(&mut conn, ADMIN, adj).unwrap();
+        assert_eq!(item.stock, 50);
+        assert_eq!(count(&conn, "SELECT qty FROM stock_movements WHERE type = 'adjust'"), -5);
+        // Stock still equals the sum of movements.
+        assert_eq!(count(&conn, "SELECT SUM(qty) FROM stock_movements WHERE batch_id = 'b-br-400'"), 50);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'batch.adjust'"), 1);
+    }
+
+    #[test]
+    fn adjustment_rejects_bad_input() {
+        let mut conn = db();
+        let adj = |qty: i64, reason: &str| AdjustBatch { batch_id: "b-br-400".into(), new_qty: qty, reason: reason.into() };
+        assert!(adjust_batch_inner(&mut conn, ADMIN, adj(40, " ")).unwrap_err().contains("سبب"));
+        assert!(adjust_batch_inner(&mut conn, ADMIN, adj(-1, "جرد")).unwrap_err().contains("سالبة"));
+        assert!(adjust_batch_inner(&mut conn, ADMIN, adj(55, "جرد")).unwrap_err().contains("مساوية"));
+        let ghost = AdjustBatch { batch_id: "b-nope".into(), new_qty: 1, reason: "جرد".into() };
+        assert!(adjust_batch_inner(&mut conn, ADMIN, ghost).unwrap_err().contains("غير موجودة"));
+        assert_eq!(qty(&conn, "b-br-400"), 55);
     }
 }

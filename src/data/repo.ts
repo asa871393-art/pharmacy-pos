@@ -1,4 +1,18 @@
-import type { AuthStatus, Batch, ProductHit, SaleDraft, SaleResult, SearchMode, User } from "../core/types.ts";
+import type {
+  AdjustBatchInput,
+  AuthStatus,
+  Batch,
+  Category,
+  InventoryBatch,
+  InventoryItem,
+  NewProduct,
+  ProductHit,
+  ReceiveBatchInput,
+  SaleDraft,
+  SaleResult,
+  SearchMode,
+  User,
+} from "../core/types.ts";
 
 /** Everything the screens need from storage. Two implementations: SQLite in the desktop app, memory in the browser demo. */
 export interface PharmacyRepo {
@@ -14,6 +28,14 @@ export interface PharmacyRepo {
   batches(productId: string): Promise<Batch[]>;
   /** Posted as the signed-in user. */
   postSale(draft: SaleDraft): Promise<SaleResult>;
+  inventory(): Promise<InventoryItem[]>;
+  /** All batches still holding stock, expired ones included, in FEFO order. */
+  inventoryBatches(productId: string): Promise<InventoryBatch[]>;
+  categories(): Promise<Category[]>;
+  // Inventory writes need an INVENTORY_ROLES user; each returns the product's updated row.
+  addProduct(product: NewProduct): Promise<InventoryItem>;
+  receiveBatch(batch: ReceiveBatchInput): Promise<InventoryItem>;
+  adjustBatch(adjustment: AdjustBatchInput): Promise<InventoryItem>;
 }
 
 export function localToday(): string {

@@ -1,5 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { AuthStatus, Batch, ProductHit, SaleDraft, SaleResult, SearchMode, User } from "../core/types.ts";
+import type {
+  AdjustBatchInput,
+  AuthStatus,
+  Batch,
+  Category,
+  InventoryBatch,
+  InventoryItem,
+  NewProduct,
+  ProductHit,
+  ReceiveBatchInput,
+  SaleDraft,
+  SaleResult,
+  SearchMode,
+  User,
+} from "../core/types.ts";
 import type { PharmacyRepo } from "./repo.ts";
 
 export const tauriRepo: PharmacyRepo = {
@@ -13,4 +27,10 @@ export const tauriRepo: PharmacyRepo = {
   alternatives: (productId: string) => invoke<ProductHit[]>("alternatives", { productId }),
   batches: (productId: string) => invoke<Batch[]>("product_batches", { productId }),
   postSale: (draft: SaleDraft) => invoke<SaleResult>("post_sale", { draft }),
+  inventory: () => invoke<InventoryItem[]>("inventory_list"),
+  inventoryBatches: (productId: string) => invoke<InventoryBatch[]>("inventory_batches", { productId }),
+  categories: () => invoke<Category[]>("list_categories"),
+  addProduct: (product: NewProduct) => invoke<InventoryItem>("add_product", { product }),
+  receiveBatch: (batch: ReceiveBatchInput) => invoke<InventoryItem>("receive_batch", { batch }),
+  adjustBatch: (adjustment: AdjustBatchInput) => invoke<InventoryItem>("adjust_batch", { adjustment }),
 };
