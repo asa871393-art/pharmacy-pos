@@ -1,15 +1,12 @@
-<<<<<<< HEAD
-node_modules/
-data/
-uploads/
-*.db
-*.db-wal
-*.db-shm
-=======
 node_modules
 dist
 src-tauri/target
 src-tauri/gen
+data/
+uploads/
+screenshots/
+*.db
+*.db-wal
+*.db-shm
 *.log
 .DS_Store
->>>>>>> ea4894bb21719294b4e8037ff2bcb77992cdaa0e
