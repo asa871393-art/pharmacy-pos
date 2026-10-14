@@ -306,3 +306,14 @@ button.module:hover:not(.active) { background: #24413b; color: #fff; }
 .audit-raw pre { margin: 8px 0 0; padding: 10px 12px; background: var(--ground); border-radius: 8px; font-size: 12px; overflow: auto; max-height: 220px; text-align: left; }
 .audit-hash { font-size: 11px; overflow-wrap: anywhere; }
 .batch-summary .btn { margin-inline-start: auto; }
+
+/* Cloud sync badge (top bar, dark background) */
+.status.sync-synced .dot { background: #5fd1a8; }
+.status.sync-syncing .dot { background: #f2c94c; animation: sync-pulse 1.2s ease-in-out infinite; }
+.status.sync-offline .dot { background: #ff7a6b; }
+.status.sync-error .dot { background: #ffa53d; }
+.status.sync-disabled .dot { background: #9aa7a3; }
+.sync-count { background: rgba(255, 255, 255, 0.14); border-radius: 999px; padding: 0 7px; font-size: 12px; }
+@keyframes sync-pulse { 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) { .status.sync-syncing .dot { animation: none; } }
+.banner.warn { background: var(--warn-soft); color: var(--warn); border: 1px solid #f0d9a8; }

@@ -352,6 +352,41 @@ export interface AuditRow {
 /** Audit screen quick filters (see audit_category in src-tauri/src/lib.rs). */
 export type AuditCategory = "inventory" | "users" | "prices" | "login" | "sales" | "settings";
 
+// ── Cloud sync ──
+
+/** disabled: not set up · offline: cloud unreachable · syncing: pushing or pulling · synced · error: cloud refused. */
+export type SyncState = "disabled" | "offline" | "syncing" | "synced" | "error";
+
+export interface SyncStatus {
+  state: SyncState;
+  /** Changes saved locally and waiting to be sent. */
+  pending: number;
+  /** Changes the cloud refused several times; "sync now" retries them. */
+  failed: number;
+  /** UTC ISO time of the last complete sync. */
+  lastSyncAt: string | null;
+  lastError: string | null;
+}
+
+export interface SyncSettings {
+  enabled: boolean;
+  url: string;
+  /** The key and secret are never sent back to the screen, only whether they are set. */
+  hasKey: boolean;
+  hasSecret: boolean;
+  deviceId: string;
+  deviceName: string;
+}
+
+export interface SyncSettingsInput {
+  enabled: boolean;
+  url: string;
+  /** Empty keeps the saved value. */
+  key?: string;
+  secret?: string;
+  deviceName: string;
+}
+
 export interface SaleSettings {
   /** Largest discount as a percentage of the subtotal, for every role except admin and chief pharmacist. */
   maxDiscountPct: number;

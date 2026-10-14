@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
 mod phone_scanner;
+mod sync;
 
 pub struct Db(pub Mutex<Connection>);
 
@@ -23,6 +24,7 @@ const SALE_CONTROLS_SQL: &str = include_str!("../migrations/0002_sale_controls.s
 const USER_PERMISSIONS_SQL: &str = include_str!("../migrations/0003_user_permissions.sql");
 const RECEIPT_SETTINGS_SQL: &str = include_str!("../migrations/0004_receipt_settings.sql");
 const REPORT_INDEXES_SQL: &str = include_str!("../migrations/0005_report_indexes.sql");
+const SYNC_QUEUE_SQL: &str = include_str!("../migrations/0006_sync_queue.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -59,11 +61,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.execute_batch("PRAGMA user_version = 5;")?;
         tx.commit()?;
     }
+    if version < 6 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(SYNC_QUEUE_SQL)?;
+        // This computer's id in the cloud, and everything recorded so far, queued for the first push.
+        tx.execute(
+            "INSERT OR IGNORE INTO settings(key, value) VALUES ('sync_device_id', ?1)",
+            [uuid::Uuid::now_v7().to_string()],
+        )?;
+        sync::backfill(&tx)?;
+        tx.execute_batch("PRAGMA user_version = 6;")?;
+        tx.commit()?;
+    }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
     let products: i64 = conn.query_row("SELECT COUNT(*) FROM products", [], |r| r.get(0))?;
     if products == 0 {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(DEMO_SQL)?;
+        sync::backfill(&tx)?;
         tx.commit()?;
     }
     Ok(())
@@ -470,7 +485,8 @@ fn append_audit(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![user_id, action, entity, entity_id, payload, prev, hash, occurred_at],
     )?;
-    Ok(())
+    let row = sync::rows_json(tx, "SELECT * FROM audit_log WHERE seq = ?1", [tx.last_insert_rowid()])?;
+    sync::enqueue(tx, "AUDIT_LOG", &serde_json::json!({ "entries": row }))
 }
 
 // ── Sign-in ──
@@ -855,6 +871,7 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
     })
     .to_string();
     append_audit(&tx, user_id, "sale.create", "sales", &sale_id, &payload, &now).map_err(err)?;
+    sync::enqueue(&tx, "POST_SALE", &sync::sale_payload(&tx, &sale_id).map_err(err)?).map_err(err)?;
     tx.commit().map_err(err)?;
 
     Ok(SaleResult { sale_id, invoice_no, total, paid, change, created_at: now })
@@ -1142,6 +1159,7 @@ fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Res
         serde_json::json!({ "tradeName": name, "price": p.price, "barcode": barcode, "to": product_snapshot(&tx, &id)? })
             .to_string();
     append_audit(&tx, user_id, "product.create", "products", &id, &payload, &now).map_err(err)?;
+    sync::enqueue(&tx, "UPDATE_PRODUCT", &sync::product_payload(&tx, &id).map_err(err)?).map_err(err)?;
     let item = inventory_item(&tx, &id)?;
     tx.commit().map_err(err)?;
     Ok(item)
@@ -1218,6 +1236,7 @@ fn update_product_inner(conn: &mut Connection, user_id: &str, id: &str, p: NewPr
         let payload = serde_json::json!({ "from": from, "to": to }).to_string();
         append_audit(&tx, user_id, "product.update", "products", id, &payload, &now).map_err(err)?;
     }
+    sync::enqueue(&tx, "UPDATE_PRODUCT", &sync::product_payload(&tx, id).map_err(err)?).map_err(err)?;
     let item = inventory_item(&tx, id)?;
     tx.commit().map_err(err)?;
     Ok(item)
@@ -1302,12 +1321,14 @@ fn receive_batch_inner(conn: &mut Connection, user_id: &str, b: ReceiveBatch) ->
         params![id, b.product_id, branch_id, batch_no, b.expiry_date, b.unit_cost, price, b.qty, now],
     )
     .map_err(err)?;
+    let movement_id = new_id();
     tx.execute(
         "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, user_id, occurred_at)
          VALUES (?1, ?2, 'purchase', ?3, ?4, 'manual_receipt', ?5, ?6)",
-        params![new_id(), id, b.qty, b.unit_cost, user_id, now],
+        params![movement_id, id, b.qty, b.unit_cost, user_id, now],
     )
     .map_err(err)?;
+    sync::enqueue(&tx, "ADD_PURCHASE", &sync::movement_payload(&tx, &movement_id).map_err(err)?).map_err(err)?;
     let payload = serde_json::json!({
         "productId": b.product_id,
         "batchNo": batch_no,
@@ -1364,12 +1385,14 @@ fn adjust_batch_inner(conn: &mut Connection, user_id: &str, a: AdjustBatch) -> R
     }
     let now = utc_now(&tx)?;
     tx.execute("UPDATE batches SET qty_on_hand = ?1 WHERE id = ?2", params![a.new_qty, a.batch_id]).map_err(err)?;
+    let movement_id = new_id();
     tx.execute(
         "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, user_id, occurred_at)
          VALUES (?1, ?2, 'adjust', ?3, ?4, 'stock_count', ?5, ?6)",
-        params![new_id(), a.batch_id, delta, unit_cost, user_id, now],
+        params![movement_id, a.batch_id, delta, unit_cost, user_id, now],
     )
     .map_err(err)?;
+    sync::enqueue(&tx, "STOCK_ADJUST", &sync::movement_payload(&tx, &movement_id).map_err(err)?).map_err(err)?;
     let payload = serde_json::json!({ "from": { "qty": old_qty }, "to": { "qty": a.new_qty }, "reason": reason }).to_string();
     append_audit(&tx, user_id, "batch.adjust", "batches", &a.batch_id, &payload, &now).map_err(err)?;
     let item = inventory_item(&tx, &product_id)?;
@@ -1731,6 +1754,7 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
                 serde_json::json!({ "from": old, "to": price, "source": "purchase", "invoiceId": invoice_id, "invoiceNo": invoice_no })
                     .to_string();
             append_audit(&tx, user_id, "product.price", "products", product_id, &payload, &now).map_err(err)?;
+            sync::enqueue(&tx, "UPDATE_PRODUCT", &sync::product_payload(&tx, product_id).map_err(err)?).map_err(err)?;
             price_changes.push(name);
         }
     }
@@ -1766,6 +1790,7 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
     })
     .to_string();
     append_audit(&tx, user_id, "purchase.post", "purchase_invoices", &invoice_id, &payload, &now).map_err(err)?;
+    sync::enqueue(&tx, "ADD_PURCHASE", &sync::purchase_payload(&tx, &invoice_id).map_err(err)?).map_err(err)?;
     tx.commit().map_err(err)?;
 
     Ok(PurchaseResult {
@@ -3103,6 +3128,134 @@ fn recent_sales(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<Re
     recent_sales_inner(&conn, &user_id)
 }
 
+// ── Cloud sync ──
+// The worker is in sync.rs. Settings are admin only; the key and secret are write-only (never sent back to the screen)
+// and never written to the audit log.
+
+#[tauri::command]
+fn sync_status(handle: State<'_, sync::SyncHandle>) -> sync::SyncStatus {
+    handle.0.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Sync again now, including entries the cloud rejected before.
+#[tauri::command]
+fn sync_now(db: State<'_, Db>, session: State<'_, Session>) -> Result<(), String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    conn.execute("UPDATE sync_queue SET attempts = 0 WHERE sent_at IS NULL", []).map_err(err)?;
+    sync::nudge();
+    Ok(())
+}
+
+#[derive(Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSettings {
+    enabled: bool,
+    url: String,
+    has_key: bool,
+    has_secret: bool,
+    device_id: String,
+    device_name: String,
+}
+
+fn sync_settings_inner(conn: &Connection) -> Result<SyncSettings, String> {
+    let c = sync::load_config(conn).map_err(err)?;
+    Ok(SyncSettings {
+        enabled: c.enabled,
+        url: c.url,
+        has_key: !c.key.is_empty(),
+        has_secret: !c.secret.is_empty(),
+        device_id: c.device_id,
+        device_name: c.device_name,
+    })
+}
+
+#[tauri::command]
+fn sync_settings(db: State<'_, Db>, session: State<'_, Session>) -> Result<SyncSettings, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    if active_role(&conn, &user_id)? != "admin" {
+        return Err("إعدادات المزامنة للمدير فقط".into());
+    }
+    sync_settings_inner(&conn)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncSettingsIn {
+    enabled: bool,
+    url: String,
+    /// None or empty keeps the saved key.
+    key: Option<String>,
+    secret: Option<String>,
+    device_name: String,
+}
+
+fn save_sync_settings_inner(conn: &mut Connection, user_id: &str, s: SyncSettingsIn) -> Result<SyncSettings, String> {
+    let tx = conn.transaction().map_err(err)?;
+    if active_role(&tx, user_id)? != "admin" {
+        return Err("إعدادات المزامنة للمدير فقط".into());
+    }
+    let url = s.url.trim().trim_end_matches('/').to_string();
+    // Plain http only for a server on this computer (testing).
+    let allowed = ["https://", "http://localhost", "http://127.0.0.1"];
+    if !url.is_empty() && !allowed.iter().any(|p| url.starts_with(p)) {
+        return Err("عنوان الخادم يجب أن يبدأ بـ https://".into());
+    }
+    let device_name = s.device_name.trim().to_string();
+    if device_name.chars().count() > 60 {
+        return Err("اسم الجهاز حتى ٦٠ حرفاً".into());
+    }
+    let before = sync_settings_inner(&tx)?;
+    let set = |key: &str, value: &str| {
+        tx.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map(|_| ())
+        .map_err(err)
+    };
+    set("sync_url", &url)?;
+    set("sync_device_name", &device_name)?;
+    let new_key = s.key.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    let new_secret = s.secret.as_deref().map(str::trim).filter(|k| !k.is_empty());
+    if let Some(k) = new_key {
+        set("sync_key", k)?;
+    }
+    if let Some(k) = new_secret {
+        set("sync_secret", k)?;
+    }
+    let after = sync_settings_inner(&tx)?;
+    if s.enabled && (after.url.is_empty() || !after.has_key || !after.has_secret) {
+        return Err("لتفعيل المزامنة أدخل عنوان الخادم والمفتاح وكلمة سر المزامنة".into());
+    }
+    set("sync_enabled", if s.enabled { "1" } else { "0" })?;
+    let after = sync_settings_inner(&tx)?;
+    if after != before || new_key.is_some() || new_secret.is_some() {
+        let view = |x: &SyncSettings| serde_json::json!({ "enabled": x.enabled, "url": x.url, "deviceName": x.device_name });
+        let mut payload = serde_json::json!({ "from": view(&before), "to": view(&after) });
+        // Only that they changed, never the values.
+        if new_key.is_some() {
+            payload["keyChanged"] = true.into();
+        }
+        if new_secret.is_some() {
+            payload["secretChanged"] = true.into();
+        }
+        let now = utc_now(&tx)?;
+        append_audit(&tx, user_id, "settings.sync", "settings", "sync", &payload.to_string(), &now).map_err(err)?;
+    }
+    tx.commit().map_err(err)?;
+    sync::nudge();
+    Ok(after)
+}
+
+#[tauri::command]
+fn save_sync_settings(db: State<'_, Db>, session: State<'_, Session>, settings: SyncSettingsIn) -> Result<SyncSettings, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    save_sync_settings_inner(&mut conn, &user_id, settings)
+}
+
 // ── Phone scanner ──
 
 /// The computer's address on the local network (e.g. 192.168.1.20).
@@ -3165,8 +3318,17 @@ pub fn run() {
             std::fs::create_dir_all(&dir)?;
             let conn = Connection::open(dir.join("pharmacy.db"))?;
             migrate(&conn)?;
+            let initial = sync::status_with(&conn, sync::SyncState::Disabled, None)?;
             app.manage(Db(Mutex::new(conn)));
             app.manage(Session::default());
+
+            // Cloud sync: the worker publishes its status as the `sync-status` event.
+            app.manage(sync::SyncHandle(Mutex::new(initial)));
+            let handle = app.handle().clone();
+            sync::start(app.handle().clone(), move |status| {
+                *handle.state::<sync::SyncHandle>().0.lock().unwrap_or_else(|e| e.into_inner()) = status.clone();
+                let _ = handle.emit(sync::EVENT, status);
+            });
 
             // Phone scanner: scans arrive as the `phone-barcode-scanned` event. A new pairing token on every start.
             let handle = app.handle().clone();
@@ -3219,6 +3381,10 @@ pub fn run() {
             receipt_settings,
             save_receipt_settings,
             sale_receipt,
+            sync_status,
+            sync_now,
+            sync_settings,
+            save_sync_settings,
             recent_sales
         ])
         .run(tauri::generate_context!())
@@ -3576,7 +3742,7 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 5);
+        assert_eq!(v, 6);
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
@@ -4593,5 +4759,357 @@ mod tests {
 
         add_user(&conn, "u-ph", "pharmacist");
         assert!(post_sale_inner(&mut conn, "u-ph", cash_sale(vec![brufen(2, 100)], 7000)).unwrap_err().contains("0٪"));
+    }
+
+    // ── Cloud sync ──
+
+    fn queue(conn: &Connection) -> Vec<(String, serde_json::Value)> {
+        let mut stmt = conn.prepare("SELECT kind, payload FROM sync_queue WHERE sent_at IS NULL ORDER BY seq").unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, serde_json::from_str(&r.get::<_, String>(1)?).unwrap())))
+            .unwrap();
+        rows.map(Result::unwrap).collect()
+    }
+
+    fn kinds(conn: &Connection) -> Vec<String> {
+        queue(conn).into_iter().map(|(k, _)| k).collect()
+    }
+
+    fn clear_queue(conn: &Connection) {
+        conn.execute("DELETE FROM sync_queue", []).unwrap();
+    }
+
+    #[test]
+    fn a_new_install_queues_its_catalog_and_opening_stock() {
+        let conn = db();
+        let q = queue(&conn);
+        let products = count(&conn, "SELECT COUNT(*) FROM products");
+        assert_eq!(q.iter().filter(|(k, _)| k == "UPDATE_PRODUCT").count() as i64, products);
+        let moved: i64 = q
+            .iter()
+            .filter(|(k, _)| k == "STOCK_ADJUST")
+            .flat_map(|(_, p)| p["movements"].as_array().unwrap().clone())
+            .map(|m| m["qty"].as_i64().unwrap())
+            .sum();
+        assert_eq!(moved, count(&conn, "SELECT SUM(qty) FROM stock_movements"), "every opening movement, once");
+        assert!(q.iter().all(|(k, _)| k != "POST_SALE"));
+        let device = count(&conn, "SELECT LENGTH(value) FROM settings WHERE key = 'sync_device_id'");
+        assert_eq!(device, 36, "a uuid for this computer");
+    }
+
+    #[test]
+    fn every_write_adds_its_outbox_entry_in_the_same_transaction() {
+        let mut conn = db();
+        clear_queue(&conn);
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![augmentin()], 18_500)).unwrap();
+        assert_eq!(kinds(&conn), ["AUDIT_LOG", "POST_SALE"]);
+        let sale = &queue(&conn)[1].1;
+        assert_eq!(sale["items"].as_array().unwrap().len(), 1);
+        assert_eq!(sale["movements"][0]["qty"], -1);
+        assert_eq!(sale["batches"][0]["id"], sale["movements"][0]["batch_id"]);
+        assert_eq!(sale["prescription"]["rx_no"], "RX-1");
+        assert_eq!(sale["payments"][0]["method"], "cash");
+
+        // A write that fails queues nothing.
+        clear_queue(&conn);
+        assert!(post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(2, 0)], 10)).is_err());
+        assert!(kinds(&conn).is_empty());
+
+        add_product_inner(&mut conn, ADMIN, new_product("Zyrtec 10 mg", Some("6281000000017"))).unwrap();
+        assert_eq!(kinds(&conn), ["AUDIT_LOG", "UPDATE_PRODUCT"]);
+        assert_eq!(queue(&conn)[1].1["barcodes"][0]["code"], "6281000000017");
+
+        clear_queue(&conn);
+        adjust_batch_inner(&mut conn, ADMIN, AdjustBatch { batch_id: "b-br-400".into(), new_qty: 50, reason: "جرد".into() })
+            .unwrap();
+        receive_batch_inner(&mut conn, ADMIN, receive("p-brufen-400", "NEW-1", "2030-01-01", 12)).unwrap();
+        assert_eq!(kinds(&conn), ["STOCK_ADJUST", "AUDIT_LOG", "ADD_PURCHASE", "AUDIT_LOG"]);
+
+        clear_queue(&conn);
+        let expiry: String = conn.query_row("SELECT expiry_date FROM batches WHERE id = 'b-br-400'", [], |r| r.get(0)).unwrap();
+        let inv = purchase("INV-9", "cash", vec![pline("p-brufen-400", "BR400", &expiry, 10, 2400, 3750)]);
+        post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        let k = kinds(&conn);
+        assert!(k.contains(&"ADD_PURCHASE".to_string()) && k.contains(&"UPDATE_PRODUCT".to_string()), "{k:?}");
+        let (_, p) = queue(&conn).into_iter().find(|(k, _)| k == "ADD_PURCHASE").unwrap();
+        assert_eq!(p["invoice"]["supplier_invoice_no"], "INV-9");
+        assert_eq!(p["movements"][0]["qty"], 10);
+    }
+
+    fn doc(v: serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+        v.as_object().unwrap().clone()
+    }
+
+    #[test]
+    fn pulled_stock_is_the_cloud_total_plus_what_is_not_pushed_yet() {
+        let mut conn = db();
+        clear_queue(&conn);
+        // Not pushed yet: this till sold 2 Brufen.
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(2, 0)], 7000)).unwrap();
+        let brufen_batch = doc(sync::rows_json(&conn, "SELECT * FROM batches WHERE id = 'b-br-400'", []).unwrap()[0].clone());
+        let mut panadol = doc(sync::rows_json(&conn, "SELECT * FROM products WHERE id = 'p-panadol-extra'", []).unwrap()[0].clone());
+        panadol.insert("sell_price".into(), 3300.into());
+        let mut other_till_batch = brufen_batch.clone();
+        other_till_batch.insert("id".into(), "b-other-till".into());
+        other_till_batch.insert("batch_no".into(), "OT-1".into());
+        other_till_batch.insert("supplier_id".into(), "s-only-on-that-till".into());
+        let mut orphan = other_till_batch.clone();
+        orphan.insert("id".into(), "b-orphan".into());
+        orphan.insert("product_id".into(), "p-unknown".into());
+
+        let pull = sync::Pull {
+            categories: vec![doc(serde_json::json!({ "id": "cat-new", "name_ar": "مستلزمات" }))],
+            products: vec![sync::PulledProduct {
+                doc: panadol,
+                barcodes: vec![doc(serde_json::json!({ "code": "9990000000001", "product_id": "p-panadol-extra" }))],
+                reorder: vec![],
+            }],
+            batches: vec![
+                // The cloud saw 50 sold elsewhere: 55 opening − 5 = 50.
+                sync::PulledBatch { doc: brufen_batch, qty: 50 },
+                sync::PulledBatch { doc: other_till_batch, qty: 30 },
+                sync::PulledBatch { doc: orphan, qty: 5 },
+            ],
+            cursor: 42,
+        };
+        sync::apply_pull(&mut conn, &pull).unwrap();
+        assert_eq!(qty(&conn, "b-br-400"), 48, "cloud 50 minus this till's unpushed 2");
+        assert_eq!(qty(&conn, "b-other-till"), 30);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM batches WHERE id = 'b-other-till' AND supplier_id IS NULL"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM batches WHERE id = 'b-orphan'"), 0, "unknown product: skipped");
+        assert_eq!(count(&conn, "SELECT sell_price FROM products WHERE id = 'p-panadol-extra'"), 3300);
+        let codes = count(&conn, "SELECT COUNT(*) FROM product_barcodes WHERE product_id = 'p-panadol-extra'");
+        assert_eq!(codes, 1, "the cloud's barcode list replaces the local one");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM categories WHERE id = 'cat-new'"), 1);
+        assert_eq!(count(&conn, "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'sync_cursor'"), 42);
+    }
+
+    #[test]
+    fn a_pull_does_not_overwrite_a_product_edit_still_in_the_outbox() {
+        let mut conn = db();
+        clear_queue(&conn);
+        let mut f = brufen_form();
+        f.trade_name_ar = product_snapshot(&conn, "p-brufen-400").unwrap()["tradeNameAr"].as_str().map(String::from);
+        f.price = 4000;
+        update_product_inner(&mut conn, ADMIN, "p-brufen-400", f).unwrap();
+        let mut stale = doc(sync::rows_json(&conn, "SELECT * FROM products WHERE id = 'p-brufen-400'", []).unwrap()[0].clone());
+        stale.insert("sell_price".into(), 3500.into());
+        let pull = sync::Pull { products: vec![sync::PulledProduct { doc: stale, ..Default::default() }], cursor: 1, ..Default::default() };
+        sync::apply_pull(&mut conn, &pull).unwrap();
+        assert_eq!(count(&conn, "SELECT sell_price FROM products WHERE id = 'p-brufen-400'"), 4000);
+    }
+
+    #[test]
+    fn sync_settings_are_admin_only_and_keep_secrets_out_of_the_log() {
+        let mut conn = db();
+        add_user(&conn, "u-chief", "chief_pharmacist");
+        let input = |enabled: bool, key: Option<&str>| SyncSettingsIn {
+            enabled,
+            url: "https://abc.supabase.co/".into(),
+            key: key.map(String::from),
+            secret: key.map(|_| "shop-secret-123".to_string()),
+            device_name: "الكاشير ١".into(),
+        };
+        assert!(save_sync_settings_inner(&mut conn, "u-chief", input(false, None)).unwrap_err().contains("للمدير"));
+        assert!(save_sync_settings_inner(&mut conn, ADMIN, input(true, None)).unwrap_err().contains("المفتاح"));
+        let mut bad = input(false, None);
+        bad.url = "ftp://x".into();
+        assert!(save_sync_settings_inner(&mut conn, ADMIN, bad).is_err());
+
+        let s = save_sync_settings_inner(&mut conn, ADMIN, input(true, Some("anon-key-xyz"))).unwrap();
+        assert_eq!((s.enabled, s.url.as_str(), s.has_key, s.has_secret), (true, "https://abc.supabase.co", true, true));
+        let logged: String = conn.query_row("SELECT payload FROM audit_log WHERE action = 'settings.sync'", [], |r| r.get(0)).unwrap();
+        assert!(!logged.contains("anon-key-xyz") && !logged.contains("shop-secret-123"), "{logged}");
+        assert!(logged.contains("keyChanged"));
+        // Saving again without a key keeps the stored one.
+        assert!(save_sync_settings_inner(&mut conn, ADMIN, input(true, None)).unwrap().has_key);
+        assert_eq!(sync::load_config(&conn).unwrap().key, "anon-key-xyz");
+    }
+
+    // A stand-in for the two Supabase functions, enough to drive the client: it records what was pushed and
+    // answers pulls with whatever the test put in `pull`.
+    #[derive(Default)]
+    struct MockCloud {
+        pushed: Vec<serde_json::Value>,
+        reject_kind: Option<String>,
+        status: Option<u16>,
+        pull: serde_json::Value,
+        pulls: Vec<i64>,
+    }
+
+    async fn mock_cloud(state: Arc<Mutex<MockCloud>>) -> String {
+        use axum::{extract::State as AxState, http::StatusCode, routing::post, Json, Router};
+        type S = Arc<Mutex<MockCloud>>;
+        async fn push(AxState(s): AxState<S>, Json(body): Json<serde_json::Value>) -> (StatusCode, Json<serde_json::Value>) {
+            let mut m = s.lock().unwrap();
+            if let Some(code) = m.status {
+                return (StatusCode::from_u16(code).unwrap(), Json(serde_json::json!({ "message": "sync secret is wrong" })));
+            }
+            let mut failed = vec![];
+            for e in body["p_entries"].as_array().unwrap() {
+                if Some(e["kind"].as_str().unwrap()) == m.reject_kind.as_deref() {
+                    failed.push(serde_json::json!({ "id": e["id"], "error": "rejected by test" }));
+                } else {
+                    m.pushed.push(e.clone());
+                }
+            }
+            (StatusCode::OK, Json(serde_json::json!({ "applied": m.pushed.len(), "failed": failed })))
+        }
+        async fn pull(AxState(s): AxState<S>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let mut m = s.lock().unwrap();
+            m.pulls.push(body["p_since"].as_i64().unwrap());
+            Json(m.pull.clone())
+        }
+        let app = Router::new()
+            .route("/rest/v1/rpc/pos_sync_push", post(push))
+            .route("/rest/v1/rpc/pos_sync_pull", post(pull))
+            .with_state(state);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    fn configure(conn: &Connection, url: &str) {
+        for (k, v) in [("sync_enabled", "1"), ("sync_url", url), ("sync_key", "anon"), ("sync_secret", "s3cret")] {
+            conn.execute("UPDATE settings SET value = ?2 WHERE key = ?1", params![k, v]).unwrap();
+        }
+    }
+
+    fn unsent(conn: &Connection) -> i64 {
+        count(conn, "SELECT COUNT(*) FROM sync_queue WHERE sent_at IS NULL")
+    }
+
+    #[tokio::test]
+    async fn a_sync_round_pushes_the_outbox_in_order_then_pulls() {
+        let cloud = Arc::new(Mutex::new(MockCloud {
+            pull: serde_json::json!({ "categories": [], "products": [], "batches": [], "cursor": 900 }),
+            ..Default::default()
+        }));
+        let url = mock_cloud(cloud.clone()).await;
+        let db = Mutex::new(db());
+        let queued = unsent(&db.lock().unwrap());
+        configure(&db.lock().unwrap(), &url);
+        let client = sync::client();
+        let reports = Mutex::new(vec![]);
+        let report = |s: sync::SyncStatus| reports.lock().unwrap().push(s.state);
+        sync::sync_once(&db, &client, true, &report).await.unwrap();
+
+        {
+            let m = cloud.lock().unwrap();
+            assert_eq!(m.pushed.len() as i64, queued, "every queued entry");
+            let conn = db.lock().unwrap();
+            let mut stmt = conn.prepare("SELECT id FROM sync_queue ORDER BY seq").unwrap();
+            let ids: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().map(Result::unwrap).collect();
+            let seqs: Vec<usize> =
+                m.pushed.iter().map(|e| ids.iter().position(|i| i == e["id"].as_str().unwrap()).unwrap()).collect();
+            assert!(seqs.windows(2).all(|w| w[0] < w[1]), "pushed in outbox order");
+            assert_eq!(m.pulls, [0], "a full pull first");
+            assert_eq!(unsent(&conn), 0);
+            assert_eq!(count(&conn, "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'sync_cursor'"), 900);
+            assert!(reports.lock().unwrap().contains(&sync::SyncState::Syncing));
+        }
+
+        // The next round only asks for what changed, with some overlap.
+        sync::sync_once(&db, &client, false, &report).await.unwrap();
+        assert_eq!(cloud.lock().unwrap().pulls, [0, 400]);
+    }
+
+    #[tokio::test]
+    async fn rejected_entries_are_retried_then_parked_and_the_rest_still_go() {
+        let cloud = Arc::new(Mutex::new(MockCloud {
+            reject_kind: Some("POST_SALE".into()),
+            pull: serde_json::json!({ "cursor": 1 }),
+            ..Default::default()
+        }));
+        let url = mock_cloud(cloud.clone()).await;
+        let mut conn = db();
+        clear_queue(&conn);
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        configure(&conn, &url);
+        let db = Mutex::new(conn);
+        let client = sync::client();
+        for _ in 0..sync::MAX_ATTEMPTS + 2 {
+            sync::sync_once(&db, &client, false, &|_| {}).await.unwrap();
+        }
+        let conn = db.lock().unwrap();
+        assert_eq!(sync::counts(&conn).unwrap(), (0, 1), "the sale is parked after {} tries", sync::MAX_ATTEMPTS);
+        assert_eq!(cloud.lock().unwrap().pushed.len(), 1, "the audit entry went through");
+        let err: String = conn.query_row("SELECT last_error FROM sync_queue WHERE sent_at IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(err, "rejected by test");
+    }
+
+    #[tokio::test]
+    async fn no_server_means_offline_and_a_refusal_means_error() {
+        let conn = db();
+        // Nothing listens on this port.
+        configure(&conn, "http://127.0.0.1:9");
+        let db = Mutex::new(conn);
+        let client = sync::client();
+        let before = unsent(&db.lock().unwrap());
+        assert!(matches!(sync::sync_once(&db, &client, true, &|_| {}).await, Err(sync::SyncError::Offline(_))));
+        assert_eq!(unsent(&db.lock().unwrap()), before, "everything stays queued");
+
+        let cloud = Arc::new(Mutex::new(MockCloud { status: Some(401), ..Default::default() }));
+        let url = mock_cloud(cloud).await;
+        configure(&db.lock().unwrap(), &url);
+        let res = sync::sync_once(&db, &client, true, &|_| {}).await;
+        assert_eq!(res, Err(sync::SyncError::Server("sync secret is wrong (401)".into())));
+    }
+
+    async fn round(label: &str, db: &Mutex<Connection>, client: &reqwest::Client) {
+        sync::sync_once(db, client, false, &|_| {}).await.unwrap_or_else(|e| panic!("{label}: {e:?}"));
+        assert_eq!(unsent(&db.lock().unwrap()), 0, "{label}: outbox empty");
+    }
+
+    /// Two tills against a real Supabase project (or Postgres + PostgREST) that has supabase/schema.sql and an EMPTY
+    /// pos schema. Not run by default:
+    ///   POS_SYNC_URL=https://xyz.supabase.co POS_SYNC_KEY=<anon key> POS_SYNC_SECRET=<sync secret> \
+    ///     cargo test --lib -- --ignored two_tills_share_catalog_and_stock_through_the_cloud
+    #[tokio::test]
+    #[ignore]
+    async fn two_tills_share_catalog_and_stock_through_the_cloud() {
+        let env = |k: &str| std::env::var(k).unwrap_or_else(|_| panic!("set {k}"));
+        let (url, key, secret) = (env("POS_SYNC_URL"), env("POS_SYNC_KEY"), env("POS_SYNC_SECRET"));
+        let till = || {
+            let conn = db();
+            for (k, v) in [("sync_enabled", "1"), ("sync_url", url.as_str()), ("sync_key", key.as_str()), ("sync_secret", secret.as_str())] {
+                conn.execute("UPDATE settings SET value = ?2 WHERE key = ?1", params![k, v]).unwrap();
+            }
+            Mutex::new(conn)
+        };
+        let (a, b) = (till(), till());
+        let client = sync::client();
+        round("A first push", &a, &client).await;
+        round("B first push", &b, &client).await;
+
+        // Both tills pushed the same demo opening stock: counted once.
+        assert_eq!(qty(&b.lock().unwrap(), "b-br-400"), 55);
+
+        // Till A sells 2 Brufen and changes the Panadol price.
+        post_sale_inner(&mut a.lock().unwrap(), ADMIN, cash_sale(vec![brufen(2, 0)], 7000)).unwrap();
+        {
+            let mut conn = a.lock().unwrap();
+            let mut f = brufen_form();
+            f.trade_name_ar = product_snapshot(&conn, "p-brufen-400").unwrap()["tradeNameAr"].as_str().map(String::from);
+            f.price = 3900;
+            update_product_inner(&mut conn, ADMIN, "p-brufen-400", f).unwrap();
+        }
+        round("A pushes the sale", &a, &client).await;
+
+        // Till B, meanwhile, sold 1 Brufen while offline; it is still in its outbox when the pull lands.
+        post_sale_inner(&mut b.lock().unwrap(), ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        {
+            let pull_only = b.lock().unwrap();
+            assert_eq!(qty(&pull_only, "b-br-400"), 54);
+        }
+        round("B syncs", &b, &client).await;
+        {
+            let conn = b.lock().unwrap();
+            assert_eq!(qty(&conn, "b-br-400"), 52, "55 − A's 2 − B's 1");
+            assert_eq!(count(&conn, "SELECT sell_price FROM products WHERE id = 'p-brufen-400'"), 3900, "A's price reached B");
+        }
+        round("A pulls B's sale", &a, &client).await;
+        assert_eq!(qty(&a.lock().unwrap(), "b-br-400"), 52);
     }
 }

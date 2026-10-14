@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { Login } from "./auth/Login.tsx";
+import { SyncBadge } from "./components/SyncBadge.tsx";
 import { ROLE_LABEL } from "./core/permissions.ts";
 import type { AuthStatus, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
@@ -62,10 +63,7 @@ export function App() {
           </nav>
         </div>
         <div className="topbar-end">
-          <span className="status">
-            <span className="dot" aria-hidden="true" />
-            {repo.kind === "sqlite" ? "قاعدة بيانات محلية · يعمل دون إنترنت" : "وضع العرض في المتصفح · البيانات لا تُحفظ"}
-          </span>
+          <SyncBadge />
           <span>الفرع الرئيسي</span>
           <strong>{user.fullName}</strong>
           <span>{ROLE_LABEL[user.role]}</span>

@@ -1039,6 +1039,21 @@ export function createDemoRepo(): PharmacyRepo {
       throw new Error("هذا الإعداد متاح في برنامج سطح المكتب فقط");
     },
 
+    // No cloud sync in a browser tab.
+    async syncStatus() {
+      return { state: "disabled" as const, pending: 0, failed: 0, lastSyncAt: null, lastError: null };
+    },
+    async onSyncStatus() {
+      return () => {};
+    },
+    async syncNow() {},
+    async syncSettings(): Promise<never> {
+      throw new Error("المزامنة السحابية متاحة في برنامج سطح المكتب فقط");
+    },
+    async saveSyncSettings(): Promise<never> {
+      throw new Error("المزامنة السحابية متاحة في برنامج سطح المكتب فقط");
+    },
+
     // Same rules as sale_settings / save_sale_settings.
     async saleSettings() {
       if (!signedIn()) throw new Error("سجّل الدخول أولاً");

@@ -27,6 +27,9 @@ import type {
   Role,
   RxReport,
   SaleSettings,
+  SyncSettings,
+  SyncSettingsInput,
+  SyncStatus,
   SaleDraft,
   SaleResult,
   SalesReport,
@@ -91,6 +94,14 @@ export interface PharmacyRepo {
   phoneScannerFirewall(): Promise<FirewallState>;
   /** Adds the firewall rule; Windows asks for administrator approval. */
   allowPhoneScannerFirewall(): Promise<FirewallState>;
+  // Cloud sync. The status is for everyone; settings are admin only.
+  syncStatus(): Promise<SyncStatus>;
+  /** Calls `handler` on every status change; returns a function that stops listening. */
+  onSyncStatus(handler: (status: SyncStatus) => void): Promise<() => void>;
+  /** Sync now, including changes the cloud refused before. */
+  syncNow(): Promise<void>;
+  syncSettings(): Promise<SyncSettings>;
+  saveSyncSettings(settings: SyncSettingsInput): Promise<SyncSettings>;
   // Sale settings: the discount cap.
   saleSettings(): Promise<SaleSettings>;
   /** Admin only. */

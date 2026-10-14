@@ -9,7 +9,7 @@ import {
   type Permission,
   type PermissionOverrides,
 } from "../core/permissions.ts";
-import type { Role, User, UserRow } from "../core/types.ts";
+import type { Role, SyncSettings, SyncStatus, User, UserRow } from "../core/types.ts";
 import { repo } from "../data/index.ts";
 import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
 
@@ -18,6 +18,7 @@ const MIN_PASSWORD_LEN = 8;
 type Dialog =
   | { kind: "add" }
   | { kind: "discount" }
+  | { kind: "sync" }
   | { kind: "access"; user: UserRow }
   | { kind: "password"; user: UserRow }
   | { kind: "deactivate"; user: UserRow };
@@ -57,6 +58,9 @@ export function UsersScreen({ me }: { me: User }) {
         <div className="inv-head">
           <h2 id="users-title">الموظفين</h2>
           <span className="muted">{users ? `${users.filter((u) => u.active).length} نشط من ${users.length}` : "جارٍ التحميل…"}</span>
+          <button type="button" className="btn" onClick={() => setDialog({ kind: "sync" })}>
+            المزامنة السحابية
+          </button>
           <button type="button" className="btn" onClick={() => setDialog({ kind: "discount" })}>
             حد الخصم
           </button>
@@ -133,6 +137,15 @@ export function UsersScreen({ me }: { me: User }) {
         </div>
       </section>
 
+      {dialog?.kind === "sync" && (
+        <SyncDialog
+          onClose={() => setDialog(null)}
+          onSaved={(s) => {
+            setDialog(null);
+            setNotice(s.enabled ? "تم حفظ إعدادات المزامنة وتفعيلها" : "تم حفظ إعدادات المزامنة (غير مفعّلة)");
+          }}
+        />
+      )}
       {dialog?.kind === "discount" && (
         <DiscountCapDialog
           onClose={() => setDialog(null)}
@@ -465,6 +478,103 @@ function DiscountCapDialog({ onClose, onSaved }: { onClose: () => void; onSaved:
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose}>إلغاء</button>
           <button type="submit" className="btn primary" disabled={busy || pct === null}>
+            {busy ? "جارٍ الحفظ…" : "حفظ"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+const SYNC_STATE: Record<SyncStatus["state"], string> = {
+  synced: "متصل وتمت المزامنة",
+  syncing: "جاري المزامنة",
+  offline: "غير متصل بالإنترنت أو الخادم: كل شيء محفوظ محلياً وسيُرسل عند عودة الاتصال",
+  error: "الخادم رفض المزامنة",
+  disabled: "غير مفعّلة",
+};
+
+/** Supabase connection for this computer. The key and secret are write-only; leaving them empty keeps the saved ones. */
+function SyncDialog({ onClose, onSaved }: { onClose: () => void; onSaved: (s: SyncSettings) => void }) {
+  const [saved, setSaved] = useState<SyncSettings | null>(null);
+  const [f, setF] = useState({ enabled: false, url: "", key: "", secret: "", deviceName: "" });
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    repo.syncSettings().then(
+      (s) => {
+        setSaved(s);
+        setF({ enabled: s.enabled, url: s.url, key: "", secret: "", deviceName: s.deviceName });
+      },
+      (e) => setError(errorText(e)),
+    );
+    repo.syncStatus().then(setStatus, () => {});
+    let stop = () => {};
+    void repo.onSyncStatus(setStatus).then((unlisten) => (stop = unlisten));
+    return () => stop();
+  }, []);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      onSaved(await repo.saveSyncSettings({ ...f, key: f.key || undefined, secret: f.secret || undefined }));
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const kept = "محفوظ؛ اتركه فارغاً للإبقاء عليه";
+  return (
+    <Modal title="المزامنة السحابية" onClose={onClose} wide>
+      <form className="modal-body" onSubmit={submit}>
+        <p className="muted small">
+          البيع والمخزون يعملان دائماً على قاعدة البيانات المحلية. عند تفعيل المزامنة تُرسل كل عملية إلى Supabase عند توفر
+          الإنترنت، ويُستلم منها كتالوج الأصناف والأسعار ومخزون كل دفعة من جميع الأجهزة. خطوات إعداد المشروع في
+          الملف supabase/schema.sql.
+        </p>
+        {error && <div role="alert" className="banner error"><span>{error}</span></div>}
+        {status && (
+          <div className={`banner ${status.state === "synced" ? "success" : status.state === "disabled" ? "info" : "warn"}`} role="status">
+            <span>
+              الحالة: {SYNC_STATE[status.state]}
+              {status.pending > 0 && <> · {status.pending} بانتظار الإرسال</>}
+              {status.failed > 0 && <> · {status.failed} رفضتها السحابة</>}
+              {status.lastSyncAt && <> · آخر مزامنة {new Date(status.lastSyncAt).toLocaleString("ar-IQ-u-nu-latn")}</>}
+              {status.lastError && <><br />السبب: <bdi>{status.lastError}</bdi></>}
+            </span>
+          </div>
+        )}
+        <div className="form-grid">
+          <Field id="sy-url" label="عنوان المشروع (Project URL)" hint="مثل https://abcd.supabase.co">
+            <input id="sy-url" className="field num" dir="ltr" value={f.url} onChange={(e) => setF({ ...f, url: e.target.value })} disabled={!saved} />
+          </Field>
+          <Field id="sy-name" label="اسم هذا الجهاز" hint="يظهر في السحابة، مثل «الكاشير ١»">
+            <input id="sy-name" className="field" value={f.deviceName} onChange={(e) => setF({ ...f, deviceName: e.target.value })} disabled={!saved} />
+          </Field>
+          <Field id="sy-key" label="المفتاح العام (anon key)" hint={saved?.hasKey ? kept : "من Project Settings ← API"}>
+            <input id="sy-key" className="field num" dir="ltr" type="password" autoComplete="off" value={f.key} onChange={(e) => setF({ ...f, key: e.target.value })} disabled={!saved} />
+          </Field>
+          <Field id="sy-secret" label="كلمة سر المزامنة" hint={saved?.hasSecret ? kept : "نفس العبارة التي سُجّلت في pos.config"}>
+            <input id="sy-secret" className="field" dir="ltr" type="password" autoComplete="off" value={f.secret} onChange={(e) => setF({ ...f, secret: e.target.value })} disabled={!saved} />
+          </Field>
+        </div>
+        <label className="check">
+          <input type="checkbox" checked={f.enabled} onChange={(e) => setF({ ...f, enabled: e.target.checked })} disabled={!saved} />
+          تفعيل المزامنة على هذا الجهاز
+        </label>
+        {saved && <p className="muted small">رقم الجهاز: <bdi className="num">{saved.deviceId}</bdi></p>}
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={() => void repo.syncNow().catch((e) => setError(errorText(e)))} disabled={!saved?.enabled}>
+            مزامنة الآن
+          </button>
+          <button type="button" className="btn" onClick={onClose}>إلغاء</button>
+          <button type="submit" className="btn primary" disabled={busy || !saved}>
             {busy ? "جارٍ الحفظ…" : "حفظ"}
           </button>
         </div>

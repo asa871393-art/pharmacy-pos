@@ -27,7 +27,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rcgen = "0.13"
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 local-ip-address = "0.6"
-tokio = { version = "1", features = ["rt", "net", "time", "macros"] }
+tokio = { version = "1", features = ["rt", "net", "time", "macros", "sync"] }
+# Cloud sync (see sync.rs): HTTPS calls to the Supabase REST API.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
