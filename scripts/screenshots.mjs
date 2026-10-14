@@ -73,6 +73,29 @@ await page.fill("#rc-cost", "3500");
 await page.getByRole("button", { name: "استلام", exact: true }).click();
 await page.waitForSelector(".modal .banner.success");
 await page.screenshot({ path: "screenshots/8-received.png" });
+await page.keyboard.press("Escape");
+
+// Purchasing: a credit invoice with a GS1 scan (batch and expiry filled in) and a typed search
+await page.getByRole("button", { name: "المشتريات" }).click();
+await page.selectOption("#pur-supplier", "s-a");
+await page.fill("#pur-no", "A-2026-118");
+await page.fill("#pur-search", "(01)02000000000046(17)290630(10)PX2001");
+await page.keyboard.press("Enter");
+await page.waitForSelector(".pur-table tbody tr input");
+await page.getByLabel("كمية Panadol Extra").fill("48");
+await page.getByLabel("سعر شراء Panadol Extra").fill("2200");
+await page.fill("#pur-search", "brufen");
+await page.waitForSelector(".pur-results button");
+await page.keyboard.press("Enter");
+await page.getByLabel("رقم تشغيلة Brufen 400 mg").fill("BR610");
+await page.getByLabel("تاريخ انتهاء Brufen 400 mg").fill("2028-11-30");
+await page.getByLabel("كمية Brufen 400 mg").fill("60");
+await page.getByLabel("سعر شراء Brufen 400 mg").fill("2450");
+await page.getByLabel("سعر بيع Brufen 400 mg").fill("3750");
+await page.screenshot({ path: "screenshots/9-purchase.png" });
+await page.getByRole("button", { name: /ترحيل الفاتورة/ }).click();
+await page.waitForSelector(".pur-panel .banner.success");
+await page.screenshot({ path: "screenshots/10-purchase-posted.png" });
 
 await browser.close();
 if (errors.length) {

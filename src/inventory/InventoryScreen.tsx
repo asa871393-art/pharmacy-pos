@@ -1,9 +1,10 @@
-import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useState, type FormEvent } from "react";
 import { addDays, daysBetween, DEFAULT_THRESHOLDS } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
 import { INVENTORY_ROLES, type Category, type InventoryBatch, type InventoryItem, type User } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
+import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
 
 type Filter = "all" | "low" | "expiring" | "expired" | "out";
 
@@ -16,15 +17,6 @@ const FILTERS: { id: Filter; label: string }[] = [
 ];
 
 const FORMS = ["قرص", "كبسول", "شراب", "حقن", "بخاخ", "كريم", "مرهم", "قطرة", "تحاميل", "أكياس"];
-
-function toInt(s: string): number {
-  const n = Number(s.replace(/[^\d]/g, ""));
-  return Number.isFinite(n) ? n : 0;
-}
-
-function message(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
 
 const isOut = (i: InventoryItem) => i.stock === 0;
 const isLow = (i: InventoryItem) => isOut(i) || (i.reorderLevel !== null && i.stock <= i.reorderLevel);
@@ -57,7 +49,7 @@ export function InventoryScreen({ user }: { user: User }) {
   const [selected, setSelected] = useState<InventoryItem | null>(null);
 
   useEffect(() => {
-    repo.inventory().then(setItems, (e) => setError(message(e)));
+    repo.inventory().then(setItems, (e) => setError(errorText(e)));
   }, []);
 
   function upsert(item: InventoryItem) {
@@ -226,47 +218,6 @@ export function InventoryScreen({ user }: { user: User }) {
 
 // ── Dialogs ──
 
-function Modal({ title, onClose, wide, children }: { title: string; onClose: () => void; wide?: boolean; children: ReactNode }) {
-  const ref = useRef<HTMLDialogElement>(null);
-  const titleId = useId();
-  useEffect(() => {
-    const d = ref.current;
-    if (d && !d.open) d.showModal();
-    return () => d?.close();
-  }, []);
-  return (
-    <dialog
-      ref={ref}
-      className={`modal ${wide ? "wide" : ""}`}
-      aria-labelledby={titleId}
-      onCancel={(e) => {
-        e.preventDefault();
-        onClose();
-      }}
-    >
-      <div className="modal-head">
-        <h3 id={titleId}>{title}</h3>
-        <button type="button" className="icon-btn" aria-label="إغلاق" onClick={onClose}>
-          <svg width="16" height="16" viewBox="0 0 24 24" aria-hidden="true">
-            <path d="M6 6 L18 18 M18 6 L6 18" />
-          </svg>
-        </button>
-      </div>
-      {children}
-    </dialog>
-  );
-}
-
-function Field({ id, label, children, hint }: { id: string; label: string; children: ReactNode; hint?: string }) {
-  return (
-    <div className="form-field">
-      <label htmlFor={id} className="label">{label}</label>
-      {children}
-      {hint && <span className="muted small">{hint}</span>}
-    </div>
-  );
-}
-
 function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: (item: InventoryItem) => void }) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [f, setF] = useState({
@@ -285,7 +236,7 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
-    repo.categories().then(setCategories, (e) => setError(message(e)));
+    repo.categories().then(setCategories, (e) => setError(errorText(e)));
   }, []);
 
   const set = (key: keyof typeof f) => (e: { target: { value: string } }) => setF({ ...f, [key]: e.target.value });
@@ -310,7 +261,7 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
         }),
       );
     } catch (err) {
-      setError(message(err));
+      setError(errorText(err));
     } finally {
       setBusy(false);
     }
@@ -390,7 +341,7 @@ function BatchesDialog({
   const [rcv, setRcv] = useState({ batchNo: "", expiryDate: "", qty: "", unitCost: "" });
   const [busy, setBusy] = useState(false);
 
-  const load = () => repo.inventoryBatches(item.id).then(setBatches, (e) => setError(message(e)));
+  const load = () => repo.inventoryBatches(item.id).then(setBatches, (e) => setError(errorText(e)));
   useEffect(() => {
     void load();
   }, [item.id]);
@@ -405,7 +356,7 @@ function BatchesDialog({
       setNotice(done);
       return true;
     } catch (e) {
-      setError(message(e));
+      setError(errorText(e));
       return false;
     } finally {
       setBusy(false);

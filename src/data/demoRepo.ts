@@ -10,12 +10,16 @@ import {
   type Category,
   type InventoryItem,
   type NewProduct,
+  type NewSupplier,
+  type PurchaseInvoice,
+  type PurchaseResult,
   type ProductHit,
   type ReceiveBatchInput,
   type Role,
   type SaleDraft,
   type SaleResult,
   type SearchMode,
+  type Supplier,
   type User,
 } from "../core/types.ts";
 import { localToday, type PharmacyRepo } from "./repo.ts";
@@ -43,6 +47,12 @@ const categories: Category[] = [
 
 // Same as reorder_rules in demo_seed.sql.
 const reorderLevels: Record<string, number> = { "p-panadol-extra": 60, "p-amoxil-500": 25, "p-ventolin": 15 };
+
+// Same suppliers as demo_seed.sql.
+const suppliers: Supplier[] = [
+  { id: "s-a", name: "المورد أ (تجريبي)", phone: null, paymentTermsDays: 30, balance: 0 },
+  { id: "s-b", name: "المورد ب (تجريبي)", phone: null, paymentTermsDays: 45, balance: 0 },
+];
 
 const ing = {
   metformin: { inn: "Metformin", ar: "ميتفورمين", cls: "biguanide" },
@@ -112,6 +122,7 @@ export function createDemoRepo(): PharmacyRepo {
   const batches = seedBatches(today);
   let counter = 0;
   let current: User | null = null;
+  const postedInvoices = new Set<string>(); // supplierId|invoiceNo
 
   const toHit = (p: DemoProduct): ProductHit => {
     const own = batches.filter((b) => b.productId === p.id);
@@ -164,7 +175,99 @@ export function createDemoRepo(): PharmacyRepo {
     if (!p) throw new Error("صنف غير موجود أو موقوف");
     return p;
   };
-  const isIsoDate = (d: string) => /^\d{4}-\d{2}-\d{2}$/.test(d) && new Date(d + "T00:00:00Z").toISOString().slice(0, 10) === d;
+  const isIsoDate = (d: string) => {
+    const t = Date.parse(d + "T00:00:00Z");
+    return /^\d{4}-\d{2}-\d{2}$/.test(d) && !Number.isNaN(t) && new Date(t).toISOString().slice(0, 10) === d;
+  };
+
+  // Same rules as post_purchase_invoice in src-tauri/src/lib.rs: validate every line, then write.
+  const postPurchase = (inv: PurchaseInvoice): PurchaseResult => {
+    requireInventoryRole();
+    const supplier = suppliers.find((s) => s.id === inv.supplierId);
+    if (!supplier) throw new Error("اختر المورد");
+    const invoiceNo = inv.supplierInvoiceNo.trim();
+    if (!invoiceNo) throw new Error("رقم فاتورة الشراء مطلوب");
+    if (postedInvoices.has(`${supplier.id}|${invoiceNo}`)) throw new Error(`الفاتورة ${invoiceNo} من ${supplier.name} مُرحّلة مسبقاً`);
+    if (!isIsoDate(inv.invoiceDate)) throw new Error("تاريخ الفاتورة غير صالح");
+    if (inv.invoiceDate > today) throw new Error("تاريخ الفاتورة في المستقبل");
+    if (inv.payment !== "cash" && inv.payment !== "credit") throw new Error("حالة الدفع يجب أن تكون نقداً أو آجلاً");
+    if (inv.lines.length === 0) throw new Error("أضف صنفاً واحداً على الأقل");
+
+    const seen = new Set<string>();
+    const prices = new Map<string, number>();
+    inv.lines.forEach((l, i) => {
+      const n = i + 1;
+      const p = products.find((x) => x.id === l.productId);
+      if (!p) throw new Error(`السطر ${n}: صنف غير موجود أو موقوف`);
+      const at = `السطر ${n} (${p.tradeName})`;
+      const batchNo = l.batchNo.trim();
+      if (!batchNo) throw new Error(`${at}: رقم التشغيلة مطلوب`);
+      if (!isIsoDate(l.expiryDate)) throw new Error(`${at}: تاريخ الانتهاء غير صالح`);
+      if (l.expiryDate <= today) throw new Error(`${at}: لا يُستلم مخزون منتهي الصلاحية`);
+      if (!(l.qty > 0)) throw new Error(`${at}: الكمية يجب أن تكون أكبر من صفر`);
+      if (l.unitCost < 0) throw new Error(`${at}: سعر الشراء لا يكون سالباً`);
+      if (!(l.sellPrice > 0)) throw new Error(`${at}: سعر البيع يجب أن يكون أكبر من صفر`);
+      if (seen.has(`${p.id}|${batchNo}`)) throw new Error(`${at}: التشغيلة ${batchNo} مكررة في الفاتورة، اجمع الكمية في سطر واحد`);
+      seen.add(`${p.id}|${batchNo}`);
+      if (prices.has(p.id) && prices.get(p.id) !== l.sellPrice) throw new Error(`${p.tradeName}: سعر البيع مختلف بين أسطر الفاتورة`);
+      prices.set(p.id, l.sellPrice);
+      const shelf = batches.find((b) => b.productId === p.id && b.batchNo === batchNo);
+      if (shelf && shelf.expiryDate !== l.expiryDate) {
+        throw new Error(`التشغيلة ${batchNo} مسجّلة بتاريخ انتهاء ${shelf.expiryDate}، والفاتورة تذكر ${l.expiryDate}. تحقّق من العبوة`);
+      }
+    });
+
+    let created = 0;
+    let updated = 0;
+    for (const l of inv.lines) {
+      const batchNo = l.batchNo.trim();
+      const shelf = batches.find((b) => b.productId === l.productId && b.batchNo === batchNo);
+      if (shelf) {
+        const qty = shelf.qtyOnHand + l.qty;
+        shelf.unitCost = Math.floor((shelf.qtyOnHand * shelf.unitCost + l.qty * l.unitCost + Math.floor(qty / 2)) / qty);
+        shelf.qtyOnHand = qty;
+        shelf.sellPrice = l.sellPrice;
+        updated += 1;
+      } else {
+        batches.push({
+          id: `b-demo-${Date.now()}-${created}`,
+          productId: l.productId,
+          batchNo,
+          expiryDate: l.expiryDate,
+          qtyOnHand: l.qty,
+          unitCost: l.unitCost,
+          sellPrice: l.sellPrice,
+          receivedAt: new Date().toISOString(),
+        });
+        created += 1;
+      }
+    }
+    const priceChanges: string[] = [];
+    for (const [id, price] of prices) {
+      const p = productById(id);
+      if (p.price !== price) {
+        p.price = price;
+        priceChanges.push(p.tradeName);
+      }
+    }
+    const total = inv.lines.reduce((s, l) => s + l.qty * l.unitCost, 0);
+    let dueDate: string | null = null;
+    if (inv.payment === "credit") {
+      supplier.balance += total;
+      dueDate = addDays(inv.invoiceDate, supplier.paymentTermsDays);
+    }
+    postedInvoices.add(`${supplier.id}|${invoiceNo}`);
+    return {
+      invoiceId: `pi-demo-${postedInvoices.size}`,
+      total,
+      units: inv.lines.reduce((s, l) => s + l.qty, 0),
+      batchesCreated: created,
+      batchesUpdated: updated,
+      priceChanges: priceChanges.sort(),
+      dueDate,
+      supplierBalance: supplier.balance,
+    };
+  };
 
   const norm = (s: string) => s.toLowerCase();
   const matchesTrade = (p: DemoProduct, t: string) => norm(p.tradeName).includes(t) || norm(p.strength).includes(t);
@@ -341,6 +444,24 @@ export function createDemoRepo(): PharmacyRepo {
       if (input.newQty === b.qtyOnHand) throw new Error("الكمية الجديدة مساوية للحالية");
       b.qtyOnHand = input.newQty;
       return toInventory(productById(b.productId));
+    },
+    async suppliers() {
+      if (!current) throw new Error("سجّل الدخول أولاً");
+      return [...suppliers].sort((a, b) => a.name.localeCompare(b.name));
+    },
+    async addSupplier(input: NewSupplier) {
+      requireInventoryRole();
+      const name = input.name.trim();
+      if (!name) throw new Error("اسم المورد مطلوب");
+      const terms = input.paymentTermsDays ?? 30;
+      if (!(terms >= 0 && terms <= 365)) throw new Error("مدة السداد بين ٠ و٣٦٥ يوماً");
+      if (suppliers.some((s) => s.name.toLowerCase() === name.toLowerCase())) throw new Error(`المورد ${name} موجود مسبقاً`);
+      const s: Supplier = { id: `s-demo-${Date.now()}`, name, phone: input.phone?.trim() || null, paymentTermsDays: terms, balance: 0 };
+      suppliers.push(s);
+      return s;
+    },
+    async postPurchaseInvoice(inv: PurchaseInvoice): Promise<PurchaseResult> {
+      return postPurchase(inv);
     },
   };
 }

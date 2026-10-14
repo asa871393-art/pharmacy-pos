@@ -4,6 +4,7 @@ import type { AuthStatus, Role, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
 import { InventoryScreen } from "./inventory/InventoryScreen.tsx";
 import { PosScreen } from "./pos/PosScreen.tsx";
+import { PurchasingScreen } from "./purchasing/PurchasingScreen.tsx";
 
 const ROLE_LABEL: Record<Role, string> = {
   admin: "مدير",
@@ -13,11 +14,12 @@ const ROLE_LABEL: Record<Role, string> = {
   storekeeper: "أمين مخزن",
 };
 
-type View = "pos" | "inventory";
+type View = "pos" | "inventory" | "purchasing";
 
 const VIEWS: { id: View; label: string }[] = [
   { id: "pos", label: "نقطة البيع" },
   { id: "inventory", label: "المخزون" },
+  { id: "purchasing", label: "المشتريات" },
 ];
 
 export function App() {
@@ -59,7 +61,6 @@ export function App() {
                 {v.label}
               </button>
             ))}
-            <span className="module soon" title="المرحلة التالية">المشتريات</span>
             <span className="module soon" title="المرحلة التالية">التقارير</span>
           </nav>
         </div>
@@ -76,11 +77,15 @@ export function App() {
           </button>
         </div>
       </header>
-      {/* The POS stays mounted while hidden so a half-built sale survives a look at the stock. */}
+      {/* POS and Purchasing stay mounted while hidden, so a half-built sale or invoice survives switching screens.
+          Inventory reloads each time it opens, so it always shows current stock. */}
       <div className="view" hidden={view !== "pos"}>
         <PosScreen key={user.id} visible={view === "pos"} />
       </div>
       {view === "inventory" && <InventoryScreen key={user.id} user={user} />}
+      <div className="view" hidden={view !== "purchasing"}>
+        <PurchasingScreen key={user.id} user={user} />
+      </div>
     </div>
   );
 }

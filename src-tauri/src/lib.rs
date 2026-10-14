@@ -142,7 +142,7 @@ pub struct AuthStatus {
     user: Option<UserDto>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct SaleResult {
     sale_id: String,
@@ -1093,6 +1093,398 @@ fn adjust_batch(db: State<'_, Db>, session: State<'_, Session>, adjustment: Adju
     adjust_batch_inner(&mut conn, &user_id, adjustment)
 }
 
+// ── Purchasing ──
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Supplier {
+    id: String,
+    name: String,
+    phone: Option<String>,
+    payment_terms_days: i64,
+    /// What the pharmacy owes this supplier.
+    balance: i64,
+}
+
+fn map_supplier(r: &rusqlite::Row) -> rusqlite::Result<Supplier> {
+    Ok(Supplier { id: r.get(0)?, name: r.get(1)?, phone: r.get(2)?, payment_terms_days: r.get(3)?, balance: r.get(4)? })
+}
+
+const SUPPLIER_SELECT: &str = "SELECT id, name, phone, payment_terms_days, balance FROM suppliers";
+
+#[tauri::command]
+fn list_suppliers(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<Supplier>, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    let mut stmt = conn.prepare(&format!("{SUPPLIER_SELECT} ORDER BY name")).map_err(err)?;
+    let rows = stmt.query_map([], map_supplier).map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSupplier {
+    name: String,
+    phone: Option<String>,
+    payment_terms_days: Option<i64>,
+}
+
+fn add_supplier_inner(conn: &mut Connection, user_id: &str, s: NewSupplier) -> Result<Supplier, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+    let name = s.name.trim();
+    if name.is_empty() {
+        return Err("اسم المورد مطلوب".into());
+    }
+    let terms = s.payment_terms_days.unwrap_or(30);
+    if !(0..=365).contains(&terms) {
+        return Err("مدة السداد بين ٠ و٣٦٥ يوماً".into());
+    }
+    let taken: bool = tx
+        .query_row("SELECT EXISTS (SELECT 1 FROM suppliers WHERE name = ?1 COLLATE NOCASE)", params![name], |r| r.get(0))
+        .map_err(err)?;
+    if taken {
+        return Err(format!("المورد {name} موجود مسبقاً"));
+    }
+    let id = new_id();
+    tx.execute(
+        "INSERT INTO suppliers(id, name, phone, payment_terms_days) VALUES (?1, ?2, ?3, ?4)",
+        params![id, name, non_empty(&s.phone), terms],
+    )
+    .map_err(err)?;
+    let now = utc_now(&tx)?;
+    let payload = serde_json::json!({ "name": name }).to_string();
+    append_audit(&tx, user_id, "supplier.create", "suppliers", &id, &payload, &now).map_err(err)?;
+    let supplier = tx
+        .query_row(&format!("{SUPPLIER_SELECT} WHERE id = ?1"), params![id], map_supplier)
+        .map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(supplier)
+}
+
+#[tauri::command]
+fn add_supplier(db: State<'_, Db>, session: State<'_, Session>, supplier: NewSupplier) -> Result<Supplier, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    add_supplier_inner(&mut conn, &user_id, supplier)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseLineIn {
+    product_id: String,
+    batch_no: String,
+    expiry_date: String,
+    qty: i64,
+    /// Purchase price per unit.
+    unit_cost: i64,
+    /// Retail price per unit; becomes the product's selling price.
+    sell_price: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseInvoiceIn {
+    supplier_id: String,
+    supplier_invoice_no: String,
+    invoice_date: String,
+    /// "cash": paid on delivery. "credit": added to what we owe the supplier.
+    payment: String,
+    lines: Vec<PurchaseLineIn>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PurchaseResult {
+    invoice_id: String,
+    total: i64,
+    units: i64,
+    batches_created: i64,
+    batches_updated: i64,
+    /// Products whose selling price this invoice changed.
+    price_changes: Vec<String>,
+    due_date: Option<String>,
+    supplier_balance: i64,
+}
+
+/// Posts a supplier invoice in one transaction: the invoice and its lines, stock into batches (new batch, or added to
+/// the same batch number if it is already on the shelf), stock movements, selling prices, the supplier ledger and audit.
+/// Stock posted here is sellable immediately: post_sale draws from the same batches in FEFO order.
+fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoiceIn) -> Result<PurchaseResult, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_role(&tx, user_id, &INVENTORY_ROLES)?;
+
+    let (supplier_name, terms): (String, i64) = tx
+        .query_row("SELECT name, payment_terms_days FROM suppliers WHERE id = ?1", params![inv.supplier_id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .optional()
+        .map_err(err)?
+        .ok_or("اختر المورد")?;
+    let invoice_no = inv.supplier_invoice_no.trim();
+    if invoice_no.is_empty() {
+        return Err("رقم فاتورة الشراء مطلوب".into());
+    }
+    let posted_before: bool = tx
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM purchase_invoices WHERE supplier_id = ?1 AND supplier_invoice_no = ?2)",
+            params![inv.supplier_id, invoice_no],
+            |r| r.get(0),
+        )
+        .map_err(err)?;
+    if posted_before {
+        return Err(format!("الفاتورة {invoice_no} من {supplier_name} مُرحّلة مسبقاً"));
+    }
+    if !is_iso_date(&tx, &inv.invoice_date)? {
+        return Err("تاريخ الفاتورة غير صالح".into());
+    }
+    let future: bool = tx
+        .query_row("SELECT ?1 > date('now', 'localtime')", params![inv.invoice_date], |r| r.get(0))
+        .map_err(err)?;
+    if future {
+        return Err("تاريخ الفاتورة في المستقبل".into());
+    }
+    let on_credit = match inv.payment.as_str() {
+        "cash" => false,
+        "credit" => true,
+        _ => return Err("حالة الدفع يجب أن تكون نقداً أو آجلاً".into()),
+    };
+    if inv.lines.is_empty() {
+        return Err("أضف صنفاً واحداً على الأقل".into());
+    }
+
+    // Validate every line before writing anything.
+    let mut seen_batches = std::collections::HashSet::new();
+    let mut new_prices: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
+    let mut subtotal = 0i64;
+    let mut units = 0i64;
+    for (i, l) in inv.lines.iter().enumerate() {
+        let n = i + 1;
+        let name: String = tx
+            .query_row("SELECT trade_name FROM products WHERE id = ?1 AND is_active = 1", params![l.product_id], |r| r.get(0))
+            .optional()
+            .map_err(err)?
+            .ok_or_else(|| format!("السطر {n}: صنف غير موجود أو موقوف"))?;
+        let batch_no = l.batch_no.trim();
+        if batch_no.is_empty() {
+            return Err(format!("السطر {n} ({name}): رقم التشغيلة مطلوب"));
+        }
+        if !is_iso_date(&tx, &l.expiry_date)? {
+            return Err(format!("السطر {n} ({name}): تاريخ الانتهاء غير صالح"));
+        }
+        let sellable: bool = tx
+            .query_row("SELECT ?1 > date('now', 'localtime')", params![l.expiry_date], |r| r.get(0))
+            .map_err(err)?;
+        if !sellable {
+            return Err(format!("السطر {n} ({name}): لا يُستلم مخزون منتهي الصلاحية"));
+        }
+        if l.qty <= 0 {
+            return Err(format!("السطر {n} ({name}): الكمية يجب أن تكون أكبر من صفر"));
+        }
+        if l.unit_cost < 0 {
+            return Err(format!("السطر {n} ({name}): سعر الشراء لا يكون سالباً"));
+        }
+        if l.sell_price <= 0 {
+            return Err(format!("السطر {n} ({name}): سعر البيع يجب أن يكون أكبر من صفر"));
+        }
+        if !seen_batches.insert((l.product_id.as_str(), batch_no)) {
+            return Err(format!("السطر {n} ({name}): التشغيلة {batch_no} مكررة في الفاتورة، اجمع الكمية في سطر واحد"));
+        }
+        if let Some(p) = new_prices.insert(&l.product_id, l.sell_price) {
+            if p != l.sell_price {
+                return Err(format!("{name}: سعر البيع مختلف بين أسطر الفاتورة"));
+            }
+        }
+        subtotal += l.qty.checked_mul(l.unit_cost).ok_or_else(|| format!("السطر {n}: المبلغ كبير جداً"))?;
+        units += l.qty;
+    }
+    let total = subtotal;
+
+    let branch_id: String = tx
+        .query_row("SELECT id FROM branches ORDER BY created_at LIMIT 1", [], |r| r.get(0))
+        .map_err(err)?;
+    let now = utc_now(&tx)?;
+    let due_date: Option<String> = if on_credit {
+        Some(
+            tx.query_row("SELECT date(?1, '+' || ?2 || ' days')", params![inv.invoice_date, terms], |r| r.get(0))
+                .map_err(err)?,
+        )
+    } else {
+        None
+    };
+    let invoice_id = new_id();
+    tx.execute(
+        "INSERT INTO purchase_invoices(id, branch_id, supplier_id, supplier_invoice_no, invoice_date, due_date,
+                                       subtotal, total, paid, status, posted_by, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            invoice_id,
+            branch_id,
+            inv.supplier_id,
+            invoice_no,
+            inv.invoice_date,
+            due_date,
+            subtotal,
+            total,
+            if on_credit { 0 } else { total },
+            if on_credit { "posted" } else { "paid" },
+            user_id,
+            now
+        ],
+    )
+    .map_err(err)?;
+
+    let (mut created, mut updated) = (0i64, 0i64);
+    for l in &inv.lines {
+        let batch_no = l.batch_no.trim();
+        let item_id = new_id();
+        tx.execute(
+            "INSERT INTO purchase_invoice_items(id, invoice_id, product_id, batch_no, expiry_date, qty, unit_cost, sell_price)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![item_id, invoice_id, l.product_id, batch_no, l.expiry_date, l.qty, l.unit_cost, l.sell_price],
+        )
+        .map_err(err)?;
+
+        let existing: Option<(String, String, String, i64, i64)> = tx
+            .query_row(
+                "SELECT id, expiry_date, status, qty_on_hand, unit_cost FROM batches
+                 WHERE product_id = ?1 AND branch_id = ?2 AND batch_no = ?3",
+                params![l.product_id, branch_id, batch_no],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()
+            .map_err(err)?;
+        let batch_id = match existing {
+            Some((id, expiry, status, old_qty, old_cost)) => {
+                if expiry != l.expiry_date {
+                    return Err(format!(
+                        "التشغيلة {batch_no} مسجّلة بتاريخ انتهاء {expiry}، والفاتورة تذكر {}. تحقّق من العبوة",
+                        l.expiry_date
+                    ));
+                }
+                if status != "active" {
+                    return Err(format!("التشغيلة {batch_no} موقوفة ({status}) ولا تُضاف إليها كمية"));
+                }
+                // Weighted average cost, so profit on later sales stays right.
+                let qty = old_qty + l.qty;
+                let cost = (old_qty * old_cost + l.qty * l.unit_cost + qty / 2) / qty;
+                tx.execute(
+                    "UPDATE batches SET qty_on_hand = ?1, unit_cost = ?2, sell_price = ?3, source_item_id = ?4,
+                                        supplier_id = ?5
+                     WHERE id = ?6",
+                    params![qty, cost, l.sell_price, item_id, inv.supplier_id, id],
+                )
+                .map_err(err)?;
+                updated += 1;
+                id
+            }
+            None => {
+                let id = new_id();
+                tx.execute(
+                    "INSERT INTO batches(id, product_id, branch_id, batch_no, expiry_date, unit_cost, sell_price, qty_on_hand,
+                                         supplier_id, source_item_id, received_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        id,
+                        l.product_id,
+                        branch_id,
+                        batch_no,
+                        l.expiry_date,
+                        l.unit_cost,
+                        l.sell_price,
+                        l.qty,
+                        inv.supplier_id,
+                        item_id,
+                        now
+                    ],
+                )
+                .map_err(err)?;
+                created += 1;
+                id
+            }
+        };
+        tx.execute(
+            "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, ref_id, user_id, occurred_at)
+             VALUES (?1, ?2, 'purchase', ?3, ?4, 'purchase_invoice', ?5, ?6, ?7)",
+            params![new_id(), batch_id, l.qty, l.unit_cost, invoice_id, user_id, now],
+        )
+        .map_err(err)?;
+    }
+
+    // The invoice's retail price becomes the product's price; the till checks sales against it.
+    let mut price_changes = vec![];
+    let mut changed: Vec<(&str, i64)> = new_prices.into_iter().collect();
+    changed.sort();
+    for (product_id, price) in changed {
+        let (name, old): (String, i64) = tx
+            .query_row("SELECT trade_name, sell_price FROM products WHERE id = ?1", params![product_id], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .map_err(err)?;
+        if old != price {
+            tx.execute("UPDATE products SET sell_price = ?1 WHERE id = ?2", params![price, product_id]).map_err(err)?;
+            let payload = serde_json::json!({ "from": old, "to": price, "invoiceId": invoice_id }).to_string();
+            append_audit(&tx, user_id, "product.price", "products", product_id, &payload, &now).map_err(err)?;
+            price_changes.push(name);
+        }
+    }
+
+    // Supplier account: the invoice is what we owe; a cash invoice is settled by a payment at once.
+    tx.execute(
+        "INSERT INTO supplier_ledger(id, supplier_id, entry_type, ref_id, credit, entry_date, note)
+         VALUES (?1, ?2, 'invoice', ?3, ?4, ?5, ?6)",
+        params![new_id(), inv.supplier_id, invoice_id, total, inv.invoice_date, invoice_no],
+    )
+    .map_err(err)?;
+    if on_credit {
+        tx.execute("UPDATE suppliers SET balance = balance + ?1 WHERE id = ?2", params![total, inv.supplier_id])
+            .map_err(err)?;
+    } else {
+        tx.execute(
+            "INSERT INTO supplier_ledger(id, supplier_id, entry_type, ref_id, debit, entry_date, note)
+             VALUES (?1, ?2, 'payment', ?3, ?4, ?5, 'نقداً عند الاستلام')",
+            params![new_id(), inv.supplier_id, invoice_id, total, inv.invoice_date],
+        )
+        .map_err(err)?;
+    }
+    let supplier_balance: i64 = tx
+        .query_row("SELECT balance FROM suppliers WHERE id = ?1", params![inv.supplier_id], |r| r.get(0))
+        .map_err(err)?;
+
+    let payload = serde_json::json!({
+        "supplierId": inv.supplier_id,
+        "invoiceNo": invoice_no,
+        "total": total,
+        "lines": inv.lines.len(),
+        "payment": inv.payment,
+    })
+    .to_string();
+    append_audit(&tx, user_id, "purchase.post", "purchase_invoices", &invoice_id, &payload, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+
+    Ok(PurchaseResult {
+        invoice_id,
+        total,
+        units,
+        batches_created: created,
+        batches_updated: updated,
+        price_changes,
+        due_date,
+        supplier_balance,
+    })
+}
+
+#[tauri::command]
+fn post_purchase_invoice(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    invoice: PurchaseInvoiceIn,
+) -> Result<PurchaseResult, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    post_purchase_inner(&mut conn, &user_id, invoice)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1120,7 +1512,10 @@ pub fn run() {
             list_categories,
             add_product,
             receive_batch,
-            adjust_batch
+            adjust_batch,
+            list_suppliers,
+            add_supplier,
+            post_purchase_invoice
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -1642,5 +2037,199 @@ mod tests {
         let ghost = AdjustBatch { batch_id: "b-nope".into(), new_qty: 1, reason: "جرد".into() };
         assert!(adjust_batch_inner(&mut conn, ADMIN, ghost).unwrap_err().contains("غير موجودة"));
         assert_eq!(qty(&conn, "b-br-400"), 55);
+    }
+
+    // ── Purchasing ──
+
+    fn pline(product: &str, batch_no: &str, expiry: &str, qty: i64, cost: i64, sell: i64) -> PurchaseLineIn {
+        PurchaseLineIn {
+            product_id: product.into(),
+            batch_no: batch_no.into(),
+            expiry_date: expiry.into(),
+            qty,
+            unit_cost: cost,
+            sell_price: sell,
+        }
+    }
+
+    fn purchase(no: &str, payment: &str, lines: Vec<PurchaseLineIn>) -> PurchaseInvoiceIn {
+        PurchaseInvoiceIn {
+            supplier_id: "s-a".into(),
+            supplier_invoice_no: no.into(),
+            invoice_date: "2026-01-15".into(),
+            payment: payment.into(),
+            lines,
+        }
+    }
+
+    fn supplier_balance(conn: &Connection) -> i64 {
+        count(conn, "SELECT balance FROM suppliers WHERE id = 's-a'")
+    }
+
+    /// The purchase must fail with `reason` and leave no trace.
+    fn assert_purchase_rejected(conn: &mut Connection, user: &str, inv: PurchaseInvoiceIn, reason: &str) {
+        let e = post_purchase_inner(conn, user, inv).unwrap_err();
+        assert!(e.contains(reason), "expected {reason:?}, got {e:?}");
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM purchase_invoices"), 0);
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM batches"), 15);
+        assert_eq!(count(conn, "SELECT COUNT(*) FROM stock_movements WHERE type = 'purchase'"), 0);
+        assert_eq!(supplier_balance(conn), 0);
+    }
+
+    #[test]
+    fn cash_purchase_creates_batches_movements_and_settled_ledger() {
+        let mut conn = db();
+        let inv = purchase(
+            "INV-100",
+            "cash",
+            vec![
+                pline("p-brufen-400", "BR500", "2099-06-30", 40, 2500, 3500),
+                pline("p-concor-5", "CN200", "2099-03-31", 10, 7300, 9000),
+            ],
+        );
+        let r = post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        assert_eq!((r.total, r.units, r.batches_created, r.batches_updated), (40 * 2500 + 10 * 7300, 50, 2, 0));
+        assert!(r.price_changes.is_empty() && r.due_date.is_none());
+        let status: String = conn.query_row("SELECT status FROM purchase_invoices", [], |r| r.get(0)).unwrap();
+        assert_eq!(status, "paid");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM purchase_invoice_items"), 2);
+        assert_eq!(count(&conn, "SELECT SUM(qty) FROM stock_movements WHERE type = 'purchase'"), 50);
+        assert_eq!(count(&conn, "SELECT SUM(credit) - SUM(debit) FROM supplier_ledger"), 0, "cash invoice is settled");
+        assert_eq!(supplier_balance(&conn), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'purchase.post'"), 1);
+        let source: i64 = count(
+            &conn,
+            "SELECT COUNT(*) FROM batches b JOIN purchase_invoice_items i ON i.id = b.source_item_id WHERE b.batch_no = 'BR500'",
+        );
+        assert_eq!(source, 1, "batch links back to the invoice line");
+    }
+
+    #[test]
+    fn credit_purchase_adds_to_supplier_balance_with_due_date() {
+        let mut conn = db();
+        let inv = purchase("INV-200", "credit", vec![pline("p-brufen-400", "BR500", "2099-06-30", 10, 2500, 3500)]);
+        let r = post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        assert_eq!(r.supplier_balance, 25_000);
+        assert_eq!(r.due_date.as_deref(), Some("2026-02-14"), "supplier s-a has 30-day terms");
+        let (status, paid): (String, i64) =
+            conn.query_row("SELECT status, paid FROM purchase_invoices", [], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        assert_eq!((status.as_str(), paid), ("posted", 0));
+    }
+
+    #[test]
+    fn purchased_stock_is_sold_by_fefo_right_away() {
+        let mut conn = db();
+        // A batch that expires before the shelf stock: FEFO must offer it first.
+        let soon: String = conn.query_row("SELECT date('now', 'localtime', '+30 days')", [], |r| r.get(0)).unwrap();
+        let inv = purchase("INV-300", "cash", vec![pline("p-brufen-400", "BR-SOON", &soon, 5, 2400, 3500)]);
+        post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        let batches = product_batches_rows(&conn, "p-brufen-400");
+        assert_eq!(batches[0].batch_no, "BR-SOON");
+        assert_eq!(search_inner(&conn, "brufen", "trade").unwrap()[0].stock, 60);
+
+        let id = batches[0].id.clone();
+        let r = post_sale_inner(&mut conn, ADMIN, cash_sale(vec![line("p-brufen-400", 3500, &[(&id, 5)])], 17_500));
+        assert!(r.is_ok(), "{r:?}");
+        assert_eq!(qty(&conn, &id), 0);
+    }
+
+    fn product_batches_rows(conn: &Connection, product: &str) -> Vec<InventoryBatch> {
+        inventory_batches_inner(conn, product).unwrap()
+    }
+
+    #[test]
+    fn same_batch_number_tops_up_with_weighted_cost() {
+        let mut conn = db();
+        let expiry: String = conn.query_row("SELECT expiry_date FROM batches WHERE id = 'b-br-400'", [], |r| r.get(0)).unwrap();
+        // Shelf: 55 at 2400. Received: 45 at 2600. Average: (55×2400 + 45×2600) / 100 = 2490.
+        let inv = purchase("INV-400", "cash", vec![pline("p-brufen-400", "BR400", &expiry, 45, 2600, 3500)]);
+        let r = post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        assert_eq!((r.batches_created, r.batches_updated), (0, 1));
+        assert_eq!(qty(&conn, "b-br-400"), 100);
+        assert_eq!(count(&conn, "SELECT unit_cost FROM batches WHERE id = 'b-br-400'"), 2490);
+        assert_eq!(count(&conn, "SELECT SUM(qty) FROM stock_movements WHERE batch_id = 'b-br-400'"), 100);
+    }
+
+    #[test]
+    fn new_retail_price_updates_the_product_and_the_till() {
+        let mut conn = db();
+        let inv = purchase("INV-500", "cash", vec![pline("p-brufen-400", "BR500", "2099-06-30", 10, 2600, 3750)]);
+        let r = post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        assert_eq!(r.price_changes, ["Brufen 400 mg"]);
+        assert_eq!(count(&conn, "SELECT sell_price FROM products WHERE id = 'p-brufen-400'"), 3750);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'product.price'"), 1);
+        // The till now refuses the old price and accepts the new one.
+        assert_rejected(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500), "أصبح 3750");
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![line("p-brufen-400", 3750, &[("b-br-400", 1)])], 3750)).unwrap();
+    }
+
+    #[test]
+    fn purchase_rejects_bad_invoices_without_writing_anything() {
+        let mut conn = db();
+        let ok = || pline("p-brufen-400", "BR500", "2099-06-30", 10, 2500, 3500);
+        let shelf_expiry: String =
+            conn.query_row("SELECT expiry_date FROM batches WHERE id = 'b-br-400'", [], |r| r.get(0)).unwrap();
+        let mismatch = format!("مسجّلة بتاريخ انتهاء {shelf_expiry}");
+        let cases: Vec<(PurchaseInvoiceIn, &str)> = vec![
+            (PurchaseInvoiceIn { supplier_id: "s-nope".into(), ..purchase("A", "cash", vec![ok()]) }, "اختر المورد"),
+            (purchase(" ", "cash", vec![ok()]), "رقم فاتورة الشراء"),
+            (PurchaseInvoiceIn { invoice_date: "2099-01-01".into(), ..purchase("A", "cash", vec![ok()]) }, "المستقبل"),
+            (PurchaseInvoiceIn { invoice_date: "15/01/2026".into(), ..purchase("A", "cash", vec![ok()]) }, "تاريخ الفاتورة"),
+            (purchase("A", "cheque", vec![ok()]), "حالة الدفع"),
+            (purchase("A", "cash", vec![]), "أضف صنفاً"),
+            // A bad second line must roll back the good first line too.
+            (purchase("A", "cash", vec![ok(), pline("p-concor-5", "C1", "2020-01-01", 5, 7000, 9000)]), "منتهي الصلاحية"),
+            (purchase("A", "cash", vec![ok(), pline("p-concor-5", "C1", "2099-13-01", 5, 7000, 9000)]), "تاريخ الانتهاء غير صالح"),
+            (purchase("A", "cash", vec![pline("p-brufen-400", " ", "2099-06-30", 10, 2500, 3500)]), "رقم التشغيلة"),
+            (purchase("A", "cash", vec![pline("p-brufen-400", "X", "2099-06-30", 0, 2500, 3500)]), "الكمية"),
+            (purchase("A", "cash", vec![pline("p-brufen-400", "X", "2099-06-30", 5, -1, 3500)]), "سعر الشراء"),
+            (purchase("A", "cash", vec![pline("p-brufen-400", "X", "2099-06-30", 5, 2500, 0)]), "سعر البيع"),
+            (purchase("A", "cash", vec![pline("p-nope", "X", "2099-06-30", 5, 2500, 3500)]), "صنف غير موجود"),
+            (purchase("A", "cash", vec![ok(), ok()]), "مكررة"),
+            (
+                purchase("A", "cash", vec![ok(), pline("p-brufen-400", "BR501", "2099-06-30", 5, 2500, 3600)]),
+                "سعر البيع مختلف",
+            ),
+            (
+                purchase("A", "cash", vec![ok(), pline("p-brufen-400", "BR400", "2099-12-31", 5, 2500, 3500)]),
+                &mismatch,
+            ),
+        ];
+        for (inv, reason) in cases {
+            assert_purchase_rejected(&mut conn, ADMIN, inv, reason);
+        }
+        assert_eq!(count(&conn, "SELECT sell_price FROM products WHERE id = 'p-brufen-400'"), 3500);
+    }
+
+    #[test]
+    fn same_supplier_invoice_cannot_be_posted_twice() {
+        let mut conn = db();
+        let inv = || purchase("INV-600", "credit", vec![pline("p-brufen-400", "BR500", "2099-06-30", 10, 2500, 3500)]);
+        post_purchase_inner(&mut conn, ADMIN, inv()).unwrap();
+        let e = post_purchase_inner(&mut conn, ADMIN, inv()).unwrap_err();
+        assert!(e.contains("مُرحّلة مسبقاً"), "{e}");
+        assert_eq!(supplier_balance(&conn), 25_000, "balance counted once");
+        assert_eq!(count(&conn, "SELECT qty_on_hand FROM batches WHERE batch_no = 'BR500'"), 10, "stock counted once");
+    }
+
+    #[test]
+    fn cashier_cannot_post_purchases_or_add_suppliers() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        let inv = purchase("INV-700", "cash", vec![pline("p-brufen-400", "BR500", "2099-06-30", 10, 2500, 3500)]);
+        assert_purchase_rejected(&mut conn, "u-cash", inv, "صلاحية");
+        let s = NewSupplier { name: "مورد".into(), phone: None, payment_terms_days: None };
+        assert!(add_supplier_inner(&mut conn, "u-cash", s).unwrap_err().contains("صلاحية"));
+    }
+
+    #[test]
+    fn add_supplier_validates_and_rejects_duplicates() {
+        let mut conn = db();
+        let s = |name: &str, terms: Option<i64>| NewSupplier { name: name.into(), phone: Some("0770".into()), payment_terms_days: terms };
+        let added = add_supplier_inner(&mut conn, ADMIN, s("شركة الرافدين", Some(60))).unwrap();
+        assert_eq!((added.payment_terms_days, added.balance, added.phone.as_deref()), (60, 0, Some("0770")));
+        assert!(add_supplier_inner(&mut conn, ADMIN, s("شركة الرافدين", None)).unwrap_err().contains("موجود مسبقاً"));
+        assert!(add_supplier_inner(&mut conn, ADMIN, s("  ", None)).unwrap_err().contains("مطلوب"));
+        assert!(add_supplier_inner(&mut conn, ADMIN, s("X", Some(400))).unwrap_err().contains("مدة السداد"));
     }
 }

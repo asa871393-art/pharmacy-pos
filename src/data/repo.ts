@@ -6,11 +6,15 @@ import type {
   InventoryBatch,
   InventoryItem,
   NewProduct,
+  NewSupplier,
   ProductHit,
+  PurchaseInvoice,
+  PurchaseResult,
   ReceiveBatchInput,
   SaleDraft,
   SaleResult,
   SearchMode,
+  Supplier,
   User,
 } from "../core/types.ts";
 
@@ -36,6 +40,10 @@ export interface PharmacyRepo {
   addProduct(product: NewProduct): Promise<InventoryItem>;
   receiveBatch(batch: ReceiveBatchInput): Promise<InventoryItem>;
   adjustBatch(adjustment: AdjustBatchInput): Promise<InventoryItem>;
+  suppliers(): Promise<Supplier[]>;
+  addSupplier(supplier: NewSupplier): Promise<Supplier>;
+  /** Posts a supplier invoice in one transaction; its stock is sellable at once. */
+  postPurchaseInvoice(invoice: PurchaseInvoice): Promise<PurchaseResult>;
 }
 
 export function localToday(): string {

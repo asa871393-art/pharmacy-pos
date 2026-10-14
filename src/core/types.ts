@@ -151,3 +151,51 @@ export interface AdjustBatchInput {
   newQty: number;
   reason: string;
 }
+
+// ── Purchasing ──
+
+export interface Supplier {
+  id: string;
+  name: string;
+  phone: string | null;
+  paymentTermsDays: number;
+  balance: number; // what the pharmacy owes them
+}
+
+export interface NewSupplier {
+  name: string;
+  phone?: string;
+  paymentTermsDays?: number;
+}
+
+/** "cash": paid on delivery. "credit": added to what we owe the supplier. */
+export type PurchasePayment = "cash" | "credit";
+
+/** One batch received. The same product delivered in two batches is two lines. */
+export interface PurchaseLine {
+  productId: string;
+  batchNo: string;
+  expiryDate: string;
+  qty: number;
+  unitCost: number; // purchase price per unit
+  sellPrice: number; // retail price; becomes the product's selling price
+}
+
+export interface PurchaseInvoice {
+  supplierId: string;
+  supplierInvoiceNo: string;
+  invoiceDate: string;
+  payment: PurchasePayment;
+  lines: PurchaseLine[];
+}
+
+export interface PurchaseResult {
+  invoiceId: string;
+  total: number;
+  units: number;
+  batchesCreated: number;
+  batchesUpdated: number;
+  priceChanges: string[]; // products whose selling price changed
+  dueDate: string | null;
+  supplierBalance: number;
+}

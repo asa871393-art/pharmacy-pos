@@ -7,11 +7,15 @@ import type {
   InventoryBatch,
   InventoryItem,
   NewProduct,
+  NewSupplier,
   ProductHit,
+  PurchaseInvoice,
+  PurchaseResult,
   ReceiveBatchInput,
   SaleDraft,
   SaleResult,
   SearchMode,
+  Supplier,
   User,
 } from "../core/types.ts";
 import type { PharmacyRepo } from "./repo.ts";
@@ -33,4 +37,7 @@ export const tauriRepo: PharmacyRepo = {
   addProduct: (product: NewProduct) => invoke<InventoryItem>("add_product", { product }),
   receiveBatch: (batch: ReceiveBatchInput) => invoke<InventoryItem>("receive_batch", { batch }),
   adjustBatch: (adjustment: AdjustBatchInput) => invoke<InventoryItem>("adjust_batch", { adjustment }),
+  suppliers: () => invoke<Supplier[]>("list_suppliers"),
+  addSupplier: (supplier: NewSupplier) => invoke<Supplier>("add_supplier", { supplier }),
+  postPurchaseInvoice: (invoice: PurchaseInvoice) => invoke<PurchaseResult>("post_purchase_invoice", { invoice }),
 };
