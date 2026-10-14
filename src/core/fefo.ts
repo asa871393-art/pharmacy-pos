@@ -35,6 +35,12 @@ export function addDays(isoDate: string, days: number): string {
   return d.toISOString().slice(0, 10);
 }
 
+/** First day of the week containing `isoDate`; the week starts on Saturday. */
+export function weekStart(isoDate: string): string {
+  const weekday = new Date(isoDate + "T00:00:00Z").getUTCDay(); // Sunday 0 … Saturday 6
+  return addDays(isoDate, -((weekday + 1) % 7));
+}
+
 export function daysBetween(fromIso: string, toIso: string): number {
   const a = Date.parse(fromIso + "T00:00:00Z");
   const b = Date.parse(toIso + "T00:00:00Z");

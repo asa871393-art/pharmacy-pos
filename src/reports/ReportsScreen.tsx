@@ -1,8 +1,9 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { addDays } from "../core/fefo.ts";
+import { AUDIT_GROUPS, auditActionLabel, auditSummary } from "../core/audit.ts";
+import { addDays, weekStart } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
-import type { Permissions } from "../core/permissions.ts";
 import {
+  type AuditReport,
   type Category,
   type ExpiryReport,
   type ReorderRow,
@@ -17,17 +18,28 @@ import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
 import { errorText } from "../ui/Modal.tsx";
 
-type Tab = "sales" | "expiry" | "reorder" | "rx";
+type Tab = "sales" | "expiry" | "reorder" | "rx" | "audit";
 
-// Same rules as the report_* commands: money and prescription reports need viewReports; stock reports either.
-const moneyReports = (p: Permissions) => p.viewReports;
-const stockReports = (p: Permissions) => p.viewReports || p.modifyInventory;
+// Same rules as the report_* commands: money and prescription reports need viewReports; stock reports either;
+// the audit log is for admins.
+const moneyReports = (u: User) => u.permissions.viewReports;
+const stockReports = (u: User) => u.permissions.viewReports || u.permissions.modifyInventory;
+const adminOnly = (u: User) => u.role === "admin";
 
-const TABS: { id: Tab; label: string; allowed: (p: Permissions) => boolean; usesDates: boolean; usesCashier: boolean }[] = [
-  { id: "sales", label: "المبيعات والأرباح", allowed: moneyReports, usesDates: true, usesCashier: true },
-  { id: "expiry", label: "الصلاحية والتالف", allowed: stockReports, usesDates: true, usesCashier: false },
-  { id: "reorder", label: "إعادة الطلب", allowed: stockReports, usesDates: false, usesCashier: false },
-  { id: "rx", label: "سجل الوصفات الطبية", allowed: moneyReports, usesDates: true, usesCashier: true },
+const TABS: {
+  id: Tab;
+  label: string;
+  allowed: (u: User) => boolean;
+  usesDates: boolean;
+  /** Label of the user filter, if the report has one. */
+  userFilter?: string;
+  usesCategory: boolean;
+}[] = [
+  { id: "sales", label: "المبيعات والأرباح", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true },
+  { id: "expiry", label: "الصلاحية والتالف", allowed: stockReports, usesDates: true, usesCategory: true },
+  { id: "reorder", label: "إعادة الطلب", allowed: stockReports, usesDates: false, usesCategory: true },
+  { id: "rx", label: "سجل الوصفات الطبية", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true },
+  { id: "audit", label: "سجل التدقيق", allowed: adminOnly, usesDates: true, userFilter: "المستخدم", usesCategory: false },
 ];
 
 const HORIZONS = [30, 90, 180];
@@ -219,6 +231,42 @@ function rxView(r: RxReport): View {
   };
 }
 
+function auditView(r: AuditReport): View {
+  type A = AuditReport["rows"][number];
+  const { chain } = r;
+  const cut = r.total > r.rows.length;
+  return {
+    hero: { label: "عمليات مسجّلة في الفترة", value: String(r.total), sub: cut ? `يُعرض أحدث ${r.rows.length}` : undefined, csv: r.total },
+    tiles: [
+      {
+        label: "سلامة السجل",
+        value: chain.ok ? "سليم" : "تم العبث به",
+        sub: chain.ok
+          ? `تحقّقنا من ${chain.checked} عملية: لم يُعدَّل أو يُحذف شيء`
+          : `السجل لا يطابق بصمته ابتداءً من العملية رقم ${chain.brokenAt}`,
+      },
+    ],
+    sections: [
+      {
+        title: "العمليات",
+        note: cut
+          ? `الأحدث أولاً. عُرض ${r.rows.length} من ${r.total}، ضيّق الفترة أو اختر مستخدماً أو نوع عملية لرؤية البقية`
+          : "الأحدث أولاً. السجل لا يقبل التعديل ولا الحذف",
+        empty: "لا توجد عمليات في هذه الفترة",
+        rows: r.rows,
+        columns: [
+          { label: "#", cell: (x: A) => x.seq, csv: (x: A) => x.seq, num: true },
+          { label: "التاريخ والوقت", cell: (x: A) => <bdi className="num">{x.at}</bdi>, csv: (x: A) => x.at },
+          text<A>("المستخدم", (x) => x.user),
+          text<A>("العملية", (x) => auditActionLabel(x.action)),
+          text<A>("يخص", (x) => x.subject),
+          { label: "التفاصيل", cell: (x: A) => auditSummary(x.action, x.payload) || "—", csv: (x: A) => auditSummary(x.action, x.payload) },
+        ],
+      },
+    ],
+  };
+}
+
 // ── CSV ──
 
 function csvCell(v: string | number): string {
@@ -242,13 +290,14 @@ function toCsv(title: string, meta: string[], view: View): string {
 /** Stays mounted (filters survive switching screens); reloads whenever it becomes `visible`, so figures are current. */
 export function ReportsScreen({ user, visible = true }: { user: User; visible?: boolean }) {
   const today = localToday();
-  const tabs = TABS.filter((t) => t.allowed(user.permissions));
+  const tabs = TABS.filter((t) => t.allowed(user));
   const [tab, setTab] = useState<Tab | undefined>(tabs[0]?.id);
   const [from, setFrom] = useState(today.slice(0, 8) + "01");
   const [to, setTo] = useState(today);
   const [cashierId, setCashierId] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [withinDays, setWithinDays] = useState(90);
+  const [auditGroup, setAuditGroup] = useState("");
   const [users, setUsers] = useState<UserRef[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   // The view is kept with the tab it belongs to, so a tab never shows another tab's numbers while loading.
@@ -280,7 +329,9 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
           ? repo.reportExpiry(f, withinDays).then((r) => expiryView(r, withinDays, today))
           : tab === "reorder"
             ? repo.reportReorder(f.categoryId).then(reorderView)
-            : repo.reportPrescriptions(f).then(rxView);
+            : tab === "rx"
+              ? repo.reportPrescriptions(f).then(rxView)
+              : repo.reportAudit({ ...f, categoryId: undefined }, auditGroup || undefined).then(auditView);
     load
       .then((v) => !stale && setLoaded({ tab, view: v }))
       .catch((e) => {
@@ -292,7 +343,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
     return () => {
       stale = true;
     };
-  }, [tab, from, to, cashierId, categoryId, withinDays, today, visible]);
+  }, [tab, from, to, cashierId, categoryId, withinDays, auditGroup, today, visible]);
 
   if (!tab || !current) {
     return (
@@ -307,6 +358,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
 
   const presets: { label: string; from: string; to: string }[] = [
     { label: "اليوم", from: today, to: today },
+    { label: "هذا الأسبوع", from: weekStart(today), to: today },
     { label: "آخر ٧ أيام", from: addDays(today, -6), to: today },
     { label: "هذا الشهر", from: today.slice(0, 8) + "01", to: today },
     { label: "آخر ٣٠ يوماً", from: addDays(today, -29), to: today },
@@ -316,8 +368,9 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
   const meta = [
     current.usesDates ? `الفترة: من ${from} إلى ${to}` : `حتى تاريخ ${today}`,
     ...(tab === "expiry" ? [`تنبيه الانتهاء: خلال ${withinDays} يوماً`] : []),
-    ...(current.usesCashier && cashierId ? [`الكاشير: ${users.find((u) => u.id === cashierId)?.fullName ?? cashierId}`] : []),
-    ...(categoryId ? [`التصنيف: ${categories.find((c) => c.id === categoryId)?.nameAr ?? categoryId}`] : []),
+    ...(current.userFilter && cashierId ? [`${current.userFilter}: ${users.find((u) => u.id === cashierId)?.fullName ?? cashierId}`] : []),
+    ...(current.usesCategory && categoryId ? [`التصنيف: ${categories.find((c) => c.id === categoryId)?.nameAr ?? categoryId}`] : []),
+    ...(tab === "audit" && auditGroup ? [`نوع العملية: ${AUDIT_GROUPS.find((g) => g.id === auditGroup)?.label ?? auditGroup}`] : []),
     `أُعدّ بواسطة ${user.fullName} في ${new Date().toLocaleString("ar-IQ-u-nu-latn")}`,
   ];
 
@@ -407,22 +460,33 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
               </select>
             </label>
           )}
-          {current.usesCashier && (
+          {current.userFilter && (
             <label className="rep-field">
-              <span className="label">الكاشير</span>
+              <span className="label">{current.userFilter}</span>
               <select className="field" value={cashierId} onChange={(e) => setCashierId(e.target.value)}>
                 <option value="">الكل</option>
                 {users.map((u) => <option key={u.id} value={u.id}>{u.fullName}</option>)}
               </select>
             </label>
           )}
-          <label className="rep-field">
-            <span className="label">التصنيف</span>
-            <select className="field" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
-              <option value="">الكل</option>
-              {categories.map((c) => <option key={c.id} value={c.id}>{c.nameAr}</option>)}
-            </select>
-          </label>
+          {tab === "audit" && (
+            <label className="rep-field">
+              <span className="label">نوع العملية</span>
+              <select className="field" value={auditGroup} onChange={(e) => setAuditGroup(e.target.value)}>
+                <option value="">الكل</option>
+                {AUDIT_GROUPS.map((g) => <option key={g.id} value={g.id}>{g.label}</option>)}
+              </select>
+            </label>
+          )}
+          {current.usesCategory && (
+            <label className="rep-field">
+              <span className="label">التصنيف</span>
+              <select className="field" value={categoryId} onChange={(e) => setCategoryId(e.target.value)}>
+                <option value="">الكل</option>
+                {categories.map((c) => <option key={c.id} value={c.id}>{c.nameAr}</option>)}
+              </select>
+            </label>
+          )}
         </div>
 
         {error && <div role="alert" className="banner error no-print"><span>{error}</span></div>}

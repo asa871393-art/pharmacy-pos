@@ -124,6 +124,12 @@ await page.waitForSelector(".perm-list");
 await page.screenshot({ path: "screenshots/16-user-access.png" });
 await page.keyboard.press("Escape");
 
+// Audit log (admin only): the sign-ins, the sale and the stock correction above
+await page.getByRole("button", { name: "التقارير", exact: true }).click();
+await page.getByRole("tab", { name: "سجل التدقيق" }).click();
+await page.waitForSelector(".rep-table tbody tr td.n");
+await page.screenshot({ path: "screenshots/17-audit-log.png" });
+
 await browser.close();
 if (errors.length) {
   console.error(errors.join("\n"));

@@ -329,6 +329,30 @@ export interface RxReport {
   byPrescriber: PrescriberRow[];
 }
 
+export interface AuditRow {
+  seq: number;
+  /** Local "YYYY-MM-DD HH:MM:SS". */
+  at: string;
+  user: string | null;
+  /** e.g. "sale.create", "user.login". */
+  action: string;
+  entity: string;
+  entityId: string | null;
+  /** What the entry is about, by name: product, "product / batch", invoice number, user or supplier. */
+  subject: string | null;
+  /** The JSON written with the entry. */
+  payload: string;
+}
+
+export interface AuditReport {
+  /** Newest first, at most 1,000. */
+  rows: AuditRow[];
+  /** Entries matching the filter; more than rows.length when the list was cut. */
+  total: number;
+  /** Result of recomputing the whole hash chain. */
+  chain: { ok: boolean; checked: number; brokenAt: number | null };
+}
+
 // ── Phone scanner ──
 
 export interface PhoneScannerInfo {

@@ -22,6 +22,7 @@ const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 const SALE_CONTROLS_SQL: &str = include_str!("../migrations/0002_sale_controls.sql");
 const USER_PERMISSIONS_SQL: &str = include_str!("../migrations/0003_user_permissions.sql");
 const RECEIPT_SETTINGS_SQL: &str = include_str!("../migrations/0004_receipt_settings.sql");
+const REPORT_INDEXES_SQL: &str = include_str!("../migrations/0005_report_indexes.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -50,6 +51,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(RECEIPT_SETTINGS_SQL)?;
         tx.execute_batch("PRAGMA user_version = 4;")?;
+        tx.commit()?;
+    }
+    if version < 5 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(REPORT_INDEXES_SQL)?;
+        tx.execute_batch("PRAGMA user_version = 5;")?;
         tx.commit()?;
     }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
@@ -1647,6 +1654,18 @@ fn check_range(conn: &Connection, f: &ReportFilter) -> Result<(), String> {
     Ok(())
 }
 
+/// The local days `from`..=`to` as a half-open range of stored UTC timestamps: [local midnight of `from`, local
+/// midnight after `to`). Comparing the column against these keeps the index on it usable, where
+/// `date(created_at, 'localtime') BETWEEN ..` has to convert and test every row.
+fn utc_range(conn: &Connection, from: &str, to: &str) -> Result<(String, String), String> {
+    conn.query_row(
+        "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', ?1, 'utc'), strftime('%Y-%m-%dT%H:%M:%fZ', ?2, '+1 day', 'utc')",
+        params![from, to],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .map_err(err)
+}
+
 #[derive(Serialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UserRef {
@@ -1705,13 +1724,14 @@ pub struct SalesReport {
 }
 
 /// One row per sale item in the filter. The invoice discount is shared over the sale's lines by value, so totals per
-/// cashier, day, product or category add up to the invoice totals. ?1 from, ?2 to, ?3 cashier, ?4 category.
+/// cashier, day, product or category add up to the invoice totals. ?1..?2 UTC range (utc_range), ?3 cashier,
+/// ?4 category.
 const SALE_ITEMS_CTE: &str = "WITH s AS (
     SELECT s.id, s.cashier_id, date(s.created_at, 'localtime') AS day,
            s.discount_total - COALESCE((SELECT SUM(discount) FROM sale_items WHERE sale_id = s.id), 0) AS inv_disc,
            COALESCE((SELECT SUM(line_total) FROM sale_items WHERE sale_id = s.id), 0) AS lines_total
     FROM sales s
-    WHERE s.status = 'paid' AND date(s.created_at, 'localtime') BETWEEN ?1 AND ?2 AND (?3 IS NULL OR s.cashier_id = ?3)
+    WHERE s.status = 'paid' AND s.created_at >= ?1 AND s.created_at < ?2 AND (?3 IS NULL OR s.cashier_id = ?3)
   ), i AS (
     SELECT s.id AS sale_id, s.cashier_id, s.day, it.product_id, p.trade_name, it.qty,
            it.qty * it.unit_price AS gross,
@@ -1727,10 +1747,11 @@ const SALES_AGG: &str = "COUNT(DISTINCT sale_id), COALESCE(SUM(qty), 0),
   CAST(ROUND(COALESCE(SUM(gross - disc - cost), 0)) AS INTEGER)";
 
 fn sales_rows(conn: &Connection, f: &ReportFilter, key: &str, label: &str, tail: &str) -> Result<Vec<SalesRow>, String> {
+    let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
     let sql = format!("{SALE_ITEMS_CTE} SELECT {key}, {label}, {SALES_AGG} FROM i {tail}");
     let mut stmt = conn.prepare(&sql).map_err(err)?;
     let rows = stmt
-        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
             Ok(SalesRow {
                 key: r.get(0)?,
                 label: r.get(1)?,
@@ -1747,13 +1768,14 @@ fn sales_rows(conn: &Connection, f: &ReportFilter, key: &str, label: &str, tail:
 
 fn report_sales_inner(conn: &Connection, f: &ReportFilter) -> Result<SalesReport, String> {
     check_range(conn, f)?;
+    let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
     let totals = conn
         .query_row(
             &format!(
                 "{SALE_ITEMS_CTE} SELECT COUNT(DISTINCT sale_id), COALESCE(SUM(qty), 0), COALESCE(SUM(gross), 0),
                    CAST(ROUND(COALESCE(SUM(disc), 0)) AS INTEGER), COALESCE(SUM(cost), 0) FROM i"
             ),
-            params![f.from, f.to, f.cashier_id, f.category_id],
+            params![lo, hi, f.cashier_id, f.category_id],
             |r| {
                 let (gross, discounts, cost): (i64, i64, i64) = (r.get(2)?, r.get(3)?, r.get(4)?);
                 Ok(SalesTotals {
@@ -1879,12 +1901,13 @@ fn report_expiry_inner(conn: &Connection, f: &ReportFilter, within_days: i64) ->
              JOIN batches b ON b.id = m.batch_id JOIN products p ON p.id = b.product_id
              LEFT JOIN users u ON u.id = m.user_id
              WHERE m.type IN ('adjust', 'damage', 'destroy') AND m.qty < 0
-               AND date(m.occurred_at, 'localtime') BETWEEN ?1 AND ?2 AND (?3 IS NULL OR p.category_id = ?3)
+               AND m.occurred_at >= ?1 AND m.occurred_at < ?2 AND (?3 IS NULL OR p.category_id = ?3)
              ORDER BY m.occurred_at DESC",
         )
         .map_err(err)?;
+    let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
     let write_offs = stmt
-        .query_map(params![f.from, f.to, f.category_id], |r| {
+        .query_map(params![lo, hi, f.category_id], |r| {
             Ok(WriteOffRow {
                 day: r.get(0)?,
                 product: r.get(1)?,
@@ -1956,7 +1979,7 @@ fn report_reorder_inner(conn: &Connection, category_id: Option<&str>) -> Result<
                rr.reorder_level, COALESCE(rr.max_qty, 0),
                COALESCE((SELECT SUM(si.qty) FROM sale_items si JOIN sales s ON s.id = si.sale_id
                          WHERE si.product_id = p.id AND s.status = 'paid'
-                           AND date(s.created_at, 'localtime') > date('now', 'localtime', '-30 days')), 0),
+                           AND s.created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', date('now', 'localtime', '-29 days'), 'utc')), 0),
                (SELECT name FROM suppliers WHERE id = rr.preferred_supplier_id),
                (SELECT unit_cost FROM batches b WHERE b.product_id = p.id ORDER BY b.received_at DESC LIMIT 1)
              FROM products p
@@ -2041,9 +2064,10 @@ pub struct RxReport {
 
 fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxReport, String> {
     check_range(conn, f)?;
-    // ?3 is the cashier who rang the sale up; ?4 keeps prescriptions with at least one item in the category.
+    let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
+    // ?1..?2 is the UTC range; ?3 is the cashier who rang the sale up; ?4 keeps prescriptions with at least one item in the category.
     let base = "FROM sale_prescriptions sp JOIN sales s ON s.id = sp.sale_id
-      WHERE s.status = 'paid' AND date(s.created_at, 'localtime') BETWEEN ?1 AND ?2
+      WHERE s.status = 'paid' AND s.created_at >= ?1 AND s.created_at < ?2
         AND (?3 IS NULL OR s.cashier_id = ?3)
         AND (?4 IS NULL OR EXISTS (SELECT 1 FROM sale_items si JOIN products p ON p.id = si.product_id
                                    WHERE si.sale_id = s.id AND p.category_id = ?4))";
@@ -2059,7 +2083,7 @@ fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxR
         ))
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
             Ok(RxRow {
                 sale_id: r.get(0)?,
                 invoice_no: r.get(1)?,
@@ -2081,7 +2105,7 @@ fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxR
         ))
         .map_err(err)?;
     let by_prescriber = stmt
-        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
             Ok(PrescriberRow { prescriber: r.get(0)?, prescriptions: r.get(1)?, units: r.get(2)? })
         })
         .map_err(err)?
@@ -2096,6 +2120,131 @@ fn report_prescriptions(db: State<'_, Db>, session: State<'_, Session>, filter: 
     let conn = db.0.lock().map_err(err)?;
     require_permission(&conn, &user_id, &["view_reports"])?;
     report_prescriptions_inner(&conn, &filter)
+}
+
+// ── Audit log ──
+// Admin only: the log covers every account, including other admins' changes to users and settings.
+
+/// At most this many entries per request, newest first; the screen asks for a narrower filter beyond that.
+const AUDIT_LIMIT: i64 = 1000;
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditRow {
+    seq: i64,
+    /// Local date and time.
+    at: String,
+    user: Option<String>,
+    action: String,
+    entity: String,
+    entity_id: Option<String>,
+    /// What the entry is about, by name: product, "product / batch", invoice number, user or supplier.
+    subject: Option<String>,
+    /// The JSON written with the entry.
+    payload: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditChain {
+    /// Every entry links to the one before it and its hash matches its contents.
+    ok: bool,
+    checked: i64,
+    /// The first entry that fails the check.
+    broken_at: Option<i64>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct AuditReport {
+    rows: Vec<AuditRow>,
+    /// Entries matching the filter; more than `rows.len()` when the list was cut at the limit.
+    total: i64,
+    chain: AuditChain,
+}
+
+/// Recomputes the whole hash chain (see append_audit).
+fn verify_audit_chain(conn: &Connection) -> Result<AuditChain, String> {
+    let mut stmt = conn
+        .prepare("SELECT seq, user_id, action, entity, entity_id, payload, prev_hash, hash, occurred_at FROM audit_log ORDER BY seq")
+        .map_err(err)?;
+    let mut rows = stmt.query([]).map_err(err)?;
+    let mut prev = "GENESIS".to_string();
+    let mut checked = 0;
+    while let Some(r) = rows.next().map_err(err)? {
+        let seq: i64 = r.get(0).map_err(err)?;
+        let field = |i: usize| -> Result<String, String> { Ok(r.get::<_, Option<String>>(i).map_err(err)?.unwrap_or_default()) };
+        let (prev_hash, hash) = (field(6)?, field(7)?);
+        let mut h = Sha256::new();
+        h.update(format!("{prev}|{}|{}|{}|{}|{}|{}", field(1)?, field(2)?, field(3)?, field(4)?, field(5)?, field(8)?));
+        if prev_hash != prev || hash != format!("{:x}", h.finalize()) {
+            return Ok(AuditChain { ok: false, checked, broken_at: Some(seq) });
+        }
+        prev = hash;
+        checked += 1;
+    }
+    Ok(AuditChain { ok: true, checked, broken_at: None })
+}
+
+/// `f.cashier_id` filters by the user who acted; `action` is a full action ("user.login") or its group ("user").
+fn report_audit_inner(conn: &Connection, f: &ReportFilter, action: Option<&str>) -> Result<AuditReport, String> {
+    check_range(conn, f)?;
+    let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
+    let filter = "FROM audit_log a
+      WHERE a.occurred_at >= ?1 AND a.occurred_at < ?2 AND (?3 IS NULL OR a.user_id = ?3)
+        AND (?4 IS NULL OR a.action = ?4 OR a.action LIKE ?4 || '.%')";
+    let total: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) {filter}"), params![lo, hi, f.cashier_id, action], |r| r.get(0))
+        .map_err(err)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT a.seq, datetime(a.occurred_at, 'localtime'), (SELECT full_name FROM users WHERE id = a.user_id),
+                    a.action, a.entity, a.entity_id,
+                    CASE a.entity
+                      WHEN 'products' THEN (SELECT trade_name FROM products WHERE id = a.entity_id)
+                      WHEN 'batches' THEN (SELECT p.trade_name || ' / ' || b.batch_no FROM batches b
+                                           JOIN products p ON p.id = b.product_id WHERE b.id = a.entity_id)
+                      WHEN 'sales' THEN (SELECT invoice_no FROM sales WHERE id = a.entity_id)
+                      WHEN 'purchase_invoices' THEN (SELECT supplier_invoice_no FROM purchase_invoices WHERE id = a.entity_id)
+                      WHEN 'users' THEN (SELECT full_name FROM users WHERE id = a.entity_id)
+                      WHEN 'suppliers' THEN (SELECT name FROM suppliers WHERE id = a.entity_id)
+                    END,
+                    COALESCE(a.payload, '{{}}')
+             {filter} ORDER BY a.seq DESC LIMIT {AUDIT_LIMIT}"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![lo, hi, f.cashier_id, action], |r| {
+            Ok(AuditRow {
+                seq: r.get(0)?,
+                at: r.get(1)?,
+                user: r.get(2)?,
+                action: r.get(3)?,
+                entity: r.get(4)?,
+                entity_id: r.get(5)?,
+                subject: r.get(6)?,
+                payload: r.get(7)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(AuditReport { rows, total, chain: verify_audit_chain(conn)? })
+}
+
+#[tauri::command]
+fn report_audit(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    filter: ReportFilter,
+    action: Option<String>,
+) -> Result<AuditReport, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    if active_role(&conn, &user_id)? != "admin" {
+        return Err("سجل التدقيق للمدير فقط".into());
+    }
+    report_audit_inner(&conn, &filter, action.as_deref().filter(|a| !a.is_empty()))
 }
 
 // ── Export ──
@@ -2688,7 +2837,7 @@ fn recent_sales_inner(conn: &Connection, user_id: &str) -> Result<Vec<RecentSale
                     (SELECT full_name FROM users WHERE id = s.cashier_id),
                     (SELECT COALESCE(SUM(qty), 0) FROM sale_items WHERE sale_id = s.id), s.total
              FROM sales s
-             WHERE date(s.created_at, 'localtime') = date('now', 'localtime') AND (?1 OR s.cashier_id = ?2)
+             WHERE s.created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', date('now', 'localtime'), 'utc') AND (?1 OR s.cashier_id = ?2)
              ORDER BY s.created_at DESC LIMIT 100",
         )
         .map_err(err)?;
@@ -2813,6 +2962,7 @@ pub fn run() {
             report_expiry,
             report_reorder,
             report_prescriptions,
+            report_audit,
             save_export,
             list_users,
             create_user,
@@ -3183,7 +3333,7 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 4);
+        assert_eq!(v, 5);
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
@@ -3709,6 +3859,79 @@ mod tests {
 
         let only_ph = report_prescriptions_inner(&conn, &filter(&conn, Some("u-ph"), None)).unwrap();
         assert_eq!(only_ph.rows.len(), 1);
+    }
+
+    #[test]
+    fn report_days_are_local_days_as_utc_ranges() {
+        let mut conn = db();
+        two_sales(&mut conn);
+        let d = today(&conn);
+        let (lo, hi) = utc_range(&conn, &d, &d).unwrap();
+        let local = |t: &str| -> String { conn.query_row("SELECT datetime(?1, 'localtime')", params![t], |r| r.get(0)).unwrap() };
+        assert_eq!(local(&lo), format!("{d} 00:00:00"));
+        let tomorrow: String = conn.query_row("SELECT date(?1, '+1 day')", params![d], |r| r.get(0)).unwrap();
+        assert_eq!(local(&hi), format!("{tomorrow} 00:00:00"));
+
+        // One millisecond before local midnight belongs to yesterday.
+        conn.execute(
+            "UPDATE sales SET created_at = strftime('%Y-%m-%dT%H:%M:%fZ', ?1, '-0.001 seconds') WHERE cashier_id = 'u-ph'",
+            params![lo],
+        )
+        .unwrap();
+        assert_eq!(report_sales_inner(&conn, &filter(&conn, None, None)).unwrap().totals.invoices, 1);
+        let yesterday: String = conn.query_row("SELECT date(?1, '-1 day')", params![d], |r| r.get(0)).unwrap();
+        let y = ReportFilter { from: yesterday.clone(), to: yesterday.clone(), cashier_id: None, category_id: None };
+        let r = report_sales_inner(&conn, &y).unwrap();
+        assert_eq!((r.totals.invoices, r.by_day[0].key.as_str()), (1, yesterday.as_str()));
+        let both = ReportFilter { from: yesterday, to: d, cashier_id: None, category_id: None };
+        assert_eq!(report_sales_inner(&conn, &both).unwrap().by_day.len(), 2);
+    }
+
+    #[test]
+    fn report_date_filters_use_indexes() {
+        let conn = db();
+        let plan = |sql: &str| -> String {
+            let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let rows = stmt.query_map(params!["a", "b", None::<String>, None::<String>], |r| r.get::<_, String>(3)).unwrap();
+            rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
+        };
+        assert!(plan(&format!("{SALE_ITEMS_CTE} SELECT COUNT(*) FROM i")).contains("idx_sales_created"));
+        let audit = plan(
+            "SELECT seq FROM audit_log a WHERE a.occurred_at >= ?1 AND a.occurred_at < ?2 AND (?3 IS NULL OR a.user_id = ?3)
+               AND (?4 IS NULL OR a.action = ?4 OR a.action LIKE ?4 || '.%')",
+        );
+        assert!(audit.contains("idx_audit_occurred"), "{audit}");
+    }
+
+    #[test]
+    fn audit_report_filters_names_subjects_and_checks_the_chain() {
+        let mut conn = db();
+        two_sales(&mut conn);
+        log_in(&mut conn, "u-ph");
+        let all = report_audit_inner(&conn, &filter(&conn, None, None), None).unwrap();
+        assert_eq!(all.total, 3);
+        assert_eq!(all.rows[0].action, "user.login", "newest first");
+        let sale = all.rows.iter().find(|r| r.action == "sale.create").unwrap();
+        assert!(sale.subject.as_deref().is_some_and(|s| sale.payload.contains(s)), "invoice number as the subject");
+        assert_eq!((all.chain.ok, all.chain.checked), (true, 3));
+
+        let sales = report_audit_inner(&conn, &filter(&conn, None, None), Some("sale")).unwrap();
+        assert_eq!(sales.total, 2);
+        let one = report_audit_inner(&conn, &filter(&conn, Some("u-ph"), None), Some("sale.create")).unwrap();
+        assert_eq!((one.total, one.rows[0].user.as_deref()), (1, Some("u-ph")));
+        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-01-31".into(), cashier_id: None, category_id: None };
+        assert_eq!(report_audit_inner(&conn, &old, None).unwrap().total, 0);
+
+        // Editing an entry behind the app's back breaks the chain at that entry.
+        conn.execute_batch("DROP TRIGGER audit_log_no_update; UPDATE audit_log SET payload = '{}' WHERE seq = 2;").unwrap();
+        let chain = report_audit_inner(&conn, &old, None).unwrap().chain;
+        assert_eq!((chain.ok, chain.checked, chain.broken_at), (false, 1, Some(2)));
+    }
+
+    fn log_in(conn: &mut Connection, user: &str) {
+        let tx = conn.transaction().unwrap();
+        append_audit(&tx, user, "user.login", "users", user, "{}", &utc_now(&tx).unwrap()).unwrap();
+        tx.commit().unwrap();
     }
 
     // ── Employees and permissions ──

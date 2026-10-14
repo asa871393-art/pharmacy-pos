@@ -1,6 +1,7 @@
 import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
+  AuditReport,
   AuthStatus,
   Batch,
   Category,
@@ -66,6 +67,8 @@ export interface PharmacyRepo {
   reportExpiry(filter: ReportFilter, withinDays: number): Promise<ExpiryReport>;
   reportReorder(categoryId?: string): Promise<ReorderRow[]>;
   reportPrescriptions(filter: ReportFilter): Promise<RxReport>;
+  /** Admin only. `filter.cashierId` is the user who acted; `action` is an action ("user.login") or group ("user"). */
+  reportAudit(filter: ReportFilter, action?: string): Promise<AuditReport>;
   /** Saves an exported file for the user; returns where it went. */
   saveExport(fileName: string, content: string): Promise<string>;
   // Employees (admin only). Each change returns the updated row.

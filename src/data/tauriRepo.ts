@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
+  AuditReport,
   AuthStatus,
   Batch,
   Category,
@@ -62,6 +63,7 @@ export const tauriRepo: PharmacyRepo = {
   reportExpiry: (filter: ReportFilter, withinDays: number) => invoke<ExpiryReport>("report_expiry", { filter, withinDays }),
   reportReorder: (categoryId?: string) => invoke<ReorderRow[]>("report_reorder", { categoryId: categoryId ?? null }),
   reportPrescriptions: (filter: ReportFilter) => invoke<RxReport>("report_prescriptions", { filter }),
+  reportAudit: (filter: ReportFilter, action?: string) => invoke<AuditReport>("report_audit", { filter, action: action ?? null }),
   saveExport: (fileName: string, content: string) => invoke<string>("save_export", { fileName, content }),
   listUsers: () => invoke<UserRow[]>("list_users"),
   createUser: (user: NewUser) => invoke<UserRow>("create_user", { user }),
