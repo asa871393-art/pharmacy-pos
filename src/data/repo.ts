@@ -3,6 +3,7 @@ import type {
   AuthStatus,
   Batch,
   Category,
+  ExpiryReport,
   InventoryBatch,
   InventoryItem,
   NewProduct,
@@ -11,8 +12,12 @@ import type {
   PurchaseInvoice,
   PurchaseResult,
   ReceiveBatchInput,
+  ReorderRow,
+  ReportFilter,
+  RxReport,
   SaleDraft,
   SaleResult,
+  SalesReport,
   SearchMode,
   Supplier,
   User,
@@ -44,6 +49,14 @@ export interface PharmacyRepo {
   addSupplier(supplier: NewSupplier): Promise<Supplier>;
   /** Posts a supplier invoice in one transaction; its stock is sellable at once. */
   postPurchaseInvoice(invoice: PurchaseInvoice): Promise<PurchaseResult>;
+  // Reports (read-only). Money and prescription reports need REPORT_ROLES; stock reports INVENTORY_ROLES.
+  reportUsers(): Promise<User[]>;
+  reportSales(filter: ReportFilter): Promise<SalesReport>;
+  reportExpiry(filter: ReportFilter, withinDays: number): Promise<ExpiryReport>;
+  reportReorder(categoryId?: string): Promise<ReorderRow[]>;
+  reportPrescriptions(filter: ReportFilter): Promise<RxReport>;
+  /** Saves an exported file for the user; returns where it went. */
+  saveExport(fileName: string, content: string): Promise<string>;
 }
 
 export function localToday(): string {

@@ -1,26 +1,37 @@
 // In-memory store with the same demo data as src-tauri/migrations/demo_seed.sql.
 // Used when the screens run in a normal browser (npm run dev) so they can be tried without the desktop app.
 
-import { addDays, availableQty, sellableBatches } from "../core/fefo.ts";
+import { addDays, availableQty, daysBetween, sellableBatches } from "../core/fefo.ts";
 import { computeTotals, settle } from "../core/totals.ts";
 import {
   INVENTORY_ROLES,
+  REPORT_ROLES,
   type AdjustBatchInput,
   type Batch,
   type Category,
+  type ExpiryReport,
+  type ExpiryRow,
   type InventoryItem,
   type NewProduct,
   type NewSupplier,
   type PurchaseInvoice,
+  type PrescriberRow,
   type PurchaseResult,
   type ProductHit,
   type ReceiveBatchInput,
+  type ReorderRow,
+  type ReportFilter,
   type Role,
+  type RxReport,
+  type RxRow,
   type SaleDraft,
   type SaleResult,
+  type SalesReport,
+  type SalesRow,
   type SearchMode,
   type Supplier,
   type User,
+  type WriteOffRow,
 } from "../core/types.ts";
 import { localToday, type PharmacyRepo } from "./repo.ts";
 
@@ -45,8 +56,33 @@ const categories: Category[] = [
   { id: "cat-otc", nameAr: "أدوية بدون وصفة" },
 ];
 
+const categoryOf = (p: DemoProduct) => (p.categoryId === undefined ? (p.rx ? "cat-rx" : "cat-otc") : p.categoryId);
+
 // Same as reorder_rules in demo_seed.sql.
 const reorderLevels: Record<string, number> = { "p-panadol-extra": 60, "p-amoxil-500": 25, "p-ventolin": 15 };
+const maxLevels: Record<string, number> = { "p-panadol-extra": 200, "p-amoxil-500": 80, "p-ventolin": 50 };
+
+// What the reports read: every sale and every stock write-off made in this session.
+interface DemoSale {
+  id: string;
+  invoiceNo: string;
+  cashierId: string;
+  day: string;
+  soldAt: string;
+  invoiceDiscount: number;
+  lines: { productId: string; qty: number; unitPrice: number; cost: number; discount: number }[];
+  prescription: { rxNo: string; prescriber: string; verifiedBy: string } | null;
+}
+
+interface DemoWriteOff {
+  day: string;
+  productId: string;
+  batchNo: string;
+  qty: number;
+  unitCost: number;
+  reason: string;
+  userId: string;
+}
 
 // Same suppliers as demo_seed.sql.
 const suppliers: Supplier[] = [
@@ -123,6 +159,8 @@ export function createDemoRepo(): PharmacyRepo {
   let counter = 0;
   let current: User | null = null;
   const postedInvoices = new Set<string>(); // supplierId|invoiceNo
+  const sales: DemoSale[] = [];
+  const writeOffs: DemoWriteOff[] = [];
 
   const toHit = (p: DemoProduct): ProductHit => {
     const own = batches.filter((b) => b.productId === p.id);
@@ -145,7 +183,7 @@ export function createDemoRepo(): PharmacyRepo {
 
   const toInventory = (p: DemoProduct): InventoryItem => {
     const own = batches.filter((b) => b.productId === p.id);
-    const categoryId = p.categoryId === undefined ? (p.rx ? "cat-rx" : "cat-otc") : p.categoryId;
+    const categoryId = categoryOf(p);
     return {
       id: p.id,
       barcode: p.barcode ?? null,
@@ -162,6 +200,15 @@ export function createDemoRepo(): PharmacyRepo {
       nearestExpiry: sellableBatches(own, { today })[0]?.expiryDate ?? null,
       reorderLevel: reorderLevels[p.id] ?? null,
     };
+  };
+
+  const requireRole = (roles: Role[]) => {
+    if (!current) throw new Error("سجّل الدخول أولاً");
+    if (!roles.includes(current.role)) throw new Error("ليست لديك صلاحية لعرض هذا التقرير");
+  };
+  const checkRange = (f: ReportFilter) => {
+    if (!isIsoDate(f.from) || !isIsoDate(f.to)) throw new Error("تاريخ البداية أو النهاية غير صالح");
+    if (f.from > f.to) throw new Error("تاريخ البداية بعد تاريخ النهاية");
   };
 
   // Same checks as the inventory commands in src-tauri/src/lib.rs.
@@ -354,8 +401,26 @@ export function createDemoRepo(): PharmacyRepo {
           if (!b || b.productId !== l.productId || b.qtyOnHand < a.qty) throw new Error(`الدفعة ${a.batchNo} لم تعد تكفي، حدّث السلة`);
         }
       }
-      for (const l of draft.lines) for (const a of l.allocations) batches.find((x) => x.id === a.batchId)!.qtyOnHand -= a.qty;
+      const costOf = (l: SaleDraft["lines"][number]) =>
+        l.allocations.reduce((sum, a) => sum + a.qty * batches.find((x) => x.id === a.batchId)!.unitCost, 0);
       counter += 1;
+      sales.push({
+        id: `demo-${counter}`,
+        invoiceNo: `MB-${today.slice(0, 4)}-${String(counter).padStart(6, "0")}`,
+        cashierId: user.id,
+        day: today,
+        soldAt: new Date().toISOString(),
+        invoiceDiscount: draft.invoiceDiscount,
+        lines: draft.lines.map((l) => ({
+          productId: l.productId,
+          qty: l.allocations.reduce((sum, a) => sum + a.qty, 0),
+          unitPrice: l.unitPrice,
+          cost: costOf(l),
+          discount: l.discount,
+        })),
+        prescription: needsRx ? { ...draft.prescription!, verifiedBy: user.id } : null,
+      });
+      for (const l of draft.lines) for (const a of l.allocations) batches.find((x) => x.id === a.batchId)!.qtyOnHand -= a.qty;
       return {
         saleId: `demo-${counter}`,
         invoiceNo: `MB-${today.slice(0, 4)}-${String(counter).padStart(6, "0")}`,
@@ -442,6 +507,17 @@ export function createDemoRepo(): PharmacyRepo {
       const b = batches.find((x) => x.id === input.batchId);
       if (!b) throw new Error("الدفعة غير موجودة");
       if (input.newQty === b.qtyOnHand) throw new Error("الكمية الجديدة مساوية للحالية");
+      if (input.newQty < b.qtyOnHand) {
+        writeOffs.push({
+          day: today,
+          productId: b.productId,
+          batchNo: b.batchNo,
+          qty: b.qtyOnHand - input.newQty,
+          unitCost: b.unitCost,
+          reason: input.reason.trim(),
+          userId: current!.id,
+        });
+      }
       b.qtyOnHand = input.newQty;
       return toInventory(productById(b.productId));
     },
@@ -462,6 +538,198 @@ export function createDemoRepo(): PharmacyRepo {
     },
     async postPurchaseInvoice(inv: PurchaseInvoice): Promise<PurchaseResult> {
       return postPurchase(inv);
+    },
+
+    // Reports: same definitions as the report_* commands in src-tauri/src/lib.rs.
+    async reportUsers() {
+      requireRole(REPORT_ROLES);
+      return [...users].sort((a, b) => a.fullName.localeCompare(b.fullName));
+    },
+    async reportSales(f: ReportFilter): Promise<SalesReport> {
+      requireRole(REPORT_ROLES);
+      checkRange(f);
+      // One row per sale line; the invoice discount is shared over the sale's lines by value.
+      const items = sales
+        .filter((s) => s.day >= f.from && s.day <= f.to && (!f.cashierId || s.cashierId === f.cashierId))
+        .flatMap((s) => {
+          const linesTotal = s.lines.reduce((sum, l) => sum + l.qty * l.unitPrice - l.discount, 0);
+          return s.lines
+            .filter((l) => !f.categoryId || categoryOf(productById(l.productId)) === f.categoryId)
+            .map((l) => {
+              const lineTotal = l.qty * l.unitPrice - l.discount;
+              const disc = l.discount + (linesTotal > 0 ? (s.invoiceDiscount * lineTotal) / linesTotal : 0);
+              const gross = l.qty * l.unitPrice;
+              return { sale: s, productId: l.productId, qty: l.qty, gross, disc, cost: l.cost };
+            });
+        });
+      type Item = (typeof items)[number];
+      const group = (keyOf: (i: Item) => string, labelOf: (i: Item) => string): SalesRow[] => {
+        const map = new Map<string, SalesRow & { sales: Set<string>; d: number; n: number; p: number }>();
+        for (const i of items) {
+          const key = keyOf(i);
+          const row = map.get(key) ?? { key, label: labelOf(i), invoices: 0, units: 0, discounts: 0, net: 0, profit: 0, sales: new Set(), d: 0, n: 0, p: 0 };
+          row.sales.add(i.sale.id);
+          row.units += i.qty;
+          row.d += i.disc;
+          row.n += i.gross - i.disc;
+          row.p += i.gross - i.disc - i.cost;
+          map.set(key, row);
+        }
+        return [...map.values()].map(({ sales: s, d, n, p, ...row }) => ({
+          ...row,
+          invoices: s.size,
+          discounts: Math.round(d),
+          net: Math.round(n),
+          profit: Math.round(p),
+        }));
+      };
+      const gross = items.reduce((s, i) => s + i.gross, 0);
+      const discounts = Math.round(items.reduce((s, i) => s + i.disc, 0));
+      const cost = items.reduce((s, i) => s + i.cost, 0);
+      return {
+        totals: {
+          invoices: new Set(items.map((i) => i.sale.id)).size,
+          units: items.reduce((s, i) => s + i.qty, 0),
+          gross,
+          discounts,
+          net: gross - discounts,
+          cost,
+          profit: gross - discounts - cost,
+        },
+        byCashier: group((i) => i.sale.cashierId, (i) => users.find((u) => u.id === i.sale.cashierId)?.fullName ?? "—").sort((a, b) => b.net - a.net),
+        byDay: group((i) => i.sale.day, (i) => i.sale.day).sort((a, b) => a.key.localeCompare(b.key)),
+        topProducts: group((i) => i.productId, (i) => productById(i.productId).tradeName).sort((a, b) => b.net - a.net).slice(0, 20),
+      };
+    },
+    async reportExpiry(f: ReportFilter, withinDays: number): Promise<ExpiryReport> {
+      requireRole(INVENTORY_ROLES);
+      checkRange(f);
+      if (!(withinDays >= 0 && withinDays <= 730)) throw new Error("مدة التنبيه بين ٠ و٧٣٠ يوماً");
+      const horizon = addDays(today, withinDays);
+      const rows: ExpiryRow[] = batches
+        .filter((b) => b.qtyOnHand > 0 && b.expiryDate <= horizon)
+        .filter((b) => !f.categoryId || categoryOf(productById(b.productId)) === f.categoryId)
+        .map((b) => {
+          const p = productById(b.productId);
+          return {
+            batchId: b.id,
+            product: p.tradeName,
+            category: categories.find((c) => c.id === categoryOf(p))?.nameAr ?? null,
+            batchNo: b.batchNo,
+            expiryDate: b.expiryDate,
+            daysLeft: daysBetween(today, b.expiryDate),
+            qty: b.qtyOnHand,
+            unitCost: b.unitCost,
+            value: b.qtyOnHand * b.unitCost,
+          };
+        })
+        .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate) || a.product.localeCompare(b.product));
+      const offs: WriteOffRow[] = writeOffs
+        .filter((w) => w.day >= f.from && w.day <= f.to)
+        .filter((w) => !f.categoryId || categoryOf(productById(w.productId)) === f.categoryId)
+        .map((w) => ({
+          day: w.day,
+          product: productById(w.productId).tradeName,
+          batchNo: w.batchNo,
+          qty: w.qty,
+          value: w.qty * w.unitCost,
+          reason: w.reason,
+          user: users.find((u) => u.id === w.userId)?.fullName ?? null,
+        }))
+        .reverse();
+      const expired = rows.filter((r) => r.daysLeft <= 0);
+      const near = rows.filter((r) => r.daysLeft > 0);
+      const sum = (rs: { qty: number; value: number }[], k: "qty" | "value") => rs.reduce((s, r) => s + r[k], 0);
+      return {
+        expiredQty: sum(expired, "qty"),
+        expiredValue: sum(expired, "value"),
+        nearQty: sum(near, "qty"),
+        nearValue: sum(near, "value"),
+        batches: rows,
+        writeOffs: offs,
+        writtenOffValue: sum(offs, "value"),
+      };
+    },
+    async reportReorder(categoryId?: string): Promise<ReorderRow[]> {
+      requireRole(INVENTORY_ROLES);
+      const monthAgo = addDays(today, -30);
+      return products
+        .filter((p) => !categoryId || categoryOf(p) === categoryId)
+        .map((p) => {
+          const inv = toInventory(p);
+          const sold = sales
+            .filter((s) => s.day > monthAgo)
+            .flatMap((s) => s.lines)
+            .filter((l) => l.productId === p.id)
+            .reduce((s, l) => s + l.qty, 0);
+          const maxQty = maxLevels[p.id] ?? 0;
+          const level = reorderLevels[p.id] ?? null;
+          const target = maxQty > 0 ? maxQty : level && level > 0 ? level * 2 : Math.max(sold, 1);
+          const latest = batches.filter((b) => b.productId === p.id).sort((a, b) => b.receivedAt.localeCompare(a.receivedAt))[0];
+          return {
+            productId: p.id,
+            product: p.tradeName,
+            barcode: p.barcode ?? null,
+            category: inv.category,
+            stock: inv.stock,
+            reorderLevel: level,
+            sold30d: sold,
+            daysOfCover: sold > 0 ? Math.floor((inv.stock * 30) / sold) : null,
+            suggestedQty: Math.max(target - inv.stock, 0),
+            supplier: level !== null ? suppliers.find((s) => s.id === "s-a")?.name ?? null : null,
+            lastCost: latest?.unitCost ?? null,
+          };
+        })
+        .filter((r) => r.stock === 0 || (r.reorderLevel !== null && r.stock <= r.reorderLevel))
+        .sort(
+          (a, b) =>
+            Number(a.stock > 0) - Number(b.stock > 0) ||
+            (a.daysOfCover ?? Infinity) - (b.daysOfCover ?? Infinity) ||
+            a.stock - b.stock,
+        );
+    },
+    async reportPrescriptions(f: ReportFilter): Promise<RxReport> {
+      requireRole(REPORT_ROLES);
+      checkRange(f);
+      const rows: RxRow[] = sales
+        .filter((s) => s.prescription && s.day >= f.from && s.day <= f.to && (!f.cashierId || s.cashierId === f.cashierId))
+        .filter((s) => !f.categoryId || s.lines.some((l) => categoryOf(productById(l.productId)) === f.categoryId))
+        .map((s) => {
+          const rxLines = s.lines.filter((l) => productById(l.productId).rx);
+          return {
+            saleId: s.id,
+            invoiceNo: s.invoiceNo,
+            soldAt: `${s.day} ${new Date(s.soldAt).toTimeString().slice(0, 8)}`,
+            rxNo: s.prescription!.rxNo,
+            prescriber: s.prescription!.prescriber,
+            pharmacist: users.find((u) => u.id === s.prescription!.verifiedBy)?.fullName ?? null,
+            items: rxLines.map((l) => `${productById(l.productId).tradeName} ×${l.qty}`).join("، "),
+            rxTotal: rxLines.reduce((sum, l) => sum + l.qty * l.unitPrice - l.discount, 0),
+          };
+        })
+        .reverse();
+      const byDoc = new Map<string, PrescriberRow>();
+      for (const s of sales.filter((x) => rows.some((r) => r.saleId === x.id))) {
+        const name = s.prescription!.prescriber;
+        const row = byDoc.get(name.toLowerCase()) ?? { prescriber: name, prescriptions: 0, units: 0 };
+        row.prescriptions += 1;
+        row.units += s.lines.filter((l) => productById(l.productId).rx).reduce((sum, l) => sum + l.qty, 0);
+        byDoc.set(name.toLowerCase(), row);
+      }
+      return {
+        rows,
+        byPrescriber: [...byDoc.values()].sort((a, b) => b.prescriptions - a.prescriptions || a.prescriber.localeCompare(b.prescriber)),
+      };
+    },
+    async saveExport(fileName: string, content: string) {
+      // A browser can only offer the file as a download.
+      const url = URL.createObjectURL(new Blob([content], { type: "text/csv;charset=utf-8" }));
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      return `مجلد التنزيلات (${fileName})`;
     },
   };
 }

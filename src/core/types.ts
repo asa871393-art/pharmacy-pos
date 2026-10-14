@@ -199,3 +199,112 @@ export interface PurchaseResult {
   dueDate: string | null;
   supplierBalance: number;
 }
+
+// ── Reports ──
+
+/** Roles that see sales, profit and prescription reports. Stock reports follow INVENTORY_ROLES. */
+export const REPORT_ROLES: Role[] = ["admin", "chief_pharmacist"];
+
+/** Local calendar days, both ends included. */
+export interface ReportFilter {
+  from: string;
+  to: string;
+  cashierId?: string;
+  categoryId?: string;
+}
+
+export interface SalesTotals {
+  invoices: number;
+  units: number;
+  gross: number; // before discounts
+  discounts: number; // line discounts + each invoice's discount shared over its lines
+  net: number;
+  cost: number; // batch cost of the stock sold
+  profit: number;
+}
+
+/** Grouped by cashier, day or product; `key` is the id or the date. */
+export interface SalesRow {
+  key: string;
+  label: string;
+  invoices: number;
+  units: number;
+  discounts: number;
+  net: number;
+  profit: number;
+}
+
+export interface SalesReport {
+  totals: SalesTotals;
+  byCashier: SalesRow[];
+  byDay: SalesRow[];
+  topProducts: SalesRow[];
+}
+
+export interface ExpiryRow {
+  batchId: string;
+  product: string;
+  category: string | null;
+  batchNo: string;
+  expiryDate: string;
+  daysLeft: number; // negative once expired
+  qty: number;
+  unitCost: number;
+  value: number;
+}
+
+export interface WriteOffRow {
+  day: string;
+  product: string;
+  batchNo: string;
+  qty: number;
+  value: number;
+  reason: string | null;
+  user: string | null;
+}
+
+export interface ExpiryReport {
+  expiredQty: number;
+  expiredValue: number;
+  nearQty: number;
+  nearValue: number;
+  batches: ExpiryRow[];
+  writeOffs: WriteOffRow[];
+  writtenOffValue: number;
+}
+
+export interface ReorderRow {
+  productId: string;
+  product: string;
+  barcode: string | null;
+  category: string | null;
+  stock: number;
+  reorderLevel: number | null;
+  sold30d: number;
+  daysOfCover: number | null; // at the last 30 days' pace; null when nothing sold
+  suggestedQty: number;
+  supplier: string | null;
+  lastCost: number | null;
+}
+
+export interface RxRow {
+  saleId: string;
+  invoiceNo: string;
+  soldAt: string; // local "YYYY-MM-DD HH:MM:SS"
+  rxNo: string;
+  prescriber: string;
+  pharmacist: string | null;
+  items: string; // prescription-only items with quantities
+  rxTotal: number;
+}
+
+export interface PrescriberRow {
+  prescriber: string;
+  prescriptions: number;
+  units: number;
+}
+
+export interface RxReport {
+  rows: RxRow[];
+  byPrescriber: PrescriberRow[];
+}

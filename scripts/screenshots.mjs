@@ -97,6 +97,24 @@ await page.getByRole("button", { name: /ترحيل الفاتورة/ }).click();
 await page.waitForSelector(".pur-panel .banner.success");
 await page.screenshot({ path: "screenshots/10-purchase-posted.png" });
 
+// Reports: a pharmacist sees the stock reports; the admin also sees sales, profit and prescriptions
+await page.getByRole("button", { name: "التقارير", exact: true }).click();
+await page.waitForSelector(".rep .tile.hero");
+await page.screenshot({ path: "screenshots/11-report-expiry.png" });
+await page.getByRole("tab", { name: "إعادة الطلب" }).click();
+await page.waitForSelector(".rep-table tbody tr");
+await page.screenshot({ path: "screenshots/12-report-reorder.png" });
+await page.click(".logout");
+await page.fill("#login-user", "admin");
+await page.fill("#login-pass", "demo1234");
+await page.keyboard.press("Enter");
+await page.getByRole("button", { name: "التقارير", exact: true }).click();
+await page.waitForSelector(".rep .tile.hero");
+await page.screenshot({ path: "screenshots/13-report-sales.png" });
+await page.getByRole("tab", { name: "سجل الوصفات الطبية" }).click();
+await page.waitForSelector(".rep-table tbody tr");
+await page.screenshot({ path: "screenshots/14-report-rx.png" });
+
 await browser.close();
 if (errors.length) {
   console.error(errors.join("\n"));

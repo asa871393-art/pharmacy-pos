@@ -1485,6 +1485,509 @@ fn post_purchase_invoice(
     post_purchase_inner(&mut conn, &user_id, invoice)
 }
 
+// ── Reports ──
+// All read-only. Sales, profit and prescription reports are for managers; stock reports for anyone who manages stock.
+// Dates in filters are local calendar days (YYYY-MM-DD), both ends included.
+
+const REPORT_ROLES: [&str; 2] = ["admin", "chief_pharmacist"];
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportFilter {
+    from: String,
+    to: String,
+    cashier_id: Option<String>,
+    category_id: Option<String>,
+}
+
+fn check_range(conn: &Connection, f: &ReportFilter) -> Result<(), String> {
+    if !is_iso_date(conn, &f.from)? || !is_iso_date(conn, &f.to)? {
+        return Err("تاريخ البداية أو النهاية غير صالح".into());
+    }
+    if f.from > f.to {
+        return Err("تاريخ البداية بعد تاريخ النهاية".into());
+    }
+    Ok(())
+}
+
+/// Users who can appear in a report filter (everyone who has sold, active or not).
+#[tauri::command]
+fn report_users(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<UserDto>, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    require_role(&conn, &user_id, &REPORT_ROLES)?;
+    let mut stmt = conn.prepare("SELECT id, username, full_name, role FROM users ORDER BY full_name").map_err(err)?;
+    let rows = stmt
+        .query_map([], |r| Ok(UserDto { id: r.get(0)?, username: r.get(1)?, full_name: r.get(2)?, role: r.get(3)? }))
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+// ── Sales and profit ──
+
+#[derive(Serialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesTotals {
+    invoices: i64,
+    units: i64,
+    /// Before any discount.
+    gross: i64,
+    /// Line discounts plus each invoice's discount, shared over its lines.
+    discounts: i64,
+    net: i64,
+    /// What the stock sold cost us (batch unit cost at the time of sale).
+    cost: i64,
+    profit: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesRow {
+    /// Cashier id, day or product id, depending on the grouping.
+    key: String,
+    label: String,
+    invoices: i64,
+    units: i64,
+    discounts: i64,
+    net: i64,
+    profit: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SalesReport {
+    totals: SalesTotals,
+    by_cashier: Vec<SalesRow>,
+    by_day: Vec<SalesRow>,
+    top_products: Vec<SalesRow>,
+}
+
+/// One row per sale item in the filter. The invoice discount is shared over the sale's lines by value, so totals per
+/// cashier, day, product or category add up to the invoice totals. ?1 from, ?2 to, ?3 cashier, ?4 category.
+const SALE_ITEMS_CTE: &str = "WITH s AS (
+    SELECT s.id, s.cashier_id, date(s.created_at, 'localtime') AS day,
+           s.discount_total - COALESCE((SELECT SUM(discount) FROM sale_items WHERE sale_id = s.id), 0) AS inv_disc,
+           COALESCE((SELECT SUM(line_total) FROM sale_items WHERE sale_id = s.id), 0) AS lines_total
+    FROM sales s
+    WHERE s.status = 'paid' AND date(s.created_at, 'localtime') BETWEEN ?1 AND ?2 AND (?3 IS NULL OR s.cashier_id = ?3)
+  ), i AS (
+    SELECT s.id AS sale_id, s.cashier_id, s.day, it.product_id, p.trade_name, it.qty,
+           it.qty * it.unit_price AS gross,
+           it.qty * it.unit_cost AS cost,
+           it.discount + CASE WHEN s.lines_total > 0 THEN s.inv_disc * 1.0 * it.line_total / s.lines_total ELSE 0 END AS disc
+    FROM s JOIN sale_items it ON it.sale_id = s.id JOIN products p ON p.id = it.product_id
+    WHERE (?4 IS NULL OR p.category_id = ?4)
+  )";
+
+const SALES_AGG: &str = "COUNT(DISTINCT sale_id), COALESCE(SUM(qty), 0),
+  CAST(ROUND(COALESCE(SUM(disc), 0)) AS INTEGER),
+  CAST(ROUND(COALESCE(SUM(gross - disc), 0)) AS INTEGER),
+  CAST(ROUND(COALESCE(SUM(gross - disc - cost), 0)) AS INTEGER)";
+
+fn sales_rows(conn: &Connection, f: &ReportFilter, key: &str, label: &str, tail: &str) -> Result<Vec<SalesRow>, String> {
+    let sql = format!("{SALE_ITEMS_CTE} SELECT {key}, {label}, {SALES_AGG} FROM i {tail}");
+    let mut stmt = conn.prepare(&sql).map_err(err)?;
+    let rows = stmt
+        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+            Ok(SalesRow {
+                key: r.get(0)?,
+                label: r.get(1)?,
+                invoices: r.get(2)?,
+                units: r.get(3)?,
+                discounts: r.get(4)?,
+                net: r.get(5)?,
+                profit: r.get(6)?,
+            })
+        })
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+fn report_sales_inner(conn: &Connection, f: &ReportFilter) -> Result<SalesReport, String> {
+    check_range(conn, f)?;
+    let totals = conn
+        .query_row(
+            &format!(
+                "{SALE_ITEMS_CTE} SELECT COUNT(DISTINCT sale_id), COALESCE(SUM(qty), 0), COALESCE(SUM(gross), 0),
+                   CAST(ROUND(COALESCE(SUM(disc), 0)) AS INTEGER), COALESCE(SUM(cost), 0) FROM i"
+            ),
+            params![f.from, f.to, f.cashier_id, f.category_id],
+            |r| {
+                let (gross, discounts, cost): (i64, i64, i64) = (r.get(2)?, r.get(3)?, r.get(4)?);
+                Ok(SalesTotals {
+                    invoices: r.get(0)?,
+                    units: r.get(1)?,
+                    gross,
+                    discounts,
+                    net: gross - discounts,
+                    cost,
+                    profit: gross - discounts - cost,
+                })
+            },
+        )
+        .map_err(err)?;
+    Ok(SalesReport {
+        totals,
+        by_cashier: sales_rows(
+            conn,
+            f,
+            "i.cashier_id",
+            "COALESCE((SELECT full_name FROM users WHERE id = i.cashier_id), '—')",
+            "GROUP BY i.cashier_id ORDER BY 6 DESC",
+        )?,
+        by_day: sales_rows(conn, f, "day", "day", "GROUP BY day ORDER BY day")?,
+        top_products: sales_rows(conn, f, "product_id", "trade_name", "GROUP BY product_id ORDER BY 6 DESC LIMIT 20")?,
+    })
+}
+
+#[tauri::command]
+fn report_sales(db: State<'_, Db>, session: State<'_, Session>, filter: ReportFilter) -> Result<SalesReport, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    require_role(&conn, &user_id, &REPORT_ROLES)?;
+    report_sales_inner(&conn, &filter)
+}
+
+// ── Expiry and write-offs ──
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpiryRow {
+    batch_id: String,
+    product: String,
+    category: Option<String>,
+    batch_no: String,
+    expiry_date: String,
+    /// Negative once expired.
+    days_left: i64,
+    qty: i64,
+    unit_cost: i64,
+    value: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct WriteOffRow {
+    day: String,
+    product: String,
+    batch_no: String,
+    qty: i64,
+    value: i64,
+    reason: Option<String>,
+    user: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ExpiryReport {
+    expired_qty: i64,
+    expired_value: i64,
+    near_qty: i64,
+    near_value: i64,
+    /// Batches with stock that have expired or expire within the horizon, soonest first (FEFO order).
+    batches: Vec<ExpiryRow>,
+    /// Stock removed by count corrections in the date range (damaged, destroyed, expired disposal).
+    write_offs: Vec<WriteOffRow>,
+    written_off_value: i64,
+}
+
+fn report_expiry_inner(conn: &Connection, f: &ReportFilter, within_days: i64) -> Result<ExpiryReport, String> {
+    check_range(conn, f)?;
+    if !(0..=730).contains(&within_days) {
+        return Err("مدة التنبيه بين ٠ و٧٣٠ يوماً".into());
+    }
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.id, p.trade_name, c.name_ar, b.batch_no, b.expiry_date,
+                    CAST(julianday(b.expiry_date) - julianday(date('now', 'localtime')) AS INTEGER),
+                    b.qty_on_hand, b.unit_cost
+             FROM batches b JOIN products p ON p.id = b.product_id LEFT JOIN categories c ON c.id = p.category_id
+             WHERE b.qty_on_hand > 0 AND b.expiry_date <= date('now', 'localtime', '+' || ?1 || ' days')
+               AND (?2 IS NULL OR p.category_id = ?2)
+             ORDER BY b.expiry_date, p.trade_name",
+        )
+        .map_err(err)?;
+    let batches = stmt
+        .query_map(params![within_days, f.category_id], |r| {
+            let (qty, unit_cost): (i64, i64) = (r.get(6)?, r.get(7)?);
+            Ok(ExpiryRow {
+                batch_id: r.get(0)?,
+                product: r.get(1)?,
+                category: r.get(2)?,
+                batch_no: r.get(3)?,
+                expiry_date: r.get(4)?,
+                days_left: r.get(5)?,
+                qty,
+                unit_cost,
+                value: qty * unit_cost,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+
+    // The reason lives in the audit entry written in the same transaction, with the same timestamp.
+    let mut stmt = conn
+        .prepare(
+            "SELECT date(m.occurred_at, 'localtime'), p.trade_name, b.batch_no, -m.qty, -m.qty * m.unit_cost,
+                    (SELECT json_extract(a.payload, '$.reason') FROM audit_log a
+                      WHERE a.entity = 'batches' AND a.entity_id = m.batch_id AND a.occurred_at = m.occurred_at LIMIT 1),
+                    u.full_name
+             FROM stock_movements m
+             JOIN batches b ON b.id = m.batch_id JOIN products p ON p.id = b.product_id
+             LEFT JOIN users u ON u.id = m.user_id
+             WHERE m.type IN ('adjust', 'damage', 'destroy') AND m.qty < 0
+               AND date(m.occurred_at, 'localtime') BETWEEN ?1 AND ?2 AND (?3 IS NULL OR p.category_id = ?3)
+             ORDER BY m.occurred_at DESC",
+        )
+        .map_err(err)?;
+    let write_offs = stmt
+        .query_map(params![f.from, f.to, f.category_id], |r| {
+            Ok(WriteOffRow {
+                day: r.get(0)?,
+                product: r.get(1)?,
+                batch_no: r.get(2)?,
+                qty: r.get(3)?,
+                value: r.get(4)?,
+                reason: r.get(5)?,
+                user: r.get(6)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+
+    let (expired, near): (Vec<&ExpiryRow>, Vec<&ExpiryRow>) = batches.iter().partition(|b| b.days_left <= 0);
+    Ok(ExpiryReport {
+        expired_qty: expired.iter().map(|b| b.qty).sum(),
+        expired_value: expired.iter().map(|b| b.value).sum(),
+        near_qty: near.iter().map(|b| b.qty).sum(),
+        near_value: near.iter().map(|b| b.value).sum(),
+        written_off_value: write_offs.iter().map(|w| w.value).sum(),
+        batches,
+        write_offs,
+    })
+}
+
+#[tauri::command]
+fn report_expiry(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    filter: ReportFilter,
+    within_days: i64,
+) -> Result<ExpiryReport, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    require_role(&conn, &user_id, &INVENTORY_ROLES)?;
+    report_expiry_inner(&conn, &filter, within_days)
+}
+
+// ── Reorder ──
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReorderRow {
+    product_id: String,
+    product: String,
+    barcode: Option<String>,
+    category: Option<String>,
+    stock: i64,
+    reorder_level: Option<i64>,
+    /// Units sold in the last 30 days.
+    sold_30d: i64,
+    /// Days the sellable stock lasts at the last 30 days' pace; None when nothing sold.
+    days_of_cover: Option<i64>,
+    suggested_qty: i64,
+    supplier: Option<String>,
+    last_cost: Option<i64>,
+}
+
+/// Products out of stock or at/below their reorder level, the most urgent first.
+fn report_reorder_inner(conn: &Connection, category_id: Option<&str>) -> Result<Vec<ReorderRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT p.id, p.trade_name,
+               (SELECT code FROM product_barcodes pb WHERE pb.product_id = p.id ORDER BY code LIMIT 1),
+               c.name_ar,
+               COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
+                         AND b.expiry_date > date('now', 'localtime')), 0) AS stock,
+               rr.reorder_level, COALESCE(rr.max_qty, 0),
+               COALESCE((SELECT SUM(si.qty) FROM sale_items si JOIN sales s ON s.id = si.sale_id
+                         WHERE si.product_id = p.id AND s.status = 'paid'
+                           AND date(s.created_at, 'localtime') > date('now', 'localtime', '-30 days')), 0),
+               (SELECT name FROM suppliers WHERE id = rr.preferred_supplier_id),
+               (SELECT unit_cost FROM batches b WHERE b.product_id = p.id ORDER BY b.received_at DESC LIMIT 1)
+             FROM products p
+             LEFT JOIN categories c ON c.id = p.category_id
+             LEFT JOIN reorder_rules rr ON rr.product_id = p.id
+             WHERE p.is_active = 1 AND (?1 IS NULL OR p.category_id = ?1)",
+        )
+        .map_err(err)?;
+    let mut rows: Vec<ReorderRow> = stmt
+        .query_map(params![category_id], |r| {
+            let stock: i64 = r.get(4)?;
+            let level: Option<i64> = r.get(5)?;
+            let max_qty: i64 = r.get(6)?;
+            let sold: i64 = r.get(7)?;
+            // Order up to the max level; without one, to twice the reorder level; without that, a month's sales.
+            let target = if max_qty > 0 { max_qty } else { level.map(|l| l * 2).filter(|t| *t > 0).unwrap_or(sold.max(1)) };
+            Ok(ReorderRow {
+                product_id: r.get(0)?,
+                product: r.get(1)?,
+                barcode: r.get(2)?,
+                category: r.get(3)?,
+                stock,
+                reorder_level: level,
+                sold_30d: sold,
+                days_of_cover: (sold > 0).then(|| stock * 30 / sold),
+                suggested_qty: (target - stock).max(0),
+                supplier: r.get(8)?,
+                last_cost: r.get(9)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    rows.retain(|r| r.stock == 0 || r.reorder_level.is_some_and(|l| r.stock <= l));
+    rows.sort_by_key(|r| (r.stock > 0, r.days_of_cover.unwrap_or(i64::MAX), r.stock));
+    Ok(rows)
+}
+
+#[tauri::command]
+fn report_reorder(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    category_id: Option<String>,
+) -> Result<Vec<ReorderRow>, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    require_role(&conn, &user_id, &INVENTORY_ROLES)?;
+    report_reorder_inner(&conn, category_id.as_deref())
+}
+
+// ── Prescriptions ──
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RxRow {
+    sale_id: String,
+    invoice_no: String,
+    /// Local date and time of the sale.
+    sold_at: String,
+    rx_no: String,
+    prescriber: String,
+    pharmacist: Option<String>,
+    /// Prescription-only items, e.g. "Augmentin 1 g ×1، Concor 5 mg ×2".
+    items: String,
+    rx_total: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct PrescriberRow {
+    prescriber: String,
+    prescriptions: i64,
+    units: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RxReport {
+    rows: Vec<RxRow>,
+    by_prescriber: Vec<PrescriberRow>,
+}
+
+fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxReport, String> {
+    check_range(conn, f)?;
+    // ?3 is the cashier who rang the sale up; ?4 keeps prescriptions with at least one item in the category.
+    let base = "FROM sale_prescriptions sp JOIN sales s ON s.id = sp.sale_id
+      WHERE s.status = 'paid' AND date(s.created_at, 'localtime') BETWEEN ?1 AND ?2
+        AND (?3 IS NULL OR s.cashier_id = ?3)
+        AND (?4 IS NULL OR EXISTS (SELECT 1 FROM sale_items si JOIN products p ON p.id = si.product_id
+                                   WHERE si.sale_id = s.id AND p.category_id = ?4))";
+    let rx_items = "FROM sale_items si JOIN products p ON p.id = si.product_id WHERE si.sale_id = s.id AND p.requires_rx = 1";
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT s.id, s.invoice_no, datetime(s.created_at, 'localtime'), sp.rx_no, sp.prescriber,
+                    (SELECT full_name FROM users WHERE id = sp.verified_by),
+                    COALESCE((SELECT group_concat(name || ' ×' || qty, '، ') FROM
+                               (SELECT p.trade_name AS name, SUM(si.qty) AS qty {rx_items} GROUP BY p.id)), ''),
+                    COALESCE((SELECT SUM(si.line_total) {rx_items}), 0)
+             {base} ORDER BY s.created_at DESC"
+        ))
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+            Ok(RxRow {
+                sale_id: r.get(0)?,
+                invoice_no: r.get(1)?,
+                sold_at: r.get(2)?,
+                rx_no: r.get(3)?,
+                prescriber: r.get(4)?,
+                pharmacist: r.get(5)?,
+                items: r.get(6)?,
+                rx_total: r.get(7)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT sp.prescriber, COUNT(*), COALESCE(SUM((SELECT SUM(si.qty) {rx_items})), 0)
+             {base} GROUP BY sp.prescriber COLLATE NOCASE ORDER BY 2 DESC, 1"
+        ))
+        .map_err(err)?;
+    let by_prescriber = stmt
+        .query_map(params![f.from, f.to, f.cashier_id, f.category_id], |r| {
+            Ok(PrescriberRow { prescriber: r.get(0)?, prescriptions: r.get(1)?, units: r.get(2)? })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    Ok(RxReport { rows, by_prescriber })
+}
+
+#[tauri::command]
+fn report_prescriptions(db: State<'_, Db>, session: State<'_, Session>, filter: ReportFilter) -> Result<RxReport, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    require_role(&conn, &user_id, &REPORT_ROLES)?;
+    report_prescriptions_inner(&conn, &filter)
+}
+
+// ── Export ──
+
+/// Writes an exported report into the user's Downloads folder and returns the full path.
+/// Only a plain file name ending in .csv is accepted; an existing file is never overwritten.
+#[tauri::command]
+fn save_export(
+    app: tauri::AppHandle,
+    session: State<'_, Session>,
+    file_name: String,
+    content: String,
+) -> Result<String, String> {
+    session_user(&session)?;
+    let safe = !file_name.is_empty()
+        && file_name.len() <= 100
+        && file_name.ends_with(".csv")
+        && file_name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        && !file_name.starts_with('.');
+    if !safe {
+        return Err("اسم الملف غير صالح".into());
+    }
+    let dir = app.path().download_dir().map_err(err)?;
+    let stem = file_name.trim_end_matches(".csv");
+    let mut path = dir.join(&file_name);
+    let mut n = 1;
+    while path.exists() {
+        path = dir.join(format!("{stem}-{n}.csv"));
+        n += 1;
+    }
+    std::fs::write(&path, content).map_err(err)?;
+    Ok(path.display().to_string())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1515,7 +2018,13 @@ pub fn run() {
             adjust_batch,
             list_suppliers,
             add_supplier,
-            post_purchase_invoice
+            post_purchase_invoice,
+            report_users,
+            report_sales,
+            report_expiry,
+            report_reorder,
+            report_prescriptions,
+            save_export
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -2231,5 +2740,170 @@ mod tests {
         assert!(add_supplier_inner(&mut conn, ADMIN, s("شركة الرافدين", None)).unwrap_err().contains("موجود مسبقاً"));
         assert!(add_supplier_inner(&mut conn, ADMIN, s("  ", None)).unwrap_err().contains("مطلوب"));
         assert!(add_supplier_inner(&mut conn, ADMIN, s("X", Some(400))).unwrap_err().contains("مدة السداد"));
+    }
+
+    // ── Reports ──
+
+    fn today(conn: &Connection) -> String {
+        conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0)).unwrap()
+    }
+
+    fn filter(conn: &Connection, cashier: Option<&str>, category: Option<&str>) -> ReportFilter {
+        let d = today(conn);
+        ReportFilter { from: d.clone(), to: d, cashier_id: cashier.map(String::from), category_id: category.map(String::from) }
+    }
+
+    /// Two sales: the admin sells 10 Brufen (line discount 1,000, invoice discount 500) plus one Augmentin;
+    /// a pharmacist sells 2 Brufen with no discount.
+    fn two_sales(conn: &mut Connection) {
+        add_user(conn, "u-ph", "pharmacist");
+        let mut d = cash_sale(vec![brufen(10, 1000), augmentin()], 100_000);
+        d.invoice_discount = 500;
+        post_sale_inner(conn, ADMIN, d).unwrap();
+        post_sale_inner(conn, "u-ph", cash_sale(vec![brufen(2, 0)], 7000)).unwrap();
+    }
+
+    #[test]
+    fn sales_report_totals_profit_and_breakdowns_agree() {
+        let mut conn = db();
+        two_sales(&mut conn);
+        let r = report_sales_inner(&conn, &filter(&conn, None, None)).unwrap();
+        let t = &r.totals;
+        // Gross: 12 × 3,500 + 18,500 = 60,500. Discounts: 1,000 + 500. Cost: 12 × 2,400 + 14,800 = 43,600.
+        assert_eq!((t.invoices, t.units, t.gross, t.discounts), (2, 13, 60_500, 1_500));
+        assert_eq!((t.net, t.cost, t.profit), (59_000, 43_600, 15_400));
+        let net: i64 = conn.query_row("SELECT SUM(total) FROM sales", [], |r| r.get(0)).unwrap();
+        assert_eq!(t.net, net, "net sales equal the invoices' totals");
+
+        for rows in [&r.by_cashier, &r.by_day, &r.top_products] {
+            assert_eq!(rows.iter().map(|x| x.net).sum::<i64>(), t.net);
+            assert_eq!(rows.iter().map(|x| x.profit).sum::<i64>(), t.profit);
+        }
+        assert_eq!(r.by_cashier.len(), 2);
+        assert_eq!(r.by_cashier[0].label, "مدير النظام", "biggest seller first");
+        assert_eq!((r.by_cashier[1].key.as_str(), r.by_cashier[1].net), ("u-ph", 7000));
+        assert_eq!(r.by_day[0].key, today(&conn));
+        assert_eq!(r.top_products[0].label, "Brufen 400 mg");
+    }
+
+    #[test]
+    fn sales_report_filters_by_cashier_category_and_dates() {
+        let mut conn = db();
+        two_sales(&mut conn);
+        let ph = report_sales_inner(&conn, &filter(&conn, Some("u-ph"), None)).unwrap().totals;
+        assert_eq!((ph.invoices, ph.net, ph.profit), (1, 7000, 2200));
+
+        // Only the Rx line of the first sale; it carries its share of the invoice discount.
+        let rx = report_sales_inner(&conn, &filter(&conn, None, Some("cat-rx"))).unwrap().totals;
+        assert_eq!((rx.invoices, rx.units, rx.gross), (1, 1, 18_500));
+        let share: f64 = 500.0 * 18_500.0 / (34_000.0 + 18_500.0);
+        assert_eq!(rx.discounts, share.round() as i64);
+
+        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-12-31".into(), cashier_id: None, category_id: None };
+        let none = report_sales_inner(&conn, &old).unwrap();
+        assert_eq!((none.totals.invoices, none.totals.net, none.by_day.len()), (0, 0, 0));
+
+        let backwards = ReportFilter { from: "2026-02-01".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None };
+        assert!(report_sales_inner(&conn, &backwards).unwrap_err().contains("بعد"));
+        let bad = ReportFilter { from: "yesterday".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None };
+        assert!(report_sales_inner(&conn, &bad).unwrap_err().contains("غير صالح"));
+    }
+
+    #[test]
+    fn only_managers_see_money_reports() {
+        let conn = db();
+        for (id, role) in [("u-cash", "cashier"), ("u-ph", "pharmacist"), ("u-store", "storekeeper")] {
+            add_user(&conn, id, role);
+            assert!(require_role(&conn, id, &REPORT_ROLES).is_err(), "{role}");
+        }
+        add_user(&conn, "u-chief", "chief_pharmacist");
+        assert!(require_role(&conn, "u-chief", &REPORT_ROLES).is_ok());
+        assert!(require_role(&conn, "u-store", &INVENTORY_ROLES).is_ok(), "stock reports for the storekeeper");
+    }
+
+    #[test]
+    fn expiry_report_lists_expired_and_near_batches_with_value() {
+        let conn = db();
+        let r = report_expiry_inner(&conn, &filter(&conn, None, None), 30).unwrap();
+        let nos: Vec<_> = r.batches.iter().map(|b| b.batch_no.as_str()).collect();
+        assert_eq!(nos, ["AM009", "AM014"], "expired first, then within 30 days");
+        assert_eq!((r.expired_qty, r.expired_value), (4, 4 * 2900));
+        assert_eq!((r.near_qty, r.near_value), (18, 18 * 2900));
+        assert!(r.batches[0].days_left < 0 && r.batches[1].days_left == 22);
+
+        let wide = report_expiry_inner(&conn, &filter(&conn, None, None), 90).unwrap();
+        assert_eq!(wide.batches.len(), 4, "adds Panadol Extra (48 days) and Ventolin (75 days)");
+        let otc = report_expiry_inner(&conn, &filter(&conn, None, Some("cat-otc")), 90).unwrap();
+        assert_eq!(otc.batches.iter().map(|b| b.batch_no.as_str()).collect::<Vec<_>>(), ["PX0921"]);
+        assert!(report_expiry_inner(&conn, &filter(&conn, None, None), -1).is_err());
+    }
+
+    #[test]
+    fn expiry_report_shows_write_offs_with_their_reason() {
+        let mut conn = db();
+        let adj = AdjustBatch { batch_id: "b-am-009".into(), new_qty: 0, reason: "إتلاف منتهي الصلاحية".into() };
+        adjust_batch_inner(&mut conn, ADMIN, adj).unwrap();
+        // A count that found extra stock is not a write-off.
+        let up = AdjustBatch { batch_id: "b-br-400".into(), new_qty: 56, reason: "جرد".into() };
+        adjust_batch_inner(&mut conn, ADMIN, up).unwrap();
+
+        let r = report_expiry_inner(&conn, &filter(&conn, None, None), 30).unwrap();
+        assert_eq!(r.write_offs.len(), 1);
+        let w = &r.write_offs[0];
+        assert_eq!((w.batch_no.as_str(), w.qty, w.value), ("AM009", 4, 4 * 2900));
+        assert_eq!(w.reason.as_deref(), Some("إتلاف منتهي الصلاحية"));
+        assert_eq!(w.user.as_deref(), Some("مدير النظام"));
+        assert_eq!(r.written_off_value, 4 * 2900);
+        assert_eq!(r.expired_qty, 0, "disposed stock no longer counts as on the shelf");
+    }
+
+    #[test]
+    fn reorder_report_puts_out_of_stock_first_and_suggests_quantities() {
+        let mut conn = db();
+        // Sell 3 Ventolin today: 6 left at 3 a month = 60 days of cover.
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![line("p-ventolin", 7000, &[("b-vt-501", 3)])], 21_000)).unwrap();
+        let rows = report_reorder_inner(&conn, None).unwrap();
+        let ids: Vec<_> = rows.iter().map(|r| r.product_id.as_str()).collect();
+        assert_eq!(ids, ["p-glucophage-xr", "p-ventolin", "p-amoxil-500"]);
+
+        let xr = &rows[0];
+        assert_eq!((xr.stock, xr.reorder_level, xr.suggested_qty), (0, None, 1));
+        let vt = &rows[1];
+        assert_eq!((vt.stock, vt.sold_30d, vt.days_of_cover), (6, 3, Some(60)));
+        assert_eq!((vt.suggested_qty, vt.supplier.as_deref(), vt.last_cost), (50 - 6, Some("المورد أ (تجريبي)"), Some(5400)));
+        let am = &rows[2];
+        assert_eq!((am.stock, am.reorder_level, am.suggested_qty, am.days_of_cover), (18, Some(25), 80 - 18, None));
+
+        assert!(report_reorder_inner(&conn, Some("cat-otc")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn prescription_report_lists_rx_items_doctor_and_pharmacist() {
+        let mut conn = db();
+        add_user(&conn, "u-ph", "pharmacist");
+        // Rx sale with an OTC item on the same invoice: only the Rx item is listed.
+        let mut d = cash_sale(vec![augmentin(), brufen(1, 0)], 22_000);
+        d.prescription = Some(PrescriptionIn { rx_no: "RX-9".into(), prescriber: "د. سارة".into() });
+        post_sale_inner(&mut conn, "u-ph", d).unwrap();
+        let concor = line("p-concor-5", 9000, &[("b-cn-118", 2)]);
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![concor], 18_000)).unwrap(); // prescriber "د. علي"
+        let mut d = cash_sale(vec![augmentin()], 18_500);
+        d.prescription = Some(PrescriptionIn { rx_no: "RX-10".into(), prescriber: "د. سارة".into() });
+        post_sale_inner(&mut conn, ADMIN, d).unwrap();
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap(); // no Rx items: not listed
+
+        let r = report_prescriptions_inner(&conn, &filter(&conn, None, None)).unwrap();
+        assert_eq!(r.rows.len(), 3);
+        let first = r.rows.iter().find(|x| x.rx_no == "RX-9").unwrap();
+        assert_eq!((first.items.as_str(), first.rx_total), ("Augmentin 1 g ×1", 18_500));
+        assert_eq!((first.prescriber.as_str(), first.pharmacist.as_deref()), ("د. سارة", Some("u-ph")));
+        let concor = r.rows.iter().find(|x| x.rx_no == "RX-1").unwrap();
+        assert_eq!(concor.items, "Concor 5 mg ×2");
+
+        let docs: Vec<_> = r.by_prescriber.iter().map(|p| (p.prescriber.as_str(), p.prescriptions, p.units)).collect();
+        assert_eq!(docs, [("د. سارة", 2, 2), ("د. علي", 1, 2)]);
+
+        let only_ph = report_prescriptions_inner(&conn, &filter(&conn, Some("u-ph"), None)).unwrap();
+        assert_eq!(only_ph.rows.len(), 1);
     }
 }

@@ -5,6 +5,7 @@ import { repo } from "./data/index.ts";
 import { InventoryScreen } from "./inventory/InventoryScreen.tsx";
 import { PosScreen } from "./pos/PosScreen.tsx";
 import { PurchasingScreen } from "./purchasing/PurchasingScreen.tsx";
+import { ReportsScreen } from "./reports/ReportsScreen.tsx";
 
 const ROLE_LABEL: Record<Role, string> = {
   admin: "مدير",
@@ -14,12 +15,13 @@ const ROLE_LABEL: Record<Role, string> = {
   storekeeper: "أمين مخزن",
 };
 
-type View = "pos" | "inventory" | "purchasing";
+type View = "pos" | "inventory" | "purchasing" | "reports";
 
 const VIEWS: { id: View; label: string }[] = [
   { id: "pos", label: "نقطة البيع" },
   { id: "inventory", label: "المخزون" },
   { id: "purchasing", label: "المشتريات" },
+  { id: "reports", label: "التقارير" },
 ];
 
 export function App() {
@@ -61,7 +63,6 @@ export function App() {
                 {v.label}
               </button>
             ))}
-            <span className="module soon" title="المرحلة التالية">التقارير</span>
           </nav>
         </div>
         <div className="topbar-end">
@@ -77,14 +78,17 @@ export function App() {
           </button>
         </div>
       </header>
-      {/* POS and Purchasing stay mounted while hidden, so a half-built sale or invoice survives switching screens.
-          Inventory reloads each time it opens, so it always shows current stock. */}
+      {/* POS, Purchasing and Reports stay mounted while hidden, so a half-built sale, an invoice or report filters
+          survive switching screens. Inventory reloads each time it opens; Reports reloads each time it is shown. */}
       <div className="view" hidden={view !== "pos"}>
         <PosScreen key={user.id} visible={view === "pos"} />
       </div>
       {view === "inventory" && <InventoryScreen key={user.id} user={user} />}
       <div className="view" hidden={view !== "purchasing"}>
         <PurchasingScreen key={user.id} user={user} />
+      </div>
+      <div className="view" hidden={view !== "reports"}>
+        <ReportsScreen key={user.id} user={user} visible={view === "reports"} />
       </div>
     </div>
   );
