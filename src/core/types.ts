@@ -118,6 +118,7 @@ export interface InventoryItem {
   barcode: string | null;
   tradeName: string;
   tradeNameAr: string | null;
+  categoryId: string | null;
   category: string | null;
   form: string;
   strength: string;
@@ -334,14 +335,26 @@ export interface AuditRow {
   /** Local "YYYY-MM-DD HH:MM:SS". */
   at: string;
   user: string | null;
+  /** Sign-in name of the user who acted. */
+  username: string | null;
   /** e.g. "sale.create", "user.login". */
   action: string;
   entity: string;
   entityId: string | null;
   /** What the entry is about, by name: product, "product / batch", invoice number, user or supplier. */
   subject: string | null;
-  /** The JSON written with the entry. */
+  /** The JSON written with the entry; changes are stored as { from: {...}, to: {...} }. */
   payload: string;
+  /** This entry's link in the hash chain. */
+  hash: string;
+}
+
+/** Audit screen quick filters (see audit_category in src-tauri/src/lib.rs). */
+export type AuditCategory = "inventory" | "users" | "prices" | "login" | "sales" | "settings";
+
+export interface SaleSettings {
+  /** Largest discount as a percentage of the subtotal, for every role except admin and chief pharmacist. */
+  maxDiscountPct: number;
 }
 
 export interface AuditReport {

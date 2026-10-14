@@ -46,6 +46,7 @@ export function InventoryScreen({ user }: { user: User }) {
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<InventoryItem | null>(null);
   const [selected, setSelected] = useState<InventoryItem | null>(null);
 
   useEffect(() => {
@@ -191,12 +192,26 @@ export function InventoryScreen({ user }: { user: User }) {
       </section>
 
       {adding && (
-        <AddProductDialog
+        <ProductDialog
           onClose={() => setAdding(false)}
           onSaved={(item) => {
             upsert(item);
             setAdding(false);
             setSelected(item); // straight on to receiving its first batch
+          }}
+        />
+      )}
+      {editing && (
+        <ProductDialog
+          item={editing}
+          onClose={() => {
+            setSelected(editing);
+            setEditing(null);
+          }}
+          onSaved={(item) => {
+            upsert(item);
+            setEditing(null);
+            setSelected(item);
           }}
         />
       )}
@@ -206,6 +221,10 @@ export function InventoryScreen({ user }: { user: User }) {
           canEdit={canEdit}
           today={today}
           onClose={() => setSelected(null)}
+          onEdit={() => {
+            setEditing(selected);
+            setSelected(null);
+          }}
           onChanged={(item) => {
             upsert(item);
             setSelected(item);
@@ -218,19 +237,28 @@ export function InventoryScreen({ user }: { user: User }) {
 
 // ── Dialogs ──
 
-function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: (item: InventoryItem) => void }) {
+/** Adds a product, or edits `item`. Edits are audit-logged field by field, with the price change as its own entry. */
+function ProductDialog({
+  item,
+  onClose,
+  onSaved,
+}: {
+  item?: InventoryItem;
+  onClose: () => void;
+  onSaved: (item: InventoryItem) => void;
+}) {
   const [categories, setCategories] = useState<Category[]>([]);
   const [f, setF] = useState({
-    tradeName: "",
-    tradeNameAr: "",
-    categoryId: "",
-    dosageForm: "قرص",
-    strength: "",
-    packSize: "1",
-    price: "",
-    barcode: "",
-    reorderLevel: "",
-    requiresRx: false,
+    tradeName: item?.tradeName ?? "",
+    tradeNameAr: item?.tradeNameAr ?? "",
+    categoryId: item?.categoryId ?? "",
+    dosageForm: item?.form ?? "قرص",
+    strength: item?.strength ?? "",
+    packSize: String(item?.packSize ?? 1),
+    price: item ? String(item.price) : "",
+    barcode: item?.barcode ?? "",
+    reorderLevel: item?.reorderLevel != null ? String(item.reorderLevel) : "",
+    requiresRx: item?.requiresRx ?? false,
   });
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -245,21 +273,20 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
     e.preventDefault();
     setError("");
     setBusy(true);
+    const product = {
+      tradeName: f.tradeName,
+      tradeNameAr: f.tradeNameAr || undefined,
+      categoryId: f.categoryId || undefined,
+      dosageForm: f.dosageForm,
+      strength: f.strength,
+      packSize: toInt(f.packSize),
+      price: toInt(f.price),
+      requiresRx: f.requiresRx,
+      barcode: f.barcode || undefined,
+      reorderLevel: f.reorderLevel ? toInt(f.reorderLevel) : undefined,
+    };
     try {
-      onSaved(
-        await repo.addProduct({
-          tradeName: f.tradeName,
-          tradeNameAr: f.tradeNameAr || undefined,
-          categoryId: f.categoryId || undefined,
-          dosageForm: f.dosageForm,
-          strength: f.strength,
-          packSize: toInt(f.packSize),
-          price: toInt(f.price),
-          requiresRx: f.requiresRx,
-          barcode: f.barcode || undefined,
-          reorderLevel: f.reorderLevel ? toInt(f.reorderLevel) : undefined,
-        }),
-      );
+      onSaved(await (item ? repo.updateProduct(item.id, product) : repo.addProduct(product)));
     } catch (err) {
       setError(errorText(err));
     } finally {
@@ -268,7 +295,7 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
   }
 
   return (
-    <Modal title="صنف جديد" onClose={onClose}>
+    <Modal title={item ? `تعديل بيانات ${item.tradeName}` : "صنف جديد"} onClose={onClose}>
       <form className="modal-body" onSubmit={submit}>
         {error && <div role="alert" className="banner error"><span>{error}</span></div>}
         <div className="form-grid">
@@ -290,7 +317,7 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
           <Field id="np-pack" label="حجم العبوة">
             <input id="np-pack" className="field num" inputMode="numeric" value={f.packSize} onChange={set("packSize")} />
           </Field>
-          <Field id="np-price" label="سعر البيع (د.ع) *">
+          <Field id="np-price" label="سعر البيع (د.ع) *" hint={item ? "تغيير السعر يُسجَّل في سجل التدقيق" : undefined}>
             <input id="np-price" className="field num" inputMode="numeric" value={f.price} onChange={set("price")} required />
           </Field>
           <Field id="np-cat" label="التصنيف">
@@ -299,10 +326,10 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
               {categories.map((c) => <option key={c.id} value={c.id}>{c.nameAr}</option>)}
             </select>
           </Field>
-          <Field id="np-barcode" label="الباركود" hint="٨ إلى ١٤ رقماً">
+          <Field id="np-barcode" label="الباركود" hint={item ? "٨ إلى ١٤ رقماً؛ إفراغه يحذف الباركود" : "٨ إلى ١٤ رقماً"}>
             <input id="np-barcode" className="field num" inputMode="numeric" value={f.barcode} onChange={set("barcode")} />
           </Field>
-          <Field id="np-reorder" label="حد إعادة الطلب" hint="يظهر الصنف «منخفض» عند بلوغه">
+          <Field id="np-reorder" label="حد إعادة الطلب" hint="يظهر الصنف «منخفض» عند بلوغه؛ اتركه فارغاً بلا حد">
             <input id="np-reorder" className="field num" inputMode="numeric" value={f.reorderLevel} onChange={set("reorderLevel")} />
           </Field>
         </div>
@@ -313,7 +340,7 @@ function AddProductDialog({ onClose, onSaved }: { onClose: () => void; onSaved: 
         <div className="modal-actions">
           <button type="button" className="btn" onClick={onClose}>إلغاء</button>
           <button type="submit" className="btn primary" disabled={busy}>
-            {busy ? "جارٍ الحفظ…" : "حفظ الصنف"}
+            {busy ? "جارٍ الحفظ…" : item ? "حفظ التعديلات" : "حفظ الصنف"}
           </button>
         </div>
       </form>
@@ -326,12 +353,14 @@ function BatchesDialog({
   canEdit,
   today,
   onClose,
+  onEdit,
   onChanged,
 }: {
   item: InventoryItem;
   canEdit: boolean;
   today: string;
   onClose: () => void;
+  onEdit: () => void;
   onChanged: (item: InventoryItem) => void;
 }) {
   const [batches, setBatches] = useState<InventoryBatch[] | null>(null);
@@ -397,6 +426,11 @@ function BatchesDialog({
           {item.expiredQty > 0 && <span className="tag bad">منتهي على الرف {item.expiredQty}</span>}
           {item.reorderLevel !== null && <span className="muted">حد إعادة الطلب <bdi className="num">{item.reorderLevel}</bdi></span>}
           <span className="muted">سعر البيع <bdi className="num">{formatIqd(item.price)}</bdi> د.ع</span>
+          {canEdit && (
+            <button type="button" className="btn" onClick={onEdit}>
+              تعديل بيانات الصنف والسعر
+            </button>
+          )}
         </div>
         {error && <div role="alert" className="banner error"><span>{error}</span></div>}
         {notice && <div role="status" className="banner success"><span>{notice}</span></div>}

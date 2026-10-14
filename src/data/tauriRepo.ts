@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
+  AuditCategory,
   AuditReport,
   AuthStatus,
   Batch,
@@ -27,6 +28,7 @@ import type {
   ReportFilter,
   Role,
   RxReport,
+  SaleSettings,
   SaleDraft,
   SaleResult,
   SalesReport,
@@ -53,6 +55,7 @@ export const tauriRepo: PharmacyRepo = {
   inventoryBatches: (productId: string) => invoke<InventoryBatch[]>("inventory_batches", { productId }),
   categories: () => invoke<Category[]>("list_categories"),
   addProduct: (product: NewProduct) => invoke<InventoryItem>("add_product", { product }),
+  updateProduct: (productId: string, product: NewProduct) => invoke<InventoryItem>("update_product", { productId, product }),
   receiveBatch: (batch: ReceiveBatchInput) => invoke<InventoryItem>("receive_batch", { batch }),
   adjustBatch: (adjustment: AdjustBatchInput) => invoke<InventoryItem>("adjust_batch", { adjustment }),
   suppliers: () => invoke<Supplier[]>("list_suppliers"),
@@ -63,7 +66,8 @@ export const tauriRepo: PharmacyRepo = {
   reportExpiry: (filter: ReportFilter, withinDays: number) => invoke<ExpiryReport>("report_expiry", { filter, withinDays }),
   reportReorder: (categoryId?: string) => invoke<ReorderRow[]>("report_reorder", { categoryId: categoryId ?? null }),
   reportPrescriptions: (filter: ReportFilter) => invoke<RxReport>("report_prescriptions", { filter }),
-  reportAudit: (filter: ReportFilter, action?: string) => invoke<AuditReport>("report_audit", { filter, action: action ?? null }),
+  reportAudit: (filter: ReportFilter, category?: AuditCategory) =>
+    invoke<AuditReport>("report_audit", { filter, category: category ?? null }),
   saveExport: (fileName: string, content: string) => invoke<string>("save_export", { fileName, content }),
   listUsers: () => invoke<UserRow[]>("list_users"),
   createUser: (user: NewUser) => invoke<UserRow>("create_user", { user }),
@@ -75,6 +79,8 @@ export const tauriRepo: PharmacyRepo = {
   onPhoneScan: (handler: (scan: PhoneScan) => void) => listen<PhoneScan>("phone-barcode-scanned", (e) => handler(e.payload)),
   phoneScannerFirewall: () => invoke<FirewallState>("phone_scanner_firewall"),
   allowPhoneScannerFirewall: () => invoke<FirewallState>("allow_phone_scanner_firewall"),
+  saleSettings: () => invoke<SaleSettings>("sale_settings"),
+  saveSaleSettings: (settings: SaleSettings) => invoke<SaleSettings>("save_sale_settings", { settings }),
   receiptSettings: () => invoke<ReceiptSettings>("receipt_settings"),
   saveReceiptSettings: (settings: ReceiptSettings) => invoke<ReceiptSettings>("save_receipt_settings", { settings }),
   saleReceipt: (saleId: string, reprint: boolean) => invoke<Receipt>("sale_receipt", { saleId, reprint }),

@@ -11,12 +11,13 @@ import {
 } from "../core/permissions.ts";
 import type { Role, User, UserRow } from "../core/types.ts";
 import { repo } from "../data/index.ts";
-import { errorText, Field, Modal } from "../ui/Modal.tsx";
+import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
 
 const MIN_PASSWORD_LEN = 8;
 
 type Dialog =
   | { kind: "add" }
+  | { kind: "discount" }
   | { kind: "access"; user: UserRow }
   | { kind: "password"; user: UserRow }
   | { kind: "deactivate"; user: UserRow };
@@ -56,6 +57,9 @@ export function UsersScreen({ me }: { me: User }) {
         <div className="inv-head">
           <h2 id="users-title">الموظفين</h2>
           <span className="muted">{users ? `${users.filter((u) => u.active).length} نشط من ${users.length}` : "جارٍ التحميل…"}</span>
+          <button type="button" className="btn" onClick={() => setDialog({ kind: "discount" })}>
+            حد الخصم
+          </button>
           <button type="button" className="btn primary" onClick={() => setDialog({ kind: "add" })}>
             + موظف جديد
           </button>
@@ -129,6 +133,15 @@ export function UsersScreen({ me }: { me: User }) {
         </div>
       </section>
 
+      {dialog?.kind === "discount" && (
+        <DiscountCapDialog
+          onClose={() => setDialog(null)}
+          onSaved={(pct) => {
+            setDialog(null);
+            setNotice(`حد الخصم الآن ${pct}٪ من مجموع الفاتورة`);
+          }}
+        />
+      )}
       {dialog?.kind === "add" && <AddUserDialog onClose={() => setDialog(null)} onSaved={(u) => upsert(u, `تمت إضافة ${u.fullName}`)} />}
       {dialog?.kind === "access" && (
         <AccessDialog user={dialog.user} self={dialog.user.id === me.id} onClose={() => setDialog(null)} onSaved={(u) => upsert(u, `تم تحديث صلاحيات ${u.fullName}`)} />
@@ -401,6 +414,61 @@ function DeactivateDialog({ user, onClose, onSaved }: { user: UserRow; onClose: 
           </button>
         </div>
       </div>
+    </Modal>
+  );
+}
+
+/** The discount cap for every role except admin and chief pharmacist. Changes are audit-logged. */
+function DiscountCapDialog({ onClose, onSaved }: { onClose: () => void; onSaved: (pct: number) => void }) {
+  const [pct, setPct] = useState<string | null>(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  useEffect(() => {
+    repo.saleSettings().then((s) => setPct(String(s.maxDiscountPct)), (e) => setError(errorText(e)));
+  }, []);
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    if (pct === null) return;
+    setError("");
+    setBusy(true);
+    try {
+      onSaved((await repo.saveSaleSettings({ maxDiscountPct: toInt(pct) })).maxDiscountPct);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="حد الخصم" onClose={onClose}>
+      <form className="modal-body" onSubmit={submit}>
+        {error && <div role="alert" className="banner error"><span>{error}</span></div>}
+        <Field
+          id="cap-pct"
+          label="أقصى خصم على الفاتورة (٪ من المجموع)"
+          hint="يسري على الصيدلاني والكاشير؛ المدير والصيدلاني المسؤول بلا حد. التغيير يُسجَّل في سجل التدقيق"
+        >
+          <input
+            id="cap-pct"
+            className="field num"
+            inputMode="numeric"
+            value={pct ?? ""}
+            disabled={pct === null}
+            autoFocus
+            onChange={(e) => setPct(e.target.value)}
+            required
+          />
+        </Field>
+        <div className="modal-actions">
+          <button type="button" className="btn" onClick={onClose}>إلغاء</button>
+          <button type="submit" className="btn primary" disabled={busy || pct === null}>
+            {busy ? "جارٍ الحفظ…" : "حفظ"}
+          </button>
+        </div>
+      </form>
     </Modal>
   );
 }

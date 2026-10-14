@@ -290,3 +290,19 @@ button.module:hover:not(.active) { background: #24413b; color: #fff; }
 @media (max-width: 900px) { .history-grid { grid-template-columns: 1fr; } }
 .firewall-banner { margin: 0; align-items: center; }
 .firewall-banner .btn { white-space: nowrap; }
+
+/* Audit log: category chips and the entry detail dialog */
+.rep-filters .audit-cats { flex-basis: 100%; }
+.audit-meta { display: grid; grid-template-columns: max-content 1fr; gap: 6px 16px; margin: 0; }
+.audit-meta dt { color: var(--muted); }
+.audit-meta dd { margin: 0; overflow-wrap: anywhere; }
+.audit-meta-row { display: contents; }
+.audit-sub { margin: 0 0 6px; font-size: 14px; }
+.audit-diff th[scope="row"] { font-weight: 600; text-align: start; }
+.audit-diff .diff-old { color: var(--bad); text-decoration: line-through; text-decoration-color: color-mix(in srgb, var(--bad) 50%, transparent); }
+.audit-diff .diff-new { color: var(--accent-dark); font-weight: 600; }
+.audit-raw summary { cursor: pointer; color: var(--muted); }
+.audit-raw[open] summary { margin-bottom: 8px; }
+.audit-raw pre { margin: 8px 0 0; padding: 10px 12px; background: var(--ground); border-radius: 8px; font-size: 12px; overflow: auto; max-height: 220px; text-align: left; }
+.audit-hash { font-size: 11px; overflow-wrap: anywhere; }
+.batch-summary .btn { margin-inline-start: auto; }

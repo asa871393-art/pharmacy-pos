@@ -878,6 +878,7 @@ pub struct InventoryItem {
     barcode: Option<String>,
     trade_name: String,
     trade_name_ar: Option<String>,
+    category_id: Option<String>,
     category: Option<String>,
     form: String,
     strength: String,
@@ -903,7 +904,8 @@ const INVENTORY_SELECT: &str = "SELECT p.id,
             AND (b.status = 'expired' OR b.expiry_date <= date('now', 'localtime'))), 0),
   (SELECT MIN(b.expiry_date) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
             AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime')),
-  (SELECT rr.reorder_level FROM reorder_rules rr WHERE rr.product_id = p.id LIMIT 1)
+  (SELECT rr.reorder_level FROM reorder_rules rr WHERE rr.product_id = p.id LIMIT 1),
+  p.category_id
   FROM products p LEFT JOIN categories c ON c.id = p.category_id
   WHERE p.is_active = 1";
 
@@ -913,6 +915,7 @@ fn map_inventory(r: &rusqlite::Row) -> rusqlite::Result<InventoryItem> {
         barcode: r.get(1)?,
         trade_name: r.get(2)?,
         trade_name_ar: r.get(3)?,
+        category_id: r.get(14)?,
         category: r.get(4)?,
         form: r.get(5)?,
         strength: r.get(6)?,
@@ -1008,7 +1011,7 @@ fn list_categories(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec
     rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct NewProduct {
     trade_name: String,
@@ -1027,9 +1030,17 @@ fn non_empty(s: &Option<String>) -> Option<String> {
     s.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from)
 }
 
-fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Result<InventoryItem, String> {
-    let tx = conn.transaction().map_err(err)?;
-    require_permission(&tx, user_id, &["modify_inventory"])?;
+/// A product form's values after validation.
+struct CheckedProduct {
+    name: String,
+    form: String,
+    strength: String,
+    barcode: Option<String>,
+    category: Option<String>,
+}
+
+/// Validation shared by add and update. `own_id` is the product being edited, whose own barcode is not a clash.
+fn check_product(tx: &Connection, p: &NewProduct, own_id: Option<&str>) -> Result<CheckedProduct, String> {
     let (name, form, strength) = (p.trade_name.trim(), p.dosage_form.trim(), p.strength.trim());
     if name.is_empty() || form.is_empty() || strength.is_empty() {
         return Err("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة".into());
@@ -1050,8 +1061,9 @@ fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Res
         }
         let owner: Option<String> = tx
             .query_row(
-                "SELECT p.trade_name FROM product_barcodes b JOIN products p ON p.id = b.product_id WHERE b.code = ?1",
-                params![code],
+                "SELECT p.trade_name FROM product_barcodes b JOIN products p ON p.id = b.product_id
+                 WHERE b.code = ?1 AND (?2 IS NULL OR b.product_id != ?2)",
+                params![code, own_id],
                 |r| r.get(0),
             )
             .optional()
@@ -1069,7 +1081,43 @@ fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Res
             return Err("التصنيف غير موجود".into());
         }
     }
+    Ok(CheckedProduct { name: name.into(), form: form.into(), strength: strength.into(), barcode, category })
+}
 
+/// A product's editable fields by name, for before/after audit entries.
+fn product_snapshot(conn: &Connection, id: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    conn.query_row(
+        "SELECT p.trade_name, p.trade_name_ar, c.name_ar, p.dosage_form, p.strength_label, p.pack_size, p.requires_rx,
+                p.sell_price,
+                (SELECT code FROM product_barcodes WHERE product_id = p.id ORDER BY code LIMIT 1),
+                (SELECT reorder_level FROM reorder_rules WHERE product_id = p.id LIMIT 1)
+         FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ?1 AND p.is_active = 1",
+        params![id],
+        |r| {
+            let v = serde_json::json!({
+                "tradeName": r.get::<_, String>(0)?,
+                "tradeNameAr": r.get::<_, Option<String>>(1)?,
+                "category": r.get::<_, Option<String>>(2)?,
+                "dosageForm": r.get::<_, String>(3)?,
+                "strength": r.get::<_, String>(4)?,
+                "packSize": r.get::<_, i64>(5)?,
+                "requiresRx": r.get::<_, i64>(6)? != 0,
+                "price": r.get::<_, i64>(7)?,
+                "barcode": r.get::<_, Option<String>>(8)?,
+                "reorderLevel": r.get::<_, Option<i64>>(9)?,
+            });
+            Ok(v.as_object().cloned().unwrap_or_default())
+        },
+    )
+    .optional()
+    .map_err(err)?
+    .ok_or_else(|| "صنف غير موجود أو موقوف".to_string())
+}
+
+fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Result<InventoryItem, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
+    let CheckedProduct { name, form, strength, barcode, category } = check_product(&tx, &p, None)?;
     let id = new_id();
     tx.execute(
         "INSERT INTO products(id, trade_name, trade_name_ar, category_id, dosage_form, strength_label, pack_size,
@@ -1090,11 +1138,101 @@ fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Res
         .map_err(err)?;
     }
     let now = utc_now(&tx)?;
-    let payload = serde_json::json!({ "tradeName": name, "price": p.price, "barcode": barcode }).to_string();
+    let payload =
+        serde_json::json!({ "tradeName": name, "price": p.price, "barcode": barcode, "to": product_snapshot(&tx, &id)? })
+            .to_string();
     append_audit(&tx, user_id, "product.create", "products", &id, &payload, &now).map_err(err)?;
     let item = inventory_item(&tx, &id)?;
     tx.commit().map_err(err)?;
     Ok(item)
+}
+
+/// Edits a product's details. The audit gets the changed fields before and after; a price change is its own
+/// `product.price` entry, so price history can be read on its own.
+fn update_product_inner(conn: &mut Connection, user_id: &str, id: &str, p: NewProduct) -> Result<InventoryItem, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_permission(&tx, user_id, &["modify_inventory"])?;
+    let before = product_snapshot(&tx, id)?;
+    let CheckedProduct { name, form, strength, barcode, category } = check_product(&tx, &p, Some(id))?;
+    tx.execute(
+        "UPDATE products SET trade_name = ?1, trade_name_ar = ?2, category_id = ?3, dosage_form = ?4, strength_label = ?5,
+                             pack_size = ?6, requires_rx = ?7, sell_price = ?8
+         WHERE id = ?9",
+        params![name, non_empty(&p.trade_name_ar), category, form, strength, p.pack_size, p.requires_rx, p.price, id],
+    )
+    .map_err(err)?;
+    // The barcode shown for the product (its first) is replaced; any other codes it has keep scanning.
+    let old_code = before.get("barcode").and_then(|v| v.as_str()).map(String::from);
+    if old_code != barcode {
+        if let Some(old) = &old_code {
+            tx.execute("DELETE FROM product_barcodes WHERE code = ?1", params![old]).map_err(err)?;
+        }
+        if let Some(code) = &barcode {
+            tx.execute("INSERT OR IGNORE INTO product_barcodes(code, product_id) VALUES (?1, ?2)", params![code, id])
+                .map_err(err)?;
+        }
+    }
+    match p.reorder_level {
+        Some(level) => {
+            let n = tx
+                .execute("UPDATE reorder_rules SET reorder_level = ?2 WHERE product_id = ?1", params![id, level])
+                .map_err(err)?;
+            if n == 0 {
+                tx.execute(
+                    "INSERT INTO reorder_rules(product_id, branch_id, reorder_level)
+                     SELECT ?1, id, ?2 FROM branches ORDER BY created_at LIMIT 1",
+                    params![id, level],
+                )
+                .map_err(err)?;
+            }
+        }
+        // A rule that also holds a max level or a preferred supplier is kept, with no reorder level.
+        None => {
+            tx.execute(
+                "DELETE FROM reorder_rules WHERE product_id = ?1 AND max_qty = 0 AND preferred_supplier_id IS NULL",
+                params![id],
+            )
+            .map_err(err)?;
+            tx.execute("UPDATE reorder_rules SET reorder_level = 0 WHERE product_id = ?1", params![id]).map_err(err)?;
+        }
+    }
+
+    let after = product_snapshot(&tx, id)?;
+    let (mut from, mut to) = (serde_json::Map::new(), serde_json::Map::new());
+    for (k, v) in &after {
+        let old = before.get(k).cloned().unwrap_or(serde_json::Value::Null);
+        if &old != v {
+            from.insert(k.clone(), old);
+            to.insert(k.clone(), v.clone());
+        }
+    }
+    if to.is_empty() {
+        return Err("لم يتغيّر شيء في بيانات الصنف".into());
+    }
+    let now = utc_now(&tx)?;
+    if let Some(price) = to.remove("price") {
+        let payload = serde_json::json!({ "from": from.remove("price"), "to": price, "source": "manual" }).to_string();
+        append_audit(&tx, user_id, "product.price", "products", id, &payload, &now).map_err(err)?;
+    }
+    if !to.is_empty() {
+        let payload = serde_json::json!({ "from": from, "to": to }).to_string();
+        append_audit(&tx, user_id, "product.update", "products", id, &payload, &now).map_err(err)?;
+    }
+    let item = inventory_item(&tx, id)?;
+    tx.commit().map_err(err)?;
+    Ok(item)
+}
+
+#[tauri::command]
+fn update_product(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    product_id: String,
+    product: NewProduct,
+) -> Result<InventoryItem, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    update_product_inner(&mut conn, &user_id, &product_id, product)
 }
 
 #[tauri::command]
@@ -1170,7 +1308,16 @@ fn receive_batch_inner(conn: &mut Connection, user_id: &str, b: ReceiveBatch) ->
         params![new_id(), id, b.qty, b.unit_cost, user_id, now],
     )
     .map_err(err)?;
-    let payload = serde_json::json!({ "productId": b.product_id, "batchNo": batch_no, "qty": b.qty }).to_string();
+    let payload = serde_json::json!({
+        "productId": b.product_id,
+        "batchNo": batch_no,
+        "qty": b.qty,
+        "unitCost": b.unit_cost,
+        "expiryDate": b.expiry_date,
+        "from": null,
+        "to": { "qty": b.qty, "unitCost": b.unit_cost },
+    })
+    .to_string();
     append_audit(&tx, user_id, "batch.receive", "batches", &id, &payload, &now).map_err(err)?;
     let item = inventory_item(&tx, &b.product_id)?;
     tx.commit().map_err(err)?;
@@ -1223,8 +1370,7 @@ fn adjust_batch_inner(conn: &mut Connection, user_id: &str, a: AdjustBatch) -> R
         params![new_id(), a.batch_id, delta, unit_cost, user_id, now],
     )
     .map_err(err)?;
-    let payload =
-        serde_json::json!({ "from": old_qty, "to": a.new_qty, "reason": reason }).to_string();
+    let payload = serde_json::json!({ "from": { "qty": old_qty }, "to": { "qty": a.new_qty }, "reason": reason }).to_string();
     append_audit(&tx, user_id, "batch.adjust", "batches", &a.batch_id, &payload, &now).map_err(err)?;
     let item = inventory_item(&tx, &product_id)?;
     tx.commit().map_err(err)?;
@@ -1499,7 +1645,8 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
             )
             .optional()
             .map_err(err)?;
-        let batch_id = match existing {
+        // (batch, its quantity and cost before this line, after it)
+        let (batch_id, was, now_is) = match existing {
             Some((id, expiry, status, old_qty, old_cost)) => {
                 if expiry != l.expiry_date {
                     return Err(format!(
@@ -1521,7 +1668,7 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
                 )
                 .map_err(err)?;
                 updated += 1;
-                id
+                (id, serde_json::json!({ "qty": old_qty, "unitCost": old_cost }), serde_json::json!({ "qty": qty, "unitCost": cost }))
             }
             None => {
                 let id = new_id();
@@ -1545,9 +1692,21 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
                 )
                 .map_err(err)?;
                 created += 1;
-                id
+                (id, serde_json::Value::Null, serde_json::json!({ "qty": l.qty, "unitCost": l.unit_cost }))
             }
         };
+        let payload = serde_json::json!({
+            "productId": l.product_id,
+            "batchNo": batch_no,
+            "qty": l.qty,
+            "unitCost": l.unit_cost,
+            "expiryDate": l.expiry_date,
+            "invoiceNo": invoice_no,
+            "from": was,
+            "to": now_is,
+        })
+        .to_string();
+        append_audit(&tx, user_id, "batch.receive", "batches", &batch_id, &payload, &now).map_err(err)?;
         tx.execute(
             "INSERT INTO stock_movements(id, batch_id, type, qty, unit_cost, ref_type, ref_id, user_id, occurred_at)
              VALUES (?1, ?2, 'purchase', ?3, ?4, 'purchase_invoice', ?5, ?6, ?7)",
@@ -1568,7 +1727,9 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
             .map_err(err)?;
         if old != price {
             tx.execute("UPDATE products SET sell_price = ?1 WHERE id = ?2", params![price, product_id]).map_err(err)?;
-            let payload = serde_json::json!({ "from": old, "to": price, "invoiceId": invoice_id }).to_string();
+            let payload =
+                serde_json::json!({ "from": old, "to": price, "source": "purchase", "invoiceId": invoice_id, "invoiceNo": invoice_no })
+                    .to_string();
             append_audit(&tx, user_id, "product.price", "products", product_id, &payload, &now).map_err(err)?;
             price_changes.push(name);
         }
@@ -2135,6 +2296,8 @@ pub struct AuditRow {
     /// Local date and time.
     at: String,
     user: Option<String>,
+    /// Sign-in name of the user who acted.
+    username: Option<String>,
     action: String,
     entity: String,
     entity_id: Option<String>,
@@ -2142,6 +2305,8 @@ pub struct AuditRow {
     subject: Option<String>,
     /// The JSON written with the entry.
     payload: String,
+    /// This entry's link in the hash chain.
+    hash: String,
 }
 
 #[derive(Serialize, Debug)]
@@ -2186,20 +2351,44 @@ fn verify_audit_chain(conn: &Connection) -> Result<AuditChain, String> {
     Ok(AuditChain { ok: true, checked, broken_at: None })
 }
 
-/// `f.cashier_id` filters by the user who acted; `action` is a full action ("user.login") or its group ("user").
-fn report_audit_inner(conn: &Connection, f: &ReportFilter, action: Option<&str>) -> Result<AuditReport, String> {
+/// Which entries each quick filter of the audit screen shows.
+fn audit_category(category: Option<&str>) -> Result<&'static str, String> {
+    Ok(match category {
+        None => "1",
+        // Products, stock and purchasing.
+        Some("inventory") => {
+            "(a.action LIKE 'product.%' OR a.action LIKE 'batch.%' OR a.action LIKE 'purchase.%' OR a.action LIKE 'supplier.%')"
+        }
+        Some("users") => "(a.action LIKE 'user.%' AND a.action != 'user.login')",
+        // Selling price changes, and purchases that changed a batch's unit cost.
+        Some("prices") => {
+            "(a.action = 'product.price' OR (a.action = 'batch.receive'
+               AND json_extract(a.payload, '$.from.unitCost') IS NOT NULL
+               AND json_extract(a.payload, '$.from.unitCost') != json_extract(a.payload, '$.to.unitCost')))"
+        }
+        Some("login") => "a.action = 'user.login'",
+        Some("sales") => "(a.action LIKE 'sale.%' OR a.action LIKE 'receipt.%')",
+        Some("settings") => "a.action LIKE 'settings.%'",
+        Some(_) => return Err("نوع العملية غير معروف".into()),
+    })
+}
+
+/// `f.cashier_id` filters by the user who acted; `category` is one of the quick filters (see audit_category).
+fn report_audit_inner(conn: &Connection, f: &ReportFilter, category: Option<&str>) -> Result<AuditReport, String> {
     check_range(conn, f)?;
     let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
-    let filter = "FROM audit_log a
-      WHERE a.occurred_at >= ?1 AND a.occurred_at < ?2 AND (?3 IS NULL OR a.user_id = ?3)
-        AND (?4 IS NULL OR a.action = ?4 OR a.action LIKE ?4 || '.%')";
+    let filter = format!(
+        "FROM audit_log a
+      WHERE a.occurred_at >= ?1 AND a.occurred_at < ?2 AND (?3 IS NULL OR a.user_id = ?3) AND {}",
+        audit_category(category)?
+    );
     let total: i64 = conn
-        .query_row(&format!("SELECT COUNT(*) {filter}"), params![lo, hi, f.cashier_id, action], |r| r.get(0))
+        .query_row(&format!("SELECT COUNT(*) {filter}"), params![lo, hi, f.cashier_id], |r| r.get(0))
         .map_err(err)?;
     let mut stmt = conn
         .prepare(&format!(
             "SELECT a.seq, datetime(a.occurred_at, 'localtime'), (SELECT full_name FROM users WHERE id = a.user_id),
-                    a.action, a.entity, a.entity_id,
+                    (SELECT username FROM users WHERE id = a.user_id), a.action, a.entity, a.entity_id,
                     CASE a.entity
                       WHEN 'products' THEN (SELECT trade_name FROM products WHERE id = a.entity_id)
                       WHEN 'batches' THEN (SELECT p.trade_name || ' / ' || b.batch_no FROM batches b
@@ -2209,21 +2398,23 @@ fn report_audit_inner(conn: &Connection, f: &ReportFilter, action: Option<&str>)
                       WHEN 'users' THEN (SELECT full_name FROM users WHERE id = a.entity_id)
                       WHEN 'suppliers' THEN (SELECT name FROM suppliers WHERE id = a.entity_id)
                     END,
-                    COALESCE(a.payload, '{{}}')
+                    COALESCE(a.payload, '{{}}'), a.hash
              {filter} ORDER BY a.seq DESC LIMIT {AUDIT_LIMIT}"
         ))
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![lo, hi, f.cashier_id, action], |r| {
+        .query_map(params![lo, hi, f.cashier_id], |r| {
             Ok(AuditRow {
                 seq: r.get(0)?,
                 at: r.get(1)?,
                 user: r.get(2)?,
-                action: r.get(3)?,
-                entity: r.get(4)?,
-                entity_id: r.get(5)?,
-                subject: r.get(6)?,
-                payload: r.get(7)?,
+                username: r.get(3)?,
+                action: r.get(4)?,
+                entity: r.get(5)?,
+                entity_id: r.get(6)?,
+                subject: r.get(7)?,
+                payload: r.get(8)?,
+                hash: r.get(9)?,
             })
         })
         .map_err(err)?
@@ -2237,14 +2428,14 @@ fn report_audit(
     db: State<'_, Db>,
     session: State<'_, Session>,
     filter: ReportFilter,
-    action: Option<String>,
+    category: Option<String>,
 ) -> Result<AuditReport, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
     if active_role(&conn, &user_id)? != "admin" {
         return Err("سجل التدقيق للمدير فقط".into());
     }
-    report_audit_inner(&conn, &filter, action.as_deref().filter(|a| !a.is_empty()))
+    report_audit_inner(&conn, &filter, category.as_deref().filter(|c| !c.is_empty()))
 }
 
 // ── Export ──
@@ -2510,7 +2701,7 @@ fn toggle_user_status_inner(conn: &mut Connection, admin_id: &str, user_id: &str
     if before.active != active {
         tx.execute("UPDATE users SET is_active = ?1 WHERE id = ?2", params![active, user_id]).map_err(err)?;
         let now = utc_now(&tx)?;
-        let payload = serde_json::json!({ "active": active }).to_string();
+        let payload = serde_json::json!({ "from": { "active": before.active }, "to": { "active": active } }).to_string();
         append_audit(&tx, admin_id, "user.status", "users", user_id, &payload, &now).map_err(err)?;
     }
     let row = user_row(&tx, user_id)?;
@@ -2590,6 +2781,55 @@ fn setting(conn: &Connection, key: &str) -> Result<String, String> {
         .optional()
         .map_err(err)
         .map(Option::unwrap_or_default)
+}
+
+#[derive(Serialize, Deserialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SaleSettings {
+    /// Largest discount, as a percentage of the invoice subtotal, for every role except admin and chief pharmacist.
+    max_discount_pct: i64,
+}
+
+fn sale_settings_inner(conn: &Connection) -> Result<SaleSettings, String> {
+    Ok(SaleSettings { max_discount_pct: setting(conn, "max_discount_pct")?.parse().unwrap_or(0) })
+}
+
+#[tauri::command]
+fn sale_settings(db: State<'_, Db>, session: State<'_, Session>) -> Result<SaleSettings, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    sale_settings_inner(&conn)
+}
+
+fn save_sale_settings_inner(conn: &mut Connection, user_id: &str, s: SaleSettings) -> Result<SaleSettings, String> {
+    let tx = conn.transaction().map_err(err)?;
+    if active_role(&tx, user_id)? != "admin" {
+        return Err("إعدادات البيع للمدير فقط".into());
+    }
+    if !(0..=100).contains(&s.max_discount_pct) {
+        return Err("حد الخصم بين ٠ و١٠٠٪".into());
+    }
+    let before = sale_settings_inner(&tx)?;
+    if before == s {
+        return Ok(s);
+    }
+    tx.execute(
+        "INSERT INTO settings(key, value) VALUES ('max_discount_pct', ?1) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        params![s.max_discount_pct.to_string()],
+    )
+    .map_err(err)?;
+    let now = utc_now(&tx)?;
+    let payload = serde_json::json!({ "from": before, "to": s }).to_string();
+    append_audit(&tx, user_id, "settings.sales", "settings", "sales", &payload, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(s)
+}
+
+#[tauri::command]
+fn save_sale_settings(db: State<'_, Db>, session: State<'_, Session>, settings: SaleSettings) -> Result<SaleSettings, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    save_sale_settings_inner(&mut conn, &user_id, settings)
 }
 
 fn receipt_settings_inner(conn: &Connection) -> Result<ReceiptSettings, String> {
@@ -2952,6 +3192,7 @@ pub fn run() {
             inventory_batches,
             list_categories,
             add_product,
+            update_product,
             receive_batch,
             adjust_batch,
             list_suppliers,
@@ -2973,6 +3214,8 @@ pub fn run() {
             phone_scanner_info,
             phone_scanner_firewall,
             allow_phone_scanner_firewall,
+            sale_settings,
+            save_sale_settings,
             receipt_settings,
             save_receipt_settings,
             sale_receipt,
@@ -3915,10 +4158,13 @@ mod tests {
         assert!(sale.subject.as_deref().is_some_and(|s| sale.payload.contains(s)), "invoice number as the subject");
         assert_eq!((all.chain.ok, all.chain.checked), (true, 3));
 
-        let sales = report_audit_inner(&conn, &filter(&conn, None, None), Some("sale")).unwrap();
+        let sales = report_audit_inner(&conn, &filter(&conn, None, None), Some("sales")).unwrap();
         assert_eq!(sales.total, 2);
-        let one = report_audit_inner(&conn, &filter(&conn, Some("u-ph"), None), Some("sale.create")).unwrap();
-        assert_eq!((one.total, one.rows[0].user.as_deref()), (1, Some("u-ph")));
+        let one = report_audit_inner(&conn, &filter(&conn, Some("u-ph"), None), Some("sales")).unwrap();
+        assert_eq!((one.total, one.rows[0].user.as_deref(), one.rows[0].username.as_deref()), (1, Some("u-ph"), Some("u-ph")));
+        let logins = report_audit_inner(&conn, &filter(&conn, None, None), Some("login")).unwrap();
+        assert_eq!(logins.total, 1);
+        assert!(report_audit_inner(&conn, &filter(&conn, None, None), Some("nope")).is_err());
         let old = ReportFilter { from: "2020-01-01".into(), to: "2020-01-31".into(), cashier_id: None, category_id: None };
         assert_eq!(report_audit_inner(&conn, &old, None).unwrap().total, 0);
 
@@ -4208,5 +4454,144 @@ mod tests {
         assert!(save_receipt_settings_inner(&mut conn, ADMIN, bad_paper).unwrap_err().contains("الورق"));
         let no_name = ReceiptSettings { name: " ".into(), ..s };
         assert!(save_receipt_settings_inner(&mut conn, ADMIN, no_name).unwrap_err().contains("مطلوب"));
+    }
+
+    // ── Audit: before and after values ──
+
+    fn last_audit(conn: &Connection, action: &str) -> serde_json::Value {
+        let payload: String = conn
+            .query_row(
+                "SELECT payload FROM audit_log WHERE action = ?1 ORDER BY seq DESC LIMIT 1",
+                params![action],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&payload).unwrap()
+    }
+
+    fn brufen_form() -> NewProduct {
+        NewProduct {
+            trade_name: "Brufen 400 mg".into(),
+            trade_name_ar: None,
+            category_id: Some("cat-otc".into()),
+            dosage_form: "قرص".into(),
+            strength: "400 mg".into(),
+            pack_size: 30,
+            price: 3500,
+            requires_rx: false,
+            barcode: Some("2000000000121".into()),
+            reorder_level: None,
+        }
+    }
+
+    #[test]
+    fn product_edit_logs_changed_fields_and_price_separately() {
+        let mut conn = db();
+        let before = product_snapshot(&conn, "p-brufen-400").unwrap();
+        let mut f = brufen_form();
+        f.trade_name_ar = before["tradeNameAr"].as_str().map(String::from);
+        f.reorder_level = before["reorderLevel"].as_i64();
+        assert!(update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap_err().contains("لم يتغيّر"));
+
+        f.pack_size = 20;
+        f.price = 3750;
+        f.barcode = Some("6281000000999".into());
+        let item = update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap();
+        assert_eq!((item.pack_size, item.price, item.barcode.as_deref()), (20, 3750, Some("6281000000999")));
+
+        let price = last_audit(&conn, "product.price");
+        assert_eq!((price["from"].as_i64(), price["to"].as_i64(), price["source"].as_str()), (Some(3500), Some(3750), Some("manual")));
+        let upd = last_audit(&conn, "product.update");
+        assert_eq!(upd["from"], serde_json::json!({ "packSize": 30, "barcode": "2000000000121" }));
+        assert_eq!(upd["to"], serde_json::json!({ "packSize": 20, "barcode": "6281000000999" }));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM product_barcodes WHERE code = '2000000000121'"), 0);
+
+        // Only the price: one price entry and no update entry.
+        f.price = 4000;
+        update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap();
+        assert_eq!(audits(&conn, "product.price"), 2);
+        assert_eq!(audits(&conn, "product.update"), 1);
+
+        // Another product's barcode is refused; nobody without modify_inventory may edit.
+        let other: String = conn
+            .query_row("SELECT code FROM product_barcodes WHERE product_id != 'p-brufen-400' LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        f.barcode = Some(other);
+        assert!(update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap_err().contains("مسجّل مسبقاً"));
+        add_user(&conn, "u-cash", "cashier");
+        f.barcode = None;
+        assert!(update_product_inner(&mut conn, "u-cash", "p-brufen-400", f.clone()).is_err());
+    }
+
+
+    #[test]
+    fn product_edit_sets_and_clears_the_reorder_level() {
+        let mut conn = db();
+        let mut f = brufen_form();
+        f.trade_name_ar = product_snapshot(&conn, "p-brufen-400").unwrap()["tradeNameAr"].as_str().map(String::from);
+        f.reorder_level = Some(15);
+        assert_eq!(update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap().reorder_level, Some(15));
+        f.reorder_level = None;
+        assert_eq!(update_product_inner(&mut conn, ADMIN, "p-brufen-400", f.clone()).unwrap().reorder_level, None);
+        assert_eq!(last_audit(&conn, "product.update")["to"], serde_json::json!({ "reorderLevel": null }));
+    }
+
+    #[test]
+    fn stock_changes_record_quantity_and_cost_before_and_after() {
+        let mut conn = db();
+        let expiry: String = conn.query_row("SELECT expiry_date FROM batches WHERE id = 'b-br-400'", [], |r| r.get(0)).unwrap();
+        let inv = purchase("INV-401", "cash", vec![pline("p-brufen-400", "BR400", &expiry, 45, 2600, 3500)]);
+        post_purchase_inner(&mut conn, ADMIN, inv).unwrap();
+        let topped = last_audit(&conn, "batch.receive");
+        assert_eq!(topped["from"], serde_json::json!({ "qty": 55, "unitCost": 2400 }));
+        assert_eq!(topped["to"], serde_json::json!({ "qty": 100, "unitCost": 2490 }));
+        assert_eq!(topped["invoiceNo"], "INV-401");
+
+        receive_batch_inner(&mut conn, ADMIN, receive("p-brufen-400", "NEW-1", "2030-01-01", 12)).unwrap();
+        let fresh = last_audit(&conn, "batch.receive");
+        assert!(fresh["from"].is_null());
+        assert_eq!(fresh["to"]["qty"], 12);
+
+        adjust_batch_inner(&mut conn, ADMIN, AdjustBatch { batch_id: "b-br-400".into(), new_qty: 97, reason: "تالف".into() })
+            .unwrap();
+        let adj = last_audit(&conn, "batch.adjust");
+        assert_eq!((adj["from"]["qty"].as_i64(), adj["to"]["qty"].as_i64(), adj["reason"].as_str()), (Some(100), Some(97), Some("تالف")));
+
+        // The price filter finds the cost change but not the new batch.
+        let f = filter(&conn, None, None);
+        let prices = report_audit_inner(&conn, &f, Some("prices")).unwrap();
+        assert_eq!(prices.rows.iter().map(|r| r.action.as_str()).collect::<Vec<_>>(), ["batch.receive"]);
+        assert_eq!(report_audit_inner(&conn, &f, Some("inventory")).unwrap().total, 4, "two receipts, the adjustment, the invoice");
+    }
+
+    #[test]
+    fn account_status_change_records_before_and_after() {
+        let mut conn = admin_db();
+        let admin_id: String = conn.query_row("SELECT id FROM users WHERE role = 'admin' LIMIT 1", [], |r| r.get(0)).unwrap();
+        let u = create_user_inner(&mut conn, &admin_id, new_user("sara", "cashier")).unwrap();
+        toggle_user_status_inner(&mut conn, &admin_id, &u.id, false).unwrap();
+        let p = last_audit(&conn, "user.status");
+        assert_eq!((p["from"]["active"].as_bool(), p["to"]["active"].as_bool()), (Some(true), Some(false)));
+        let users = report_audit_inner(&conn, &filter(&conn, None, None), Some("users")).unwrap();
+        assert!(users.rows.iter().all(|r| r.action != "user.login"));
+        assert_eq!(users.rows.len(), 3, "setup, create, status");
+    }
+
+    #[test]
+    fn discount_cap_is_admin_only_logged_and_applied() {
+        let mut conn = db();
+        add_user(&conn, "u-chief", "chief_pharmacist");
+        assert!(save_sale_settings_inner(&mut conn, "u-chief", SaleSettings { max_discount_pct: 50 }).unwrap_err().contains("للمدير"));
+        assert!(save_sale_settings_inner(&mut conn, ADMIN, SaleSettings { max_discount_pct: 101 }).is_err());
+        save_sale_settings_inner(&mut conn, ADMIN, SaleSettings { max_discount_pct: 10 }).unwrap();
+        assert_eq!(audits(&conn, "settings.sales"), 0, "saving the same value logs nothing");
+
+        save_sale_settings_inner(&mut conn, ADMIN, SaleSettings { max_discount_pct: 0 }).unwrap();
+        assert_eq!(sale_settings_inner(&conn).unwrap().max_discount_pct, 0);
+        let p = last_audit(&conn, "settings.sales");
+        assert_eq!((p["from"]["maxDiscountPct"].as_i64(), p["to"]["maxDiscountPct"].as_i64()), (Some(10), Some(0)));
+
+        add_user(&conn, "u-ph", "pharmacist");
+        assert!(post_sale_inner(&mut conn, "u-ph", cash_sale(vec![brufen(2, 100)], 7000)).unwrap_err().contains("0٪"));
     }
 }

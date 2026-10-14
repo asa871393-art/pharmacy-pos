@@ -1,9 +1,11 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { AUDIT_GROUPS, auditActionLabel, auditSummary } from "../core/audit.ts";
+import { AUDIT_CATEGORIES, auditActionLabel, auditChanges, auditDetails, auditSummary } from "../core/audit.ts";
 import { addDays, weekStart } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
 import {
+  type AuditCategory,
   type AuditReport,
+  type AuditRow,
   type Category,
   type ExpiryReport,
   type ReorderRow,
@@ -16,7 +18,7 @@ import {
 } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
-import { errorText } from "../ui/Modal.tsx";
+import { errorText, Modal } from "../ui/Modal.tsx";
 
 type Tab = "sales" | "expiry" | "reorder" | "rx" | "audit";
 
@@ -59,6 +61,8 @@ interface Column<T> {
   cell: (row: T) => ReactNode;
   csv: (row: T) => string | number;
   num?: boolean;
+  /** A control for the screen: left out of the print view and the CSV file. */
+  screenOnly?: boolean;
 }
 
 interface Section<T> {
@@ -231,7 +235,7 @@ function rxView(r: RxReport): View {
   };
 }
 
-function auditView(r: AuditReport): View {
+function auditView(r: AuditReport, open: (row: AuditRow) => void): View {
   type A = AuditReport["rows"][number];
   const { chain } = r;
   const cut = r.total > r.rows.length;
@@ -257,14 +261,108 @@ function auditView(r: AuditReport): View {
         columns: [
           { label: "#", cell: (x: A) => x.seq, csv: (x: A) => x.seq, num: true },
           { label: "التاريخ والوقت", cell: (x: A) => <bdi className="num">{x.at}</bdi>, csv: (x: A) => x.at },
-          text<A>("المستخدم", (x) => x.user),
+          {
+            label: "المستخدم",
+            cell: (x: A) => (
+              <>
+                {x.user ?? "—"}
+                {x.username && <div className="muted small"><bdi className="num">{x.username}</bdi></div>}
+              </>
+            ),
+            csv: (x: A) => (x.username ? `${x.user ?? ""} (${x.username})` : (x.user ?? "")),
+          },
           text<A>("العملية", (x) => auditActionLabel(x.action)),
           text<A>("يخص", (x) => x.subject),
           { label: "التفاصيل", cell: (x: A) => auditSummary(x.action, x.payload) || "—", csv: (x: A) => auditSummary(x.action, x.payload) },
+          {
+            label: "السجل الكامل",
+            cell: (x: A) => (
+              <button type="button" className="link-btn" onClick={() => open(x)} aria-label={`عرض العملية رقم ${x.seq}`}>
+                عرض
+              </button>
+            ),
+            csv: () => "",
+            screenOnly: true,
+          },
         ],
       },
     ],
   };
+}
+
+function prettyJson(text: string): string {
+  try {
+    return JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    return text;
+  }
+}
+
+/** One audit entry in full: who, when, every changed field old against new, and the stored record. */
+function AuditEntryDialog({ row, onClose }: { row: AuditRow; onClose: () => void }) {
+  const changes = auditChanges(row.action, row.payload);
+  const details = auditDetails(row.payload);
+  const isCreation = changes.length > 0 && changes.every((c) => c.before === "—");
+  return (
+    <Modal title={`${auditActionLabel(row.action)} · العملية رقم ${row.seq}`} onClose={onClose} wide>
+      <div className="modal-body">
+        <dl className="audit-meta">
+          <dt>الوقت</dt>
+          <dd><bdi className="num">{row.at}</bdi></dd>
+          <dt>المستخدم</dt>
+          <dd>
+            {row.user ?? "—"}
+            {row.username && <> · <bdi className="num">{row.username}</bdi></>}
+          </dd>
+          <dt>يخص</dt>
+          <dd>{row.subject ?? "—"}</dd>
+          {details.map((d) => (
+            <div key={d.label} className="audit-meta-row">
+              <dt>{d.label}</dt>
+              <dd>{d.value}</dd>
+            </div>
+          ))}
+        </dl>
+
+        {changes.length > 0 ? (
+          <section aria-labelledby="audit-changes">
+            <h4 id="audit-changes" className="audit-sub">{isCreation ? "القيم المسجّلة" : "التغييرات"}</h4>
+            <div className="table-wrap">
+              <table className="cart audit-diff">
+                <thead>
+                  <tr>
+                    <th>الحقل</th>
+                    {!isCreation && <th>القيمة السابقة</th>}
+                    <th>{isCreation ? "القيمة" : "القيمة الجديدة"}</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {changes.map((c) => (
+                    <tr key={c.key}>
+                      <th scope="row">{c.label}</th>
+                      {!isCreation && <td className="diff-old">{c.before}</td>}
+                      <td className="diff-new">{c.after}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </section>
+        ) : (
+          <p className="muted small">لا توجد قيم سابقة ولاحقة لهذه العملية.</p>
+        )}
+
+        <details className="audit-raw">
+          <summary>السجل كما خُزّن</summary>
+          <dl className="audit-meta">
+            <dt>البصمة</dt>
+            <dd><bdi className="num audit-hash">{row.hash}</bdi></dd>
+          </dl>
+          <pre className="num">{prettyJson(row.payload)}</pre>
+        </details>
+      </div>
+    </Modal>
+  );
 }
 
 // ── CSV ──
@@ -278,8 +376,9 @@ function toCsv(title: string, meta: string[], view: View): string {
   const lines: string[] = [csvCell(title), ...meta.map(csvCell), ""];
   for (const t of view.hero ? [view.hero, ...view.tiles] : view.tiles) lines.push(`${csvCell(t.label)},${csvCell(t.csv ?? t.value)}`);
   for (const s of view.sections) {
-    lines.push("", csvCell(s.title), s.columns.map((c) => csvCell(c.label)).join(","));
-    for (const r of s.rows) lines.push(s.columns.map((c) => csvCell(c.csv(r))).join(","));
+    const columns = s.columns.filter((c) => !c.screenOnly);
+    lines.push("", csvCell(s.title), columns.map((c) => csvCell(c.label)).join(","));
+    for (const r of s.rows) lines.push(columns.map((c) => csvCell(c.csv(r))).join(","));
   }
   // The byte-order mark makes Excel read the Arabic text as UTF-8.
   return "﻿" + lines.join("\r\n") + "\r\n";
@@ -297,7 +396,8 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
   const [cashierId, setCashierId] = useState("");
   const [categoryId, setCategoryId] = useState("");
   const [withinDays, setWithinDays] = useState(90);
-  const [auditGroup, setAuditGroup] = useState("");
+  const [auditCategory, setAuditCategory] = useState<AuditCategory | "">("");
+  const [auditEntry, setAuditEntry] = useState<AuditRow | null>(null);
   const [users, setUsers] = useState<UserRef[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   // The view is kept with the tab it belongs to, so a tab never shows another tab's numbers while loading.
@@ -331,7 +431,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
             ? repo.reportReorder(f.categoryId).then(reorderView)
             : tab === "rx"
               ? repo.reportPrescriptions(f).then(rxView)
-              : repo.reportAudit({ ...f, categoryId: undefined }, auditGroup || undefined).then(auditView);
+              : repo.reportAudit({ ...f, categoryId: undefined }, auditCategory || undefined).then((r) => auditView(r, setAuditEntry));
     load
       .then((v) => !stale && setLoaded({ tab, view: v }))
       .catch((e) => {
@@ -343,7 +443,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
     return () => {
       stale = true;
     };
-  }, [tab, from, to, cashierId, categoryId, withinDays, auditGroup, today, visible]);
+  }, [tab, from, to, cashierId, categoryId, withinDays, auditCategory, today, visible]);
 
   if (!tab || !current) {
     return (
@@ -370,7 +470,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
     ...(tab === "expiry" ? [`تنبيه الانتهاء: خلال ${withinDays} يوماً`] : []),
     ...(current.userFilter && cashierId ? [`${current.userFilter}: ${users.find((u) => u.id === cashierId)?.fullName ?? cashierId}`] : []),
     ...(current.usesCategory && categoryId ? [`التصنيف: ${categories.find((c) => c.id === categoryId)?.nameAr ?? categoryId}`] : []),
-    ...(tab === "audit" && auditGroup ? [`نوع العملية: ${AUDIT_GROUPS.find((g) => g.id === auditGroup)?.label ?? auditGroup}`] : []),
+    ...(tab === "audit" && auditCategory ? [`نوع العملية: ${AUDIT_CATEGORIES.find((c) => c.id === auditCategory)?.label}`] : []),
     `أُعدّ بواسطة ${user.fullName} في ${new Date().toLocaleString("ar-IQ-u-nu-latn")}`,
   ];
 
@@ -470,13 +570,19 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
             </label>
           )}
           {tab === "audit" && (
-            <label className="rep-field">
-              <span className="label">نوع العملية</span>
-              <select className="field" value={auditGroup} onChange={(e) => setAuditGroup(e.target.value)}>
-                <option value="">الكل</option>
-                {AUDIT_GROUPS.map((g) => <option key={g.id} value={g.id}>{g.label}</option>)}
-              </select>
-            </label>
+            <div className="chips audit-cats" role="group" aria-label="نوع العملية">
+              {[{ id: "" as const, label: "كل العمليات" }, ...AUDIT_CATEGORIES].map((c) => (
+                <button
+                  key={c.id}
+                  type="button"
+                  className={`chip ${auditCategory === c.id ? "on" : ""}`}
+                  aria-pressed={auditCategory === c.id}
+                  onClick={() => setAuditCategory(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
           )}
           {current.usesCategory && (
             <label className="rep-field">
@@ -522,7 +628,13 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
                   <div className="table-wrap">
                     <table className="cart rep-table">
                       <thead>
-                        <tr>{s.columns.map((c) => <th key={c.label} className={c.num ? "n" : ""}>{c.label}</th>)}</tr>
+                        <tr>
+                          {s.columns.map((c) => (
+                            <th key={c.label} className={`${c.num ? "n" : ""} ${c.screenOnly ? "no-print" : ""}`}>
+                              {c.screenOnly ? <span className="sr-only">{c.label}</span> : c.label}
+                            </th>
+                          ))}
+                        </tr>
                       </thead>
                       <tbody>
                         {s.rows.length === 0 && (
@@ -530,7 +642,9 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
                         )}
                         {s.rows.map((r, i) => (
                           <tr key={i}>
-                            {s.columns.map((c) => <td key={c.label} className={c.num ? "n num" : ""}>{c.cell(r)}</td>)}
+                            {s.columns.map((c) => (
+                              <td key={c.label} className={`${c.num ? "n num" : ""} ${c.screenOnly ? "no-print" : ""}`}>{c.cell(r)}</td>
+                            ))}
                           </tr>
                         ))}
                       </tbody>
@@ -543,6 +657,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
           {loading && !view && <p className="empty-note">جارٍ إعداد التقرير…</p>}
         </div>
       </section>
+      {auditEntry && <AuditEntryDialog row={auditEntry} onClose={() => setAuditEntry(null)} />}
     </main>
   );
 }

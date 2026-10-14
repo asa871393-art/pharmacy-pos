@@ -124,11 +124,41 @@ await page.waitForSelector(".perm-list");
 await page.screenshot({ path: "screenshots/16-user-access.png" });
 await page.keyboard.press("Escape");
 
-// Audit log (admin only): the sign-ins, the sale and the stock correction above
+// Discount cap (admin only)
+await page.getByRole("button", { name: "حد الخصم" }).click();
+await page.fill("#cap-pct", "15");
+await page.getByRole("button", { name: "حفظ", exact: true }).click();
+await page.waitForSelector(".banner.success");
+
+// Edit a product: its price and pack size
+await page.getByRole("button", { name: "المخزون", exact: true }).click();
+await page.locator(".inv-table tbody tr", { hasText: "Panadol Extra" }).first().click();
+await page.getByRole("button", { name: "تعديل بيانات الصنف والسعر" }).click();
+const price = Number(await page.inputValue("#np-price"));
+await page.fill("#np-price", String(price + 250));
+await page.fill("#np-pack", "20");
+await page.screenshot({ path: "screenshots/17-product-edit.png" });
+await page.getByRole("button", { name: "حفظ التعديلات" }).click();
+await page.waitForSelector(".batch-summary");
+await page.keyboard.press("Escape");
+
+// Audit log (admin only): every change above, with quick filters and the full record of one entry
 await page.getByRole("button", { name: "التقارير", exact: true }).click();
 await page.getByRole("tab", { name: "سجل التدقيق" }).click();
 await page.waitForSelector(".rep-table tbody tr td.n");
-await page.screenshot({ path: "screenshots/17-audit-log.png" });
+await page.screenshot({ path: "screenshots/18-audit-log-all.png" });
+await page.getByRole("button", { name: "تغيير الأسعار" }).click();
+await page.waitForFunction(() =>
+  [...document.querySelectorAll(".rep-table tbody tr")].every((tr) => /تغيير سعر البيع|استلام دفعة/.test(tr.textContent ?? "")),
+);
+await page.screenshot({ path: "screenshots/18-audit-prices.png" });
+await page.getByRole("button", { name: "إدارة المستخدمين" }).click();
+await page.getByRole("button", { name: "تعديلات المخزون" }).click();
+await page.waitForSelector(".rep-table tbody tr td.n");
+await page.locator(".rep-table tbody tr", { hasText: "تعديل بيانات صنف" }).getByRole("button", { name: /عرض العملية/ }).click();
+await page.waitForSelector(".audit-diff");
+await page.screenshot({ path: "screenshots/19-audit-entry.png" });
+await page.keyboard.press("Escape");
 
 await browser.close();
 if (errors.length) {

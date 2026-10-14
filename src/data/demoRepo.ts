@@ -6,6 +6,7 @@ import { computeTotals, settle } from "../core/totals.ts";
 import { normalizeOverrides, resolvePermissions, ROLES, type Permission, type PermissionOverrides } from "../core/permissions.ts";
 import {
   type AdjustBatchInput,
+  type AuditCategory,
   type AuditReport,
   type AuditRow,
   type Batch,
@@ -28,6 +29,7 @@ import {
   type ReportFilter,
   type Role,
   type RxReport,
+  type SaleSettings,
   type RxRow,
   type SaleDraft,
   type SaleResult,
@@ -82,6 +84,29 @@ interface DemoSale {
   // What each method actually covered (card and credit first, then cash), and the change.
   payments: { method: "cash" | "card" | "credit"; amount: number }[];
   change: number;
+}
+
+// Same groups as audit_category in src-tauri/src/lib.rs.
+function inAuditCategory(a: { action: string; payload: string }, category: AuditCategory): boolean {
+  const group = a.action.split(".")[0];
+  switch (category) {
+    case "inventory":
+      return ["product", "batch", "purchase", "supplier"].includes(group);
+    case "users":
+      return group === "user" && a.action !== "user.login";
+    case "prices": {
+      if (a.action === "product.price") return true;
+      if (a.action !== "batch.receive") return false;
+      const p = JSON.parse(a.payload);
+      return p.from?.unitCost != null && p.from.unitCost !== p.to?.unitCost;
+    }
+    case "login":
+      return a.action === "user.login";
+    case "sales":
+      return group === "sale" || group === "receipt";
+    case "settings":
+      return group === "settings";
+  }
 }
 
 // Same order as post_sale: card and credit are capped at what is owed, cash goes last and may give change.
@@ -212,7 +237,8 @@ const DENIED: Record<Permission, string> = {
 };
 
 // Same rules as post_sale in src-tauri/src/lib.rs.
-const MAX_DISCOUNT_PCT = 10;
+// Same default as 0002_sale_controls.sql; changed with saveSaleSettings.
+const saleSettings: SaleSettings = { maxDiscountPct: 10 };
 const UNLIMITED_DISCOUNT_ROLES: Role[] = ["admin", "chief_pharmacist"];
 
 export function createDemoRepo(): PharmacyRepo {
@@ -229,8 +255,21 @@ export function createDemoRepo(): PharmacyRepo {
   const audit: (AuditRow & { day: string; userId: string })[] = [];
   const log = (userId: string, action: string, entity: string, entityId: string | null, subject: string | null, payload: object = {}) => {
     const at = new Date().toLocaleString("sv-SE").slice(0, 19);
-    const user = users.find((u) => u.id === userId)?.fullName ?? null;
-    audit.push({ seq: audit.length + 1, at, day: at.slice(0, 10), userId, user, action, entity, entityId, subject, payload: JSON.stringify(payload) });
+    const u = users.find((x) => x.id === userId);
+    audit.push({
+      seq: audit.length + 1,
+      at,
+      day: at.slice(0, 10),
+      userId,
+      user: u?.fullName ?? null,
+      username: u?.username ?? null,
+      action,
+      entity,
+      entityId,
+      subject,
+      payload: JSON.stringify(payload),
+      hash: "—", // no hash chain in the demo
+    });
   };
 
   const toHit = (p: DemoProduct): ProductHit => {
@@ -260,6 +299,7 @@ export function createDemoRepo(): PharmacyRepo {
       barcode: p.barcode ?? null,
       tradeName: p.tradeName,
       tradeNameAr: p.tradeNameAr ?? null,
+      categoryId,
       category: categories.find((c) => c.id === categoryId)?.nameAr ?? null,
       form: p.form,
       strength: p.strength,
@@ -303,6 +343,37 @@ export function createDemoRepo(): PharmacyRepo {
     if (!isIsoDate(f.from) || !isIsoDate(f.to)) throw new Error("تاريخ البداية أو النهاية غير صالح");
     if (f.from > f.to) throw new Error("تاريخ البداية بعد تاريخ النهاية");
   };
+
+  // Same checks as check_product in src-tauri/src/lib.rs; `ownId` is the product being edited.
+  const checkProduct = (input: NewProduct, ownId?: string) => {
+    const [name, form, strength] = [input.tradeName.trim(), input.dosageForm.trim(), input.strength.trim()];
+    if (!name || !form || !strength) throw new Error("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة");
+    if (!(input.price > 0)) throw new Error("سعر البيع يجب أن يكون أكبر من صفر");
+    if (!(input.packSize >= 1)) throw new Error("حجم العبوة يجب أن يكون ١ على الأقل");
+    if (input.reorderLevel !== undefined && input.reorderLevel < 0) throw new Error("حد إعادة الطلب لا يكون سالباً");
+    const barcode = input.barcode?.trim() || undefined;
+    if (barcode) {
+      if (!/^\d{8,14}$/.test(barcode)) throw new Error("الباركود يجب أن يكون من ٨ إلى ١٤ رقماً");
+      const owner = products.find((p) => p.barcode === barcode && p.id !== ownId);
+      if (owner) throw new Error(`الباركود مسجّل مسبقاً للصنف ${owner.tradeName}`);
+    }
+    const categoryId = input.categoryId?.trim() || null;
+    if (categoryId && !categories.some((c) => c.id === categoryId)) throw new Error("التصنيف غير موجود");
+    return { name, form, strength, barcode, categoryId };
+  };
+  // Same fields as product_snapshot.
+  const snapshot = (p: DemoProduct): Record<string, unknown> => ({
+    tradeName: p.tradeName,
+    tradeNameAr: p.tradeNameAr ?? null,
+    category: categories.find((c) => c.id === categoryOf(p))?.nameAr ?? null,
+    dosageForm: p.form,
+    strength: p.strength,
+    packSize: p.packSize,
+    requiresRx: p.rx,
+    price: p.price,
+    barcode: p.barcode ?? null,
+    reorderLevel: reorderLevels[p.id] ?? null,
+  });
 
   const productById = (id: string) => {
     const p = products.find((x) => x.id === id);
@@ -356,12 +427,16 @@ export function createDemoRepo(): PharmacyRepo {
     for (const l of inv.lines) {
       const batchNo = l.batchNo.trim();
       const shelf = batches.find((b) => b.productId === l.productId && b.batchNo === batchNo);
+      const entry = { productId: l.productId, batchNo, qty: l.qty, unitCost: l.unitCost, expiryDate: l.expiryDate, invoiceNo };
+      const subject = `${productById(l.productId).tradeName} / ${batchNo}`;
       if (shelf) {
+        const from = { qty: shelf.qtyOnHand, unitCost: shelf.unitCost };
         const qty = shelf.qtyOnHand + l.qty;
         shelf.unitCost = Math.floor((shelf.qtyOnHand * shelf.unitCost + l.qty * l.unitCost + Math.floor(qty / 2)) / qty);
         shelf.qtyOnHand = qty;
         shelf.sellPrice = l.sellPrice;
         updated += 1;
+        log(me.id, "batch.receive", "batches", shelf.id, subject, { ...entry, from, to: { qty, unitCost: shelf.unitCost } });
       } else {
         batches.push({
           id: `b-demo-${Date.now()}-${created}`,
@@ -374,13 +449,14 @@ export function createDemoRepo(): PharmacyRepo {
           receivedAt: new Date().toISOString(),
         });
         created += 1;
+        log(me.id, "batch.receive", "batches", batches[batches.length - 1].id, subject, { ...entry, from: null, to: { qty: l.qty, unitCost: l.unitCost } });
       }
     }
     const priceChanges: string[] = [];
     for (const [id, price] of prices) {
       const p = productById(id);
       if (p.price !== price) {
-        log(me.id, "product.price", "products", p.id, p.tradeName, { from: p.price, to: price, invoiceId: `pi-demo-${postedInvoices.size + 1}` });
+        log(me.id, "product.price", "products", p.id, p.tradeName, { from: p.price, to: price, source: "purchase", invoiceId: `pi-demo-${postedInvoices.size + 1}`, invoiceNo });
         p.price = price;
         priceChanges.push(p.tradeName);
       }
@@ -483,8 +559,9 @@ export function createDemoRepo(): PharmacyRepo {
       totals.total -= draft.invoiceDiscount;
       const discount = totals.lineDiscounts + totals.invoiceDiscount;
       if (discount > 0 && !perms.giveDiscount) throw new Error(DENIED.giveDiscount);
-      if (!UNLIMITED_DISCOUNT_ROLES.includes(user.role) && discount * 100 > totals.subtotal * MAX_DISCOUNT_PCT) {
-        throw new Error(`الخصم يتجاوز الحد المسموح (${MAX_DISCOUNT_PCT}٪ من المجموع)، يحتاج موافقة المدير`);
+      const cap = saleSettings.maxDiscountPct;
+      if (!UNLIMITED_DISCOUNT_ROLES.includes(user.role) && discount * 100 > totals.subtotal * cap) {
+        throw new Error(`الخصم يتجاوز الحد المسموح (${cap}٪ من المجموع)، يحتاج موافقة المدير`);
       }
       if (needsRx) {
         if (!perms.dispenseRx) throw new Error(DENIED.dispenseRx);
@@ -557,19 +634,7 @@ export function createDemoRepo(): PharmacyRepo {
     },
     async addProduct(input: NewProduct) {
       const me = requirePermission("modifyInventory");
-      const [name, form, strength] = [input.tradeName.trim(), input.dosageForm.trim(), input.strength.trim()];
-      if (!name || !form || !strength) throw new Error("الاسم التجاري والشكل الدوائي والتركيز حقول مطلوبة");
-      if (!(input.price > 0)) throw new Error("سعر البيع يجب أن يكون أكبر من صفر");
-      if (!(input.packSize >= 1)) throw new Error("حجم العبوة يجب أن يكون ١ على الأقل");
-      if (input.reorderLevel !== undefined && input.reorderLevel < 0) throw new Error("حد إعادة الطلب لا يكون سالباً");
-      const barcode = input.barcode?.trim() || undefined;
-      if (barcode) {
-        if (!/^\d{8,14}$/.test(barcode)) throw new Error("الباركود يجب أن يكون من ٨ إلى ١٤ رقماً");
-        const owner = products.find((p) => p.barcode === barcode);
-        if (owner) throw new Error(`الباركود مسجّل مسبقاً للصنف ${owner.tradeName}`);
-      }
-      const categoryId = input.categoryId?.trim() || null;
-      if (categoryId && !categories.some((c) => c.id === categoryId)) throw new Error("التصنيف غير موجود");
+      const { name, form, strength, barcode, categoryId } = checkProduct(input);
       const p: DemoProduct = {
         id: `p-demo-${Date.now()}`,
         tradeName: name,
@@ -586,7 +651,29 @@ export function createDemoRepo(): PharmacyRepo {
       };
       products.push(p);
       if (input.reorderLevel !== undefined) reorderLevels[p.id] = input.reorderLevel;
-      log(me.id, "product.create", "products", p.id, p.tradeName, { tradeName: p.tradeName, price: p.price, barcode: barcode ?? null });
+      log(me.id, "product.create", "products", p.id, p.tradeName, { tradeName: p.tradeName, price: p.price, barcode: barcode ?? null, to: snapshot(p) });
+      return toInventory(p);
+    },
+    async updateProduct(productId: string, input: NewProduct) {
+      const me = requirePermission("modifyInventory");
+      const p = productById(productId);
+      const before = snapshot(p);
+      const { name, form, strength, barcode, categoryId } = checkProduct(input, p.id);
+      Object.assign(p, { tradeName: name, tradeNameAr: input.tradeNameAr?.trim() || undefined, categoryId, form, strength });
+      Object.assign(p, { packSize: input.packSize, rx: input.requiresRx, barcode });
+      if (input.reorderLevel === undefined) delete reorderLevels[p.id];
+      else reorderLevels[p.id] = input.reorderLevel;
+      const oldPrice = p.price;
+      p.price = input.price;
+      const after = snapshot(p);
+      const changed = Object.keys(after).filter((k) => JSON.stringify(before[k]) !== JSON.stringify(after[k]));
+      if (changed.length === 0) throw new Error("لم يتغيّر شيء في بيانات الصنف");
+      if (oldPrice !== p.price) log(me.id, "product.price", "products", p.id, p.tradeName, { from: oldPrice, to: p.price, source: "manual" });
+      const fields = changed.filter((k) => k !== "price");
+      if (fields.length) {
+        const pick = (o: Record<string, unknown>) => Object.fromEntries(fields.map((k) => [k, o[k]]));
+        log(me.id, "product.update", "products", p.id, p.tradeName, { from: pick(before), to: pick(after) });
+      }
       return toInventory(p);
     },
     async receiveBatch(input: ReceiveBatchInput) {
@@ -612,7 +699,15 @@ export function createDemoRepo(): PharmacyRepo {
         receivedAt: new Date().toISOString(),
       });
       const id = batches[batches.length - 1].id;
-      log(me.id, "batch.receive", "batches", id, `${p.tradeName} / ${batchNo}`, { productId: p.id, batchNo, qty: input.qty });
+      log(me.id, "batch.receive", "batches", id, `${p.tradeName} / ${batchNo}`, {
+        productId: p.id,
+        batchNo,
+        qty: input.qty,
+        unitCost: input.unitCost,
+        expiryDate: input.expiryDate,
+        from: null,
+        to: { qty: input.qty, unitCost: input.unitCost },
+      });
       return toInventory(p);
     },
     async adjustBatch(input: AdjustBatchInput) {
@@ -634,8 +729,8 @@ export function createDemoRepo(): PharmacyRepo {
         });
       }
       log(signedIn()!.id, "batch.adjust", "batches", b.id, `${productById(b.productId).tradeName} / ${b.batchNo}`, {
-        from: b.qtyOnHand,
-        to: input.newQty,
+        from: { qty: b.qtyOnHand },
+        to: { qty: input.newQty },
         reason: input.reason.trim(),
       });
       b.qtyOnHand = input.newQty;
@@ -842,7 +937,7 @@ export function createDemoRepo(): PharmacyRepo {
         byPrescriber: [...byDoc.values()].sort((a, b) => b.prescriptions - a.prescriptions || a.prescriber.localeCompare(b.prescriber)),
       };
     },
-    async reportAudit(f: ReportFilter, action?: string): Promise<AuditReport> {
+    async reportAudit(f: ReportFilter, category?: AuditCategory): Promise<AuditReport> {
       const me = signedIn();
       if (!me) throw new Error("الحساب غير موجود أو معطّل، سجّل الدخول من جديد");
       if (me.role !== "admin") throw new Error("سجل التدقيق للمدير فقط");
@@ -852,7 +947,7 @@ export function createDemoRepo(): PharmacyRepo {
           a.day >= f.from &&
           a.day <= f.to &&
           (!f.cashierId || a.userId === f.cashierId) &&
-          (!action || a.action === action || a.action.startsWith(action + ".")),
+          (!category || inAuditCategory(a, category)),
       );
       return {
         rows: match.slice(-1000).reverse().map(({ day: _d, userId: _u, ...row }) => row),
@@ -917,7 +1012,7 @@ export function createDemoRepo(): PharmacyRepo {
         if (u.id === me.id) throw new Error("لا يمكنك تعطيل حسابك");
         if (u.role === "admin" && otherActiveAdmins(u.id) === 0) throw new Error("يجب أن يبقى مدير واحد نشط على الأقل");
       }
-      if (u.active !== active) log(me.id, "user.status", "users", u.id, u.fullName, { active });
+      if (u.active !== active) log(me.id, "user.status", "users", u.id, u.fullName, { from: { active: u.active }, to: { active } });
       u.active = active;
       return toRow(u);
     },
@@ -942,6 +1037,23 @@ export function createDemoRepo(): PharmacyRepo {
     },
     async allowPhoneScannerFirewall(): Promise<never> {
       throw new Error("هذا الإعداد متاح في برنامج سطح المكتب فقط");
+    },
+
+    // Same rules as sale_settings / save_sale_settings.
+    async saleSettings() {
+      if (!signedIn()) throw new Error("سجّل الدخول أولاً");
+      return { ...saleSettings };
+    },
+    async saveSaleSettings(next: SaleSettings) {
+      const me = signedIn();
+      if (!me) throw new Error("الحساب غير موجود أو معطّل، سجّل الدخول من جديد");
+      if (me.role !== "admin") throw new Error("إعدادات البيع للمدير فقط");
+      if (!Number.isInteger(next.maxDiscountPct) || next.maxDiscountPct < 0 || next.maxDiscountPct > 100) throw new Error("حد الخصم بين ٠ و١٠٠٪");
+      if (next.maxDiscountPct !== saleSettings.maxDiscountPct) {
+        log(me.id, "settings.sales", "settings", "sales", null, { from: { ...saleSettings }, to: { maxDiscountPct: next.maxDiscountPct } });
+        saleSettings.maxDiscountPct = next.maxDiscountPct;
+      }
+      return { ...saleSettings };
     },
 
     // Receipts: same rules as the receipt commands in src-tauri/src/lib.rs.

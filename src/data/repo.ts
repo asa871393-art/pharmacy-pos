@@ -1,6 +1,7 @@
 import type { PermissionOverrides } from "../core/permissions.ts";
 import type {
   AdjustBatchInput,
+  AuditCategory,
   AuditReport,
   AuthStatus,
   Batch,
@@ -25,6 +26,7 @@ import type {
   ReportFilter,
   Role,
   RxReport,
+  SaleSettings,
   SaleDraft,
   SaleResult,
   SalesReport,
@@ -55,6 +57,8 @@ export interface PharmacyRepo {
   categories(): Promise<Category[]>;
   // Inventory writes need the modifyInventory permission; each returns the product's updated row.
   addProduct(product: NewProduct): Promise<InventoryItem>;
+  /** Replaces the product's details; changes are audit-logged with before and after values. */
+  updateProduct(productId: string, product: NewProduct): Promise<InventoryItem>;
   receiveBatch(batch: ReceiveBatchInput): Promise<InventoryItem>;
   adjustBatch(adjustment: AdjustBatchInput): Promise<InventoryItem>;
   suppliers(): Promise<Supplier[]>;
@@ -67,8 +71,8 @@ export interface PharmacyRepo {
   reportExpiry(filter: ReportFilter, withinDays: number): Promise<ExpiryReport>;
   reportReorder(categoryId?: string): Promise<ReorderRow[]>;
   reportPrescriptions(filter: ReportFilter): Promise<RxReport>;
-  /** Admin only. `filter.cashierId` is the user who acted; `action` is an action ("user.login") or group ("user"). */
-  reportAudit(filter: ReportFilter, action?: string): Promise<AuditReport>;
+  /** Admin only. `filter.cashierId` is the user who acted. */
+  reportAudit(filter: ReportFilter, category?: AuditCategory): Promise<AuditReport>;
   /** Saves an exported file for the user; returns where it went. */
   saveExport(fileName: string, content: string): Promise<string>;
   // Employees (admin only). Each change returns the updated row.
@@ -87,6 +91,10 @@ export interface PharmacyRepo {
   phoneScannerFirewall(): Promise<FirewallState>;
   /** Adds the firewall rule; Windows asks for administrator approval. */
   allowPhoneScannerFirewall(): Promise<FirewallState>;
+  // Sale settings: the discount cap.
+  saleSettings(): Promise<SaleSettings>;
+  /** Admin only. */
+  saveSaleSettings(settings: SaleSettings): Promise<SaleSettings>;
   // Receipts.
   receiptSettings(): Promise<ReceiptSettings>;
   /** Admin only. */

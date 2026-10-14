@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { auditActionLabel, auditSummary } from "./audit.ts";
+import { auditActionLabel, auditChanges, auditDetails, auditSummary } from "./audit.ts";
 import { weekStart } from "./fefo.ts";
 
 test("summarises a sale with its discount and prescription", () => {
@@ -25,6 +25,48 @@ test("unknown actions and empty payloads stay readable", () => {
   assert.equal(auditSummary("thing.new", "not json"), "not json");
   assert.equal(auditActionLabel("user.login"), "تسجيل دخول");
   assert.equal(auditActionLabel("thing.new"), "thing.new");
+});
+
+test("product edits list each changed field, old against new", () => {
+  const p = JSON.stringify({ from: { packSize: 30, requiresRx: false, barcode: null }, to: { packSize: 20, requiresRx: true, barcode: "6281000000999" } });
+  assert.deepEqual(
+    auditChanges("product.update", p).map((c) => [c.label, c.before, c.after]),
+    [["حجم العبوة", "30", "20"], ["بوصفة طبية", "لا", "نعم"], ["الباركود", "—", "6281000000999"]],
+  );
+  assert.equal(auditSummary("product.update", p), "تعديل حجم العبوة، بوصفة طبية، الباركود");
+});
+
+test("price, stock and cost changes read in dinars and units", () => {
+  const price = JSON.stringify({ from: 3500, to: 3750, source: "manual" });
+  assert.deepEqual(auditChanges("product.price", price).map((c) => [c.label, c.before, c.after]), [["سعر البيع", "3,500 د.ع", "3,750 د.ع"]]);
+  assert.equal(auditSummary("product.price", price), "من 3,500 د.ع إلى 3,750 د.ع · تعديل يدوي");
+  assert.deepEqual(auditDetails(price), [{ label: "المصدر", value: "تعديل يدوي" }]);
+
+  const topUp = JSON.stringify({
+    productId: "p", batchNo: "BR400", qty: 45, invoiceNo: "INV-1", from: { qty: 55, unitCost: 2400 }, to: { qty: 100, unitCost: 2490 },
+  });
+  assert.deepEqual(
+    auditChanges("batch.receive", topUp).map((c) => [c.label, c.before, c.after]),
+    [["الكمية", "55", "100"], ["تكلفة الوحدة", "2,400 د.ع", "2,490 د.ع"]],
+  );
+  assert.equal(auditSummary("batch.receive", topUp), "45 وحدة · الدفعة BR400 · الكمية من 55 إلى 100 · التكلفة من 2,400 د.ع إلى 2,490 د.ع · فاتورة الشراء INV-1");
+
+  // A new batch has nothing before it.
+  const fresh = JSON.stringify({ batchNo: "N1", qty: 12, from: null, to: { qty: 12, unitCost: 900 } });
+  assert.deepEqual(auditChanges("batch.receive", fresh).map((c) => c.before), ["—", "—"]);
+
+  const adjust = JSON.stringify({ from: { qty: 10 }, to: { qty: 6 }, reason: "تالف" });
+  assert.equal(auditSummary("batch.adjust", adjust), "الكمية من 10 إلى 6 · السبب: تالف");
+});
+
+test("account, role and discount cap changes", () => {
+  const status = JSON.stringify({ from: { active: true }, to: { active: false } });
+  assert.equal(auditSummary("user.status", status), "تعطيل الحساب");
+  assert.deepEqual(auditChanges("user.status", status).map((c) => [c.before, c.after]), [["مفعّل", "معطّل"]]);
+  const role = JSON.stringify({ from: { role: "cashier", overrides: {} }, to: { role: "cashier", overrides: { giveDiscount: null, viewReports: true } } });
+  assert.deepEqual(auditChanges("user.role", role).map((c) => [c.label, c.before, c.after]), [["الصلاحيات الخاصة", "حسب الدور", "عرض التقارير: مسموح"]]);
+  const cap = JSON.stringify({ from: { maxDiscountPct: 10 }, to: { maxDiscountPct: 15 } });
+  assert.equal(auditSummary("settings.sales", cap), "حد الخصم من 10٪ إلى 15٪");
 });
 
 test("the week starts on Saturday", () => {
