@@ -879,6 +879,12 @@ export function createDemoRepo(): PharmacyRepo {
     async onPhoneScan() {
       return () => {};
     },
+    async phoneScannerFirewall() {
+      return "unknown" as const;
+    },
+    async allowPhoneScannerFirewall(): Promise<never> {
+      throw new Error("هذا الإعداد متاح في برنامج سطح المكتب فقط");
+    },
 
     // Receipts: same rules as the receipt commands in src-tauri/src/lib.rs.
     async receiptSettings() {

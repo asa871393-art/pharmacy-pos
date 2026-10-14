@@ -5,6 +5,7 @@ import type {
   Batch,
   Category,
   ExpiryReport,
+  FirewallState,
   InventoryBatch,
   InventoryItem,
   NewProduct,
@@ -80,6 +81,9 @@ export interface PharmacyRepo {
   phoneScanner(): Promise<PhoneScannerInfo | null>;
   /** Calls `handler` for every barcode scanned on a paired phone; returns a function that stops listening. */
   onPhoneScan(handler: (scan: PhoneScan) => void): Promise<() => void>;
+  phoneScannerFirewall(): Promise<FirewallState>;
+  /** Adds the firewall rule; Windows asks for administrator approval. */
+  allowPhoneScannerFirewall(): Promise<FirewallState>;
   // Receipts.
   receiptSettings(): Promise<ReceiptSettings>;
   /** Admin only. */

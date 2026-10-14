@@ -2408,6 +2408,20 @@ fn reset_user_password(
     reset_user_password_inner(&mut conn, &admin_id, &user_id, &password)
 }
 
+/// Whether Windows Firewall lets phones reach the scanner server.
+#[tauri::command]
+async fn phone_scanner_firewall(session: State<'_, Session>) -> Result<phone_scanner::FirewallState, String> {
+    session_user(&session)?;
+    tauri::async_runtime::spawn_blocking(phone_scanner::firewall_state).await.map_err(err)
+}
+
+/// Adds the firewall rule for the scanner. Windows asks for administrator approval; nothing changes if declined.
+#[tauri::command]
+async fn allow_phone_scanner_firewall(session: State<'_, Session>) -> Result<phone_scanner::FirewallState, String> {
+    session_user(&session)?;
+    tauri::async_runtime::spawn_blocking(phone_scanner::allow_through_firewall).await.map_err(err)?
+}
+
 // ── Receipts ──
 // Receipts are built from the saved sale, never from what the screen still shows, so a reprint matches the record.
 
@@ -2807,6 +2821,8 @@ pub fn run() {
             reset_user_password,
             get_local_ip,
             phone_scanner_info,
+            phone_scanner_firewall,
+            allow_phone_scanner_firewall,
             receipt_settings,
             save_receipt_settings,
             sale_receipt,

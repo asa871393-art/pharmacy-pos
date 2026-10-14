@@ -341,6 +341,9 @@ export interface PhoneScannerInfo {
   devices: { device: string; secondsAgo: number }[]; // phones heard from in the last 10 seconds
 }
 
+/** Whether Windows Firewall lets phones reach the scanner server. */
+export type FirewallState = "allowed" | "missing" | "unknown";
+
 export interface PhoneScan {
   code: string;
   device: string;

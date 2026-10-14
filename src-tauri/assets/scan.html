@@ -36,6 +36,11 @@
   li .s { color: var(--muted); white-space: nowrap; }
   li .s.wait { color: #7a4700; }
   .hint { color: var(--muted); font-size: 13px; text-align: center; }
+  .log { list-style: none; margin: 0; padding: 8px 12px; background: #fff; border: 1px solid var(--line); border-radius: 12px; font-size: 13px; color: var(--muted); }
+  .log li { display: block; padding: 3px 0; border: 0; }
+  .log li.ok { color: #09493f; }
+  .log li.bad { color: var(--bad); font-weight: 600; }
+  #errors { white-space: pre-wrap; word-break: break-word; }
   [hidden] { display: none !important; }
 </style>
 </head>
@@ -46,8 +51,10 @@
 </header>
 <main>
   <div id="fatal" class="msg error" hidden></div>
+  <div id="errors" class="msg error" role="alert" hidden></div>
+  <noscript><div class="msg error">المتصفح أوقف JavaScript، ولا تعمل الصفحة بدونه. فعّله من إعدادات المتصفح.</div></noscript>
+  <ol id="log" class="log" aria-live="polite"><li class="ok">تم تحميل الصفحة من البرنامج</li></ol>
   <div id="reader"></div>
-  <div id="camera-msg" class="msg warn" hidden></div>
   <button id="retry" class="secondary" hidden>تشغيل الكاميرا من جديد</button>
   <div id="last" class="last" hidden>
     <div class="hint">آخر باركود أُرسل لشاشة البيع</div>
@@ -60,7 +67,43 @@
   <ul id="history" hidden></ul>
   <p class="hint">وجّه الكاميرا إلى باركود العبوة. يُضاف الصنف إلى الفاتورة المفتوحة على شاشة البيع.</p>
 </main>
-<script src="/scan/html5-qrcode.min.js"></script>
+<script>
+// Loaded first, so even a failure inside the scanner library shows on screen instead of a blank page.
+(function () {
+  var shown = [];
+  window.__log = function (text, kind) {
+    var list = document.getElementById("log");
+    var li = document.createElement("li");
+    if (kind) li.className = kind;
+    var t = new Date();
+    li.textContent = ("0" + t.getHours()).slice(-2) + ":" + ("0" + t.getMinutes()).slice(-2) + ":" + ("0" + t.getSeconds()).slice(-2) + "  " + text;
+    list.appendChild(li);
+    while (list.children.length > 7) list.removeChild(list.firstChild);
+  };
+  window.__error = function (text) {
+    if (shown.indexOf(text) !== -1) return;
+    shown.push(text);
+    var box = document.getElementById("errors");
+    box.textContent = (box.textContent ? box.textContent + "\n" : "") + "⚠ " + text;
+    box.hidden = false;
+    window.__log(text, "bad");
+  };
+  window.__clearErrors = function () {
+    shown = [];
+    var box = document.getElementById("errors");
+    box.textContent = "";
+    box.hidden = true;
+  };
+  window.addEventListener("error", function (e) {
+    window.__error("خطأ في الصفحة: " + (e.message || "غير معروف") + (e.filename ? " (" + e.filename.split("/").pop() + ":" + e.lineno + ")" : ""));
+  });
+  window.addEventListener("unhandledrejection", function (e) {
+    var r = e.reason;
+    window.__error("خطأ غير متوقع: " + ((r && (r.message || r.name)) || String(r)));
+  });
+})();
+</script>
+<script src="/scan/html5-qrcode.min.js" onerror="__error('تعذّر تحميل مكتبة قراءة الباركود من البرنامج. أعد تحميل الصفحة؛ يمكنك كتابة الباركود يدوياً.')"></script>
 <script>
 (function () {
   "use strict";
@@ -85,7 +128,13 @@
   var queue = [];
   var sending = false;
   var revoked = false;
+  var lastState = "";
   function setStatus(state) {
+    if (state !== lastState) {
+      if (state === "on") __log("متصل بشاشة البيع ✓", "ok");
+      if (state === "off") __log("لا يصل الموبايل إلى البرنامج، إعادة المحاولة… (تأكد من الواي فاي نفسها)", "bad");
+      lastState = state;
+    }
     var el = $("status");
     el.className = "pill " + (state === "on" ? "on" : state === "off" ? "off" : "");
     el.textContent = state === "on" ? "متصل بشاشة البيع" : state === "off" ? "غير متصل — إعادة المحاولة" : "جارٍ الاتصال…";
@@ -97,6 +146,7 @@
     revoked = true;
     setStatus("off");
     fatal("انتهت صلاحية هذا الرابط (أُعيد تشغيل البرنامج). امسح رمز QR من شاشة البيع من جديد.");
+    __log("رُفض الرابط: رمز الاقتران قديم", "bad");
   }
   function flush() {
     if (sending || revoked || queue.length === 0) return;
@@ -129,6 +179,7 @@
       })
       .catch(function () { setStatus("off"); });
   }
+  __log("جاري الاتصال بالخادم…");
   ping();
   setInterval(ping, 3000);
 
@@ -182,10 +233,13 @@
 
   // ── Camera ──
   if (!window.isSecureContext || !navigator.mediaDevices) {
-    $("camera-msg").textContent = "المتصفح لم يسمح بالكاميرا لأن الاتصال غير آمن. افتح الرابط https كما في رمز QR، أو اكتب الباركود يدوياً.";
-    $("camera-msg").hidden = false;
+    __error("المتصفح لم يسمح بالكاميرا لأن الاتصال غير آمن. افتح الرابط https كما في رمز QR، أو اكتب الباركود يدوياً.");
     $("reader").hidden = true;
     return;
+  }
+  if (typeof Html5Qrcode === "undefined") {
+    $("reader").hidden = true;
+    return; // the library's onerror already explained it; manual entry still works
   }
   var F = Html5QrcodeSupportedFormats;
   var scanner = new Html5Qrcode("reader", {
@@ -198,8 +252,8 @@
   function start() {
     if (running || starting) return;
     starting = true;
-    $("camera-msg").hidden = true;
     $("retry").hidden = true;
+    __log("يرجى السماح بصلاحية الكاميرا عندما يسألك المتصفح");
     scanner
       .start(
         { facingMode: "environment" },
@@ -207,13 +261,21 @@
         onCameraScan,
         function () { /* no code in this frame */ }
       )
-      .then(function () { running = true; })
+      .then(function () {
+        running = true;
+        __clearErrors(); // a camera problem fixed by "retry" should not stay on screen
+        __log("الكاميرا تعمل ✓ وجّهها إلى باركود العبوة", "ok");
+      })
       .catch(function (err) {
         var name = (err && err.name) || String(err);
-        $("camera-msg").textContent = /NotAllowed|Permission/i.test(name)
+        var text = /NotAllowed|Permission/i.test(name)
           ? "لم يُسمح باستخدام الكاميرا. اسمح بها من إعدادات المتصفح ثم اضغط «تشغيل الكاميرا من جديد»."
-          : "تعذّر تشغيل الكاميرا (" + name + "). يمكنك كتابة الباركود يدوياً.";
-        $("camera-msg").hidden = false;
+          : /NotFound|Overconstrained/i.test(name)
+            ? "لم يُعثر على كاميرا خلفية في هذا الجهاز. يمكنك كتابة الباركود يدوياً."
+            : /NotReadable|TrackStart/i.test(name)
+              ? "الكاميرا مستخدمة من تطبيق آخر. أغلقه ثم اضغط «تشغيل الكاميرا من جديد»."
+              : "تعذّر تشغيل الكاميرا (" + name + "). يمكنك كتابة الباركود يدوياً.";
+        __error(text);
         $("retry").hidden = false;
       })
       .then(function () { starting = false; });

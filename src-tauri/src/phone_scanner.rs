@@ -239,6 +239,98 @@ pub fn qr_svg(url: &str) -> Result<String, String> {
     Ok(code.render::<qrcode::render::svg::Color>().min_dimensions(240, 240).quiet_zone(true).build())
 }
 
+// ── Windows Firewall ──
+// Phones connect from the network, so Windows Firewall must let this program accept connections on PORT. Without a
+// rule it silently drops them (on a "Public" network by default) and the phone shows a blank page until it times out.
+
+pub const FIREWALL_RULE: &str = "Pharmacy POS phone scanner";
+
+#[derive(Clone, Copy, Serialize, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum FirewallState {
+    /// A rule allows this exact program on PORT.
+    Allowed,
+    /// No rule for this program: phones will not get through.
+    Missing,
+    /// Not Windows, or the firewall could not be queried.
+    Unknown,
+}
+
+#[cfg(windows)]
+fn hidden_command(program: &str) -> std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut c = std::process::Command::new(program);
+    c.creation_flags(CREATE_NO_WINDOW);
+    c
+}
+
+/// Looks for our rule and checks it points at the program that is running now (a dev build and the installed app live
+/// in different folders). The program path is compared, not netsh's wording, which depends on the Windows language.
+#[cfg(windows)]
+pub fn firewall_state() -> FirewallState {
+    let Ok(exe) = std::env::current_exe() else { return FirewallState::Unknown };
+    let out = hidden_command("netsh")
+        .args(["advfirewall", "firewall", "show", "rule", &format!("name={FIREWALL_RULE}"), "verbose"])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => {
+            let text = String::from_utf8_lossy(&o.stdout).to_lowercase();
+            if text.contains(&exe.display().to_string().to_lowercase()) {
+                FirewallState::Allowed
+            } else {
+                FirewallState::Missing
+            }
+        }
+        // netsh exits with 1 when no rule has that name.
+        Ok(_) => FirewallState::Missing,
+        Err(_) => FirewallState::Unknown,
+    }
+}
+
+#[cfg(not(windows))]
+pub fn firewall_state() -> FirewallState {
+    FirewallState::Unknown
+}
+
+/// The elevated command that (re)creates the rule: this program only, TCP PORT only, any network profile.
+#[cfg(windows)]
+fn firewall_script(exe: &Path) -> String {
+    let exe = exe.display().to_string();
+    let cmd = format!(
+        "/c netsh advfirewall firewall delete rule name=\"{FIREWALL_RULE}\" & \
+         netsh advfirewall firewall add rule name=\"{FIREWALL_RULE}\" dir=in action=allow protocol=TCP \
+         localport={PORT} program=\"{exe}\" profile=any"
+    );
+    // A PowerShell single-quoted string: a quote inside it is written twice.
+    format!(
+        "$p = Start-Process -FilePath 'cmd.exe' -Verb RunAs -Wait -PassThru -WindowStyle Hidden -ArgumentList '{}'; exit $p.ExitCode",
+        cmd.replace('\'', "''")
+    )
+}
+
+/// Adds the rule. Windows asks the user to confirm as administrator; returns an error if they decline.
+#[cfg(windows)]
+pub fn allow_through_firewall() -> Result<FirewallState, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let status = hidden_command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &firewall_script(&exe)])
+        .status()
+        .map_err(|e| format!("تعذّر تشغيل أداة جدار الحماية: {e}"))?;
+    if !status.success() {
+        return Err("لم تتم الموافقة على تعديل جدار الحماية".into());
+    }
+    match firewall_state() {
+        FirewallState::Allowed => Ok(FirewallState::Allowed),
+        _ => Err("لم يُضف الاستثناء إلى جدار الحماية".into()),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn allow_through_firewall() -> Result<FirewallState, String> {
+    Err("هذا الإعداد متاح في ويندوز فقط".into())
+}
+
 /// Starts the server in the background. Failures (port taken, certificate) end up in `scanner.status`; the rest of
 /// the app keeps working without the phone scanner.
 pub fn start(data_dir: std::path::PathBuf, scanner: Arc<Scanner>) {
@@ -372,6 +464,18 @@ mod tests {
         let (cert3, _) = load_or_create_cert(&dir, &[b]).unwrap();
         assert_ne!(cert1, cert3, "new address: new certificate naming it");
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn firewall_rule_is_scoped_to_this_program_and_port() {
+        let script = firewall_script(Path::new(r"C:\Program Files\PharmacyPOS\pharmacy-pos.exe"));
+        assert!(script.contains(r#"program="C:\Program Files\PharmacyPOS\pharmacy-pos.exe""#), "{script}");
+        assert!(script.contains("localport=8080") && script.contains("protocol=TCP") && script.contains("dir=in"));
+        assert!(script.contains("-Verb RunAs"), "needs the administrator prompt");
+        // A quote in the path cannot break out of the PowerShell string.
+        let odd = firewall_script(Path::new(r"C:\Users\O'Neil\pos.exe"));
+        assert!(odd.contains(r"O''Neil") && !odd.contains(r"O'Neil"));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { PhoneScannerInfo } from "../core/types.ts";
+import type { FirewallState, PhoneScannerInfo } from "../core/types.ts";
 import { repo } from "../data/index.ts";
 import { errorText, Modal } from "../ui/Modal.tsx";
 
@@ -7,6 +7,26 @@ import { errorText, Modal } from "../ui/Modal.tsx";
 export function PhoneScannerDialog({ onClose }: { onClose: () => void }) {
   const [info, setInfo] = useState<PhoneScannerInfo | null | undefined>(undefined);
   const [error, setError] = useState("");
+  const [firewall, setFirewall] = useState<FirewallState>("unknown");
+  const [fixing, setFixing] = useState(false);
+  const [firewallError, setFirewallError] = useState(""); // separate: the 2 s refresh clears `error`
+
+  // Checked once on open (it starts a system tool), and again after the fix.
+  useEffect(() => {
+    repo.phoneScannerFirewall().then(setFirewall, () => {});
+  }, []);
+
+  async function allowFirewall() {
+    setFixing(true);
+    setFirewallError("");
+    try {
+      setFirewall(await repo.allowPhoneScannerFirewall());
+    } catch (e) {
+      setFirewallError(errorText(e));
+    } finally {
+      setFixing(false);
+    }
+  }
 
   useEffect(() => {
     let live = true;
@@ -33,6 +53,21 @@ export function PhoneScannerDialog({ onClose }: { onClose: () => void }) {
           </p>
         )}
         {info && info.error && <div role="alert" className="banner error"><span>{info.error}</span></div>}
+        {info && firewall === "missing" && (
+          <div role="alert" className="banner error firewall-banner">
+            <span>
+              <strong>جدار حماية ويندوز يمنع الموبايل من الوصول إلى البرنامج</strong>، فتظهر صفحة بيضاء على الموبايل. اسمح
+              للبرنامج باستقبال اتصالات قارئ الموبايل (المنفذ {info.port} فقط). سيطلب ويندوز موافقة المدير.
+              {firewallError && <strong className="firewall-error"> {firewallError}</strong>}
+            </span>
+            <button type="button" className="btn primary" disabled={fixing} onClick={() => void allowFirewall()}>
+              {fixing ? "بانتظار موافقة ويندوز…" : "السماح عبر جدار الحماية"}
+            </button>
+          </div>
+        )}
+        {info && firewall === "allowed" && !info.devices.length && (
+          <p className="muted small">جدار الحماية يسمح بالاتصال ✓</p>
+        )}
         {info && !info.error && (
           <div className="phone-grid">
             <div className="phone-qr">
@@ -55,8 +90,8 @@ export function PhoneScannerDialog({ onClose }: { onClose: () => void }) {
               </li>
               <li>اسمح للصفحة باستخدام الكاميرا، ثم وجّهها إلى باركود العبوة: يُضاف الصنف إلى الفاتورة هنا مباشرة.</li>
               <li className="muted">
-                إن طلب Windows السماح للبرنامج بالوصول للشبكة فاختر «الشبكات الخاصة». الرابط صالح حتى إغلاق البرنامج؛ بعد
-                إعادة تشغيله امسح الرمز من جديد.
+                إن بقيت صفحة الموبايل بيضاء: تأكد أن الجهازين على الشبكة نفسها (ليست شبكة ضيوف)، وأن جدار الحماية يسمح
+                بالاتصال. الرابط صالح حتى إغلاق البرنامج؛ بعد إعادة تشغيله امسح الرمز من جديد.
               </li>
             </ol>
           </div>

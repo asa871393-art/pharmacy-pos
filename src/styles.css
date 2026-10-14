@@ -288,3 +288,5 @@ button.module:hover:not(.active) { background: #24413b; color: #fff; }
 .paper-frame { background: #e9ece9; border-radius: 10px; padding: 12px; max-height: 60vh; overflow: auto; display: flex; justify-content: center; }
 .paper-frame .receipt-print { box-shadow: 0 2px 10px rgb(16 32 29 / 0.18); }
 @media (max-width: 900px) { .history-grid { grid-template-columns: 1fr; } }
+.firewall-banner { margin: 0; align-items: center; }
+.firewall-banner .btn { white-space: nowrap; }
