@@ -21,6 +21,7 @@ pub struct Session(pub Mutex<Option<String>>);
 const INIT_SQL: &str = include_str!("../migrations/0001_init.sql");
 const SALE_CONTROLS_SQL: &str = include_str!("../migrations/0002_sale_controls.sql");
 const USER_PERMISSIONS_SQL: &str = include_str!("../migrations/0003_user_permissions.sql");
+const RECEIPT_SETTINGS_SQL: &str = include_str!("../migrations/0004_receipt_settings.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -43,6 +44,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(USER_PERMISSIONS_SQL)?;
         tx.execute_batch("PRAGMA user_version = 3;")?;
+        tx.commit()?;
+    }
+    if version < 4 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(RECEIPT_SETTINGS_SQL)?;
+        tx.execute_batch("PRAGMA user_version = 4;")?;
         tx.commit()?;
     }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
@@ -2401,6 +2408,298 @@ fn reset_user_password(
     reset_user_password_inner(&mut conn, &admin_id, &user_id, &password)
 }
 
+// ── Receipts ──
+// Receipts are built from the saved sale, never from what the screen still shows, so a reprint matches the record.
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptSettings {
+    name: String,
+    address: String,
+    phone: String,
+    footer: String,
+    /// "80" or "58" (mm thermal roll) or "a4".
+    paper: String,
+}
+
+fn setting(conn: &Connection, key: &str) -> Result<String, String> {
+    conn.query_row("SELECT value FROM settings WHERE key = ?1", params![key], |r| r.get(0))
+        .optional()
+        .map_err(err)
+        .map(Option::unwrap_or_default)
+}
+
+fn receipt_settings_inner(conn: &Connection) -> Result<ReceiptSettings, String> {
+    Ok(ReceiptSettings {
+        name: setting(conn, "receipt_name")?,
+        address: setting(conn, "receipt_address")?,
+        phone: setting(conn, "receipt_phone")?,
+        footer: setting(conn, "receipt_footer")?,
+        paper: setting(conn, "receipt_paper")?,
+    })
+}
+
+#[tauri::command]
+fn receipt_settings(db: State<'_, Db>, session: State<'_, Session>) -> Result<ReceiptSettings, String> {
+    session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    receipt_settings_inner(&conn)
+}
+
+fn save_receipt_settings_inner(conn: &mut Connection, user_id: &str, s: ReceiptSettings) -> Result<ReceiptSettings, String> {
+    let tx = conn.transaction().map_err(err)?;
+    require_admin(&tx, user_id)?;
+    let s = ReceiptSettings {
+        name: s.name.trim().to_string(),
+        address: s.address.trim().to_string(),
+        phone: s.phone.trim().to_string(),
+        footer: s.footer.trim().to_string(),
+        paper: s.paper,
+    };
+    if s.name.is_empty() {
+        return Err("اسم الصيدلية مطلوب".into());
+    }
+    let too_long = [(&s.name, 60), (&s.address, 120), (&s.phone, 40), (&s.footer, 200)]
+        .iter()
+        .any(|(v, max)| v.chars().count() > *max);
+    if too_long {
+        return Err("نص طويل جداً لعرض الإيصال".into());
+    }
+    if !matches!(s.paper.as_str(), "80" | "58" | "a4") {
+        return Err("مقاس الورق غير معروف".into());
+    }
+    let before = receipt_settings_inner(&tx)?;
+    for (key, value) in [
+        ("receipt_name", &s.name),
+        ("receipt_address", &s.address),
+        ("receipt_phone", &s.phone),
+        ("receipt_footer", &s.footer),
+        ("receipt_paper", &s.paper),
+    ] {
+        tx.execute(
+            "INSERT INTO settings(key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )
+        .map_err(err)?;
+    }
+    let now = utc_now(&tx)?;
+    let payload = serde_json::json!({ "from": before, "to": s }).to_string();
+    append_audit(&tx, user_id, "settings.receipt", "settings", "receipt", &payload, &now).map_err(err)?;
+    tx.commit().map_err(err)?;
+    Ok(s)
+}
+
+#[tauri::command]
+fn save_receipt_settings(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    settings: ReceiptSettings,
+) -> Result<ReceiptSettings, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    save_receipt_settings_inner(&mut conn, &user_id, settings)
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptLine {
+    name: String,
+    qty: i64,
+    unit_price: i64,
+    discount: i64,
+    total: i64,
+    /// Batch numbers the units came from, e.g. "PX0921، PX1104".
+    batches: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptPayment {
+    method: String,
+    amount: i64,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ReceiptRx {
+    rx_no: String,
+    prescriber: String,
+    pharmacist: Option<String>,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Receipt {
+    sale_id: String,
+    invoice_no: String,
+    /// Local "YYYY-MM-DD HH:MM".
+    sold_at: String,
+    cashier: Option<String>,
+    lines: Vec<ReceiptLine>,
+    subtotal: i64,
+    discount: i64,
+    total: i64,
+    payments: Vec<ReceiptPayment>,
+    /// Cash handed over (cash applied + change); 0 when nothing was paid in cash.
+    cash_tendered: i64,
+    change: i64,
+    prescription: Option<ReceiptRx>,
+    /// A reprint, marked "نسخة" on paper.
+    copy: bool,
+    settings: ReceiptSettings,
+}
+
+/// Cashiers see their own sales; anyone with `view_reports` (and admins) sees all.
+fn may_see_sale(conn: &Connection, user_id: &str, sale_cashier: Option<&str>) -> Result<bool, String> {
+    let role = active_role(conn, user_id)?;
+    Ok(sale_cashier == Some(user_id) || has_permission(conn, user_id, &role, "view_reports")?)
+}
+
+fn sale_receipt_inner(conn: &mut Connection, user_id: &str, sale_id: &str, reprint: bool) -> Result<Receipt, String> {
+    let tx = conn.transaction().map_err(err)?;
+    type Head = (String, String, Option<String>, Option<String>, i64, i64, i64, i64);
+    let head: Head = tx
+        .query_row(
+            "SELECT s.invoice_no, strftime('%Y-%m-%d %H:%M', s.created_at, 'localtime'), s.cashier_id,
+                    (SELECT full_name FROM users WHERE id = s.cashier_id), s.subtotal, s.discount_total, s.total, s.change_given
+             FROM sales s WHERE s.id = ?1",
+            params![sale_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+        )
+        .optional()
+        .map_err(err)?
+        .ok_or("الفاتورة غير موجودة")?;
+    let (invoice_no, sold_at, cashier_id, cashier, subtotal, discount, total, change) = head;
+    if !may_see_sale(&tx, user_id, cashier_id.as_deref())? {
+        return Err("لا يمكنك طباعة فاتورة كاشير آخر".into());
+    }
+
+    // One line per product; a product sold from two batches is one line with both batch numbers.
+    let mut stmt = tx
+        .prepare(
+            "SELECT p.trade_name, SUM(si.qty), si.unit_price, SUM(si.discount), SUM(si.line_total),
+                    group_concat(b.batch_no, '، ')
+             FROM sale_items si JOIN products p ON p.id = si.product_id JOIN batches b ON b.id = si.batch_id
+             WHERE si.sale_id = ?1 GROUP BY si.product_id ORDER BY MIN(si.rowid)",
+        )
+        .map_err(err)?;
+    let lines = stmt
+        .query_map(params![sale_id], |r| {
+            Ok(ReceiptLine {
+                name: r.get(0)?,
+                qty: r.get(1)?,
+                unit_price: r.get(2)?,
+                discount: r.get(3)?,
+                total: r.get(4)?,
+                batches: r.get(5)?,
+            })
+        })
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    drop(stmt);
+    let mut stmt = tx.prepare("SELECT method, amount FROM payments WHERE sale_id = ?1 ORDER BY rowid").map_err(err)?;
+    let payments = stmt
+        .query_map(params![sale_id], |r| Ok(ReceiptPayment { method: r.get(0)?, amount: r.get(1)? }))
+        .map_err(err)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(err)?;
+    drop(stmt);
+    let cash: i64 = payments.iter().filter(|p| p.method == "cash").map(|p| p.amount).sum();
+    let prescription = tx
+        .query_row(
+            "SELECT sp.rx_no, sp.prescriber, (SELECT full_name FROM users WHERE id = sp.verified_by)
+             FROM sale_prescriptions sp WHERE sp.sale_id = ?1",
+            params![sale_id],
+            |r| Ok(ReceiptRx { rx_no: r.get(0)?, prescriber: r.get(1)?, pharmacist: r.get(2)? }),
+        )
+        .optional()
+        .map_err(err)?;
+    if reprint {
+        let now = utc_now(&tx)?;
+        let payload = serde_json::json!({ "invoiceNo": invoice_no }).to_string();
+        append_audit(&tx, user_id, "receipt.reprint", "sales", sale_id, &payload, &now).map_err(err)?;
+    }
+    let settings = receipt_settings_inner(&tx)?;
+    tx.commit().map_err(err)?;
+    Ok(Receipt {
+        sale_id: sale_id.to_string(),
+        invoice_no,
+        sold_at,
+        cashier,
+        lines,
+        subtotal,
+        discount,
+        total,
+        cash_tendered: if cash > 0 || change > 0 { cash + change } else { 0 },
+        payments,
+        change,
+        prescription,
+        copy: reprint,
+        settings,
+    })
+}
+
+#[tauri::command]
+fn sale_receipt(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    sale_id: String,
+    reprint: bool,
+) -> Result<Receipt, String> {
+    let user_id = session_user(&session)?;
+    let mut conn = db.0.lock().map_err(err)?;
+    sale_receipt_inner(&mut conn, &user_id, &sale_id, reprint)
+}
+
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentSale {
+    sale_id: String,
+    invoice_no: String,
+    /// Local "HH:MM".
+    time: String,
+    cashier: Option<String>,
+    items: i64,
+    total: i64,
+}
+
+/// Today's sales, newest first: the user's own, or everyone's for users with `view_reports`.
+fn recent_sales_inner(conn: &Connection, user_id: &str) -> Result<Vec<RecentSale>, String> {
+    let role = active_role(conn, user_id)?;
+    let all = has_permission(conn, user_id, &role, "view_reports")?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT s.id, s.invoice_no, strftime('%H:%M', s.created_at, 'localtime'),
+                    (SELECT full_name FROM users WHERE id = s.cashier_id),
+                    (SELECT COALESCE(SUM(qty), 0) FROM sale_items WHERE sale_id = s.id), s.total
+             FROM sales s
+             WHERE date(s.created_at, 'localtime') = date('now', 'localtime') AND (?1 OR s.cashier_id = ?2)
+             ORDER BY s.created_at DESC LIMIT 100",
+        )
+        .map_err(err)?;
+    let rows = stmt
+        .query_map(params![all, user_id], |r| {
+            Ok(RecentSale {
+                sale_id: r.get(0)?,
+                invoice_no: r.get(1)?,
+                time: r.get(2)?,
+                cashier: r.get(3)?,
+                items: r.get(4)?,
+                total: r.get(5)?,
+            })
+        })
+        .map_err(err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(err)
+}
+
+#[tauri::command]
+fn recent_sales(db: State<'_, Db>, session: State<'_, Session>) -> Result<Vec<RecentSale>, String> {
+    let user_id = session_user(&session)?;
+    let conn = db.0.lock().map_err(err)?;
+    recent_sales_inner(&conn, &user_id)
+}
+
 // ── Phone scanner ──
 
 /// The computer's address on the local network (e.g. 192.168.1.20).
@@ -2507,7 +2806,11 @@ pub fn run() {
             toggle_user_status,
             reset_user_password,
             get_local_ip,
-            phone_scanner_info
+            phone_scanner_info,
+            receipt_settings,
+            save_receipt_settings,
+            sale_receipt,
+            recent_sales
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -2864,7 +3167,7 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, 4);
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
@@ -3586,5 +3889,85 @@ mod tests {
             conn.query_row("SELECT payload FROM audit_log WHERE action = 'user.password_reset'", [], |r| r.get(0)).unwrap();
         assert_eq!(payload, "{}");
         assert!(reset_user_password_inner(&mut conn, ADMIN, "u-ghost", "new-secret-99").is_err());
+    }
+
+    // ── Receipts ──
+
+    #[test]
+    fn receipt_matches_the_saved_sale() {
+        let mut conn = db();
+        add_user(&conn, "u-ph", "pharmacist");
+        // 30 Panadol Extra from two batches (line discount 500), one Augmentin with a prescription, invoice discount 1,000.
+        let px = SaleLineIn { discount: 500, ..line("p-panadol-extra", 3000, &[("b-px-0921", 24), ("b-px-1104", 6)]) };
+        let mut d = cash_sale(vec![px, augmentin()], 120_000);
+        d.invoice_discount = 1000;
+        d.payments = vec![
+            PaymentIn { method: "card".into(), amount: 50_000, reference: None },
+            PaymentIn { method: "cash".into(), amount: 60_000, reference: None },
+        ];
+        let sale = post_sale_inner(&mut conn, "u-ph", d).unwrap();
+        let r = sale_receipt_inner(&mut conn, "u-ph", &sale.sale_id, false).unwrap();
+
+        assert_eq!(r.invoice_no, sale.invoice_no);
+        assert_eq!(r.cashier.as_deref(), Some("u-ph"));
+        assert_eq!(r.lines.len(), 2, "one line per product");
+        let p = &r.lines[0];
+        assert_eq!((p.name.as_str(), p.qty, p.unit_price, p.discount), ("Panadol Extra", 30, 3000, 500));
+        assert_eq!((p.total, p.batches.as_str()), (89_500, "PX0921، PX1104"));
+        assert_eq!((r.subtotal, r.discount, r.total), (108_500, 1500, 107_000));
+        // Card covers 50,000 first; cash pays the remaining 57,000 out of 60,000.
+        let paid: Vec<_> = r.payments.iter().map(|x| (x.method.as_str(), x.amount)).collect();
+        assert_eq!(paid, [("card", 50_000), ("cash", 57_000)]);
+        assert_eq!((r.cash_tendered, r.change), (60_000, 3_000));
+        let rx = r.prescription.as_ref().unwrap();
+        assert_eq!((rx.rx_no.as_str(), rx.prescriber.as_str(), rx.pharmacist.as_deref()), ("RX-1", "د. علي", Some("u-ph")));
+        assert!(!r.copy);
+        assert_eq!(r.settings.name, "نظام الصيدلية");
+        assert_eq!(r.settings.paper, "80");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'receipt.reprint'"), 0);
+    }
+
+    #[test]
+    fn reprints_are_marked_logged_and_limited_to_your_own_sales() {
+        let mut conn = db();
+        add_user(&conn, "u-cash", "cashier");
+        add_user(&conn, "u-cash2", "cashier");
+        let mine = post_sale_inner(&mut conn, "u-cash", cash_sale(vec![brufen(1, 0)], 5000)).unwrap();
+        let r = sale_receipt_inner(&mut conn, "u-cash", &mine.sale_id, true).unwrap();
+        assert!(r.copy);
+        assert_eq!((r.cash_tendered, r.change, r.prescription.is_none()), (5000, 1500, true));
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'receipt.reprint'"), 1);
+
+        let e = sale_receipt_inner(&mut conn, "u-cash2", &mine.sale_id, true).unwrap_err();
+        assert!(e.contains("كاشير آخر"), "{e}");
+        assert!(sale_receipt_inner(&mut conn, ADMIN, &mine.sale_id, true).is_ok(), "managers reprint anyone's");
+        assert!(sale_receipt_inner(&mut conn, ADMIN, "s-nope", false).unwrap_err().contains("غير موجودة"));
+
+        assert_eq!(recent_sales_inner(&conn, "u-cash").unwrap().len(), 1);
+        assert!(recent_sales_inner(&conn, "u-cash2").unwrap().is_empty(), "cashiers see only their own");
+        let all = recent_sales_inner(&conn, ADMIN).unwrap();
+        assert_eq!((all.len(), all[0].items, all[0].total), (1, 1, 3500));
+    }
+
+    #[test]
+    fn receipt_settings_are_admin_only_and_validated() {
+        let mut conn = admin_db();
+        add_user(&conn, "u-ph", "pharmacist");
+        let s = ReceiptSettings {
+            name: " صيدلية الشفاء ".into(),
+            address: "بغداد — الكرادة".into(),
+            phone: "0770 000 0000".into(),
+            footer: "شفاكم الله".into(),
+            paper: "58".into(),
+        };
+        assert!(save_receipt_settings_inner(&mut conn, "u-ph", s.clone()).unwrap_err().contains("للمدير"));
+        let saved = save_receipt_settings_inner(&mut conn, ADMIN, s.clone()).unwrap();
+        assert_eq!(saved.name, "صيدلية الشفاء");
+        assert_eq!(receipt_settings_inner(&conn).unwrap(), saved);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM audit_log WHERE action = 'settings.receipt'"), 1);
+        let bad_paper = ReceiptSettings { paper: "A3".into(), ..s.clone() };
+        assert!(save_receipt_settings_inner(&mut conn, ADMIN, bad_paper).unwrap_err().contains("الورق"));
+        let no_name = ReceiptSettings { name: " ".into(), ..s };
+        assert!(save_receipt_settings_inner(&mut conn, ADMIN, no_name).unwrap_err().contains("مطلوب"));
     }
 }

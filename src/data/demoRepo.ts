@@ -17,6 +17,9 @@ import {
   type PurchaseInvoice,
   type PrescriberRow,
   type PurchaseResult,
+  type Receipt,
+  type ReceiptSettings,
+  type RecentSale,
   type ProductHit,
   type ReceiveBatchInput,
   type ReorderRow,
@@ -71,8 +74,25 @@ interface DemoSale {
   day: string;
   soldAt: string;
   invoiceDiscount: number;
-  lines: { productId: string; qty: number; unitPrice: number; cost: number; discount: number }[];
+  lines: { productId: string; qty: number; unitPrice: number; cost: number; discount: number; batches: string }[];
   prescription: { rxNo: string; prescriber: string; verifiedBy: string } | null;
+  total: number;
+  // What each method actually covered (card and credit first, then cash), and the change.
+  payments: { method: "cash" | "card" | "credit"; amount: number }[];
+  change: number;
+}
+
+// Same order as post_sale: card and credit are capped at what is owed, cash goes last and may give change.
+function applyPayments(total: number, payments: { method: "cash" | "card" | "credit"; amount: number }[]) {
+  let remaining = total;
+  const applied: DemoSale["payments"] = [];
+  const ordered = payments.filter((p) => p.amount > 0).sort((a, b) => Number(a.method === "cash") - Number(b.method === "cash"));
+  for (const p of ordered) {
+    const take = Math.min(p.amount, remaining);
+    remaining -= take;
+    if (take > 0) applied.push({ method: p.method, amount: take });
+  }
+  return applied;
 }
 
 interface DemoWriteOff {
@@ -84,6 +104,15 @@ interface DemoWriteOff {
   reason: string;
   userId: string;
 }
+
+// Same defaults as migrations/0004_receipt_settings.sql.
+const receiptSettings: ReceiptSettings = {
+  name: "نظام الصيدلية",
+  address: "",
+  phone: "",
+  footer: "شكراً لزيارتكم · الأدوية لا تُرد بعد فتح العبوة",
+  paper: "80",
+};
 
 // Same suppliers as demo_seed.sql.
 const suppliers: Supplier[] = [
@@ -470,8 +499,12 @@ export function createDemoRepo(): PharmacyRepo {
           unitPrice: l.unitPrice,
           cost: costOf(l),
           discount: l.discount,
+          batches: l.allocations.map((a) => a.batchNo).join("، "),
         })),
         prescription: needsRx ? { ...draft.prescription!, verifiedBy: user.id } : null,
+        total: totals.total,
+        payments: applyPayments(totals.total, draft.payments),
+        change: s.change,
       });
       for (const l of draft.lines) for (const a of l.allocations) batches.find((x) => x.id === a.batchId)!.qtyOnHand -= a.qty;
       return {
@@ -845,6 +878,79 @@ export function createDemoRepo(): PharmacyRepo {
     },
     async onPhoneScan() {
       return () => {};
+    },
+
+    // Receipts: same rules as the receipt commands in src-tauri/src/lib.rs.
+    async receiptSettings() {
+      if (!signedIn()) throw new Error("سجّل الدخول أولاً");
+      return { ...receiptSettings };
+    },
+    async saveReceiptSettings(s: ReceiptSettings) {
+      requireAdmin();
+      const next = { name: s.name.trim(), address: s.address.trim(), phone: s.phone.trim(), footer: s.footer.trim(), paper: s.paper };
+      if (!next.name) throw new Error("اسم الصيدلية مطلوب");
+      if ([...next.name].length > 60 || [...next.address].length > 120 || [...next.phone].length > 40 || [...next.footer].length > 200) {
+        throw new Error("نص طويل جداً لعرض الإيصال");
+      }
+      if (!["80", "58", "a4"].includes(next.paper)) throw new Error("مقاس الورق غير معروف");
+      Object.assign(receiptSettings, next);
+      return { ...receiptSettings };
+    },
+    async saleReceipt(saleId: string, reprint: boolean): Promise<Receipt> {
+      const me = signedIn();
+      if (!me) throw new Error("سجّل الدخول أولاً");
+      const s = sales.find((x) => x.id === saleId);
+      if (!s) throw new Error("الفاتورة غير موجودة");
+      if (s.cashierId !== me.id && !resolvePermissions(me.role, me.overrides).viewReports) {
+        throw new Error("لا يمكنك طباعة فاتورة كاشير آخر");
+      }
+      const subtotal = s.lines.reduce((sum, l) => sum + l.qty * l.unitPrice, 0);
+      const cash = s.payments.filter((p) => p.method === "cash").reduce((sum, p) => sum + p.amount, 0);
+      return {
+        saleId: s.id,
+        invoiceNo: s.invoiceNo,
+        soldAt: new Date(s.soldAt).toLocaleString("sv-SE").slice(0, 16),
+        cashier: users.find((u) => u.id === s.cashierId)?.fullName ?? null,
+        lines: s.lines.map((l) => ({
+          name: productById(l.productId).tradeName,
+          qty: l.qty,
+          unitPrice: l.unitPrice,
+          discount: l.discount,
+          total: l.qty * l.unitPrice - l.discount,
+          batches: l.batches,
+        })),
+        subtotal,
+        discount: subtotal - s.total,
+        total: s.total,
+        payments: s.payments,
+        cashTendered: cash > 0 || s.change > 0 ? cash + s.change : 0,
+        change: s.change,
+        prescription: s.prescription
+          ? {
+              rxNo: s.prescription.rxNo,
+              prescriber: s.prescription.prescriber,
+              pharmacist: users.find((u) => u.id === s.prescription!.verifiedBy)?.fullName ?? null,
+            }
+          : null,
+        copy: reprint,
+        settings: { ...receiptSettings },
+      };
+    },
+    async recentSales(): Promise<RecentSale[]> {
+      const me = signedIn();
+      if (!me) throw new Error("سجّل الدخول أولاً");
+      const all = resolvePermissions(me.role, me.overrides).viewReports;
+      return sales
+        .filter((s) => s.day === today && (all || s.cashierId === me.id))
+        .map((s) => ({
+          saleId: s.id,
+          invoiceNo: s.invoiceNo,
+          time: new Date(s.soldAt).toTimeString().slice(0, 5),
+          cashier: users.find((u) => u.id === s.cashierId)?.fullName ?? null,
+          items: s.lines.reduce((sum, l) => sum + l.qty, 0),
+          total: s.total,
+        }))
+        .reverse();
     },
   };
 }

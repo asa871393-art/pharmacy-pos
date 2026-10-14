@@ -1,0 +1,54 @@
+/* Printing. Two kinds of printout, chosen by a class on <body> for the length of the print dialog:
+   body.printing-receipt — the receipt in .print-host only (thermal 80/58 mm or A4; the page size is set by PrintHost);
+   body.printing-report  — the open report on A4 (ReportsScreen). */
+
+/* ── Receipt layout (screen preview and print) ── */
+.receipt-print { background: #fff; color: #000; font-family: "Segoe UI", Tahoma, "Noto Sans Arabic", sans-serif; line-height: 1.35; }
+.receipt-print.paper-80 { width: 80mm; padding: 3mm 4mm; font-size: 10.5pt; }
+.receipt-print.paper-58 { width: 58mm; padding: 2mm 3mm; font-size: 9pt; }
+.receipt-print.paper-a4 { width: 150mm; padding: 6mm; font-size: 11pt; margin: 0 auto; }
+.receipt-print .r-center { text-align: center; }
+.receipt-print .r-title { font-size: 1.35em; font-weight: 700; }
+.receipt-print .r-copy { display: inline-block; margin-top: 2px; border: 1.5px solid #000; padding: 0 8px; font-weight: 700; }
+.receipt-print .r-strong { font-weight: 700; }
+.receipt-print .r-small { font-size: 0.85em; }
+.receipt-print .r-rule { border-top: 1px dashed #000; margin: 1.5mm 0; }
+.receipt-print .r-row { display: flex; justify-content: space-between; gap: 2mm; }
+.receipt-print .r-total { font-size: 1.25em; font-weight: 700; }
+.receipt-print .r-items { width: 100%; border-collapse: collapse; }
+.receipt-print .r-items th { font-weight: 700; font-size: 0.85em; text-align: start; border-bottom: 1px solid #000; padding: 0 0 1mm; }
+.receipt-print .r-items td { vertical-align: top; padding: 1mm 0; }
+.receipt-print .r-items th + th, .receipt-print .r-items .r-num { text-align: end; padding-inline-start: 1.5mm; white-space: nowrap; }
+.receipt-print .r-num { font-variant-numeric: tabular-nums; }
+.receipt-print .r-barcode { display: block; width: 100%; height: 11mm; margin: 2mm 0 0.5mm; }
+.receipt-print bdi { unicode-bidi: isolate; }
+
+/* Laid out off-screen so PrintHost can measure the receipt's length; never visible on screen. */
+.print-host { position: fixed; top: 0; left: -10000px; visibility: hidden; pointer-events: none; }
+
+@media print {
+  /* ── Receipt ── */
+  body.printing-receipt > #root > *:not(.print-host) { display: none !important; }
+  html:has(> body.printing-receipt), body.printing-receipt { background: #fff; margin: 0; }
+  body.printing-receipt .print-host { position: static; visibility: visible; }
+  body.printing-receipt .receipt-print { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+
+  /* ── Report ── */
+  @page report { size: A4; margin: 12mm; }
+  body.printing-report * { visibility: visible; }
+  body.printing-report .topbar,
+  body.printing-report .no-print,
+  body.printing-report .print-host { display: none !important; }
+  body.printing-report .rep { page: report; padding: 0; }
+  body.printing-report .rep-panel { border: 0; }
+  body.printing-report .rep-body { padding: 0; }
+  body.printing-report .table-wrap { overflow: visible; }
+  body.printing-report .print-only { display: block; }
+  body.printing-report .tile.hero { background: none; }
+  body.printing-report .rep-section { break-inside: avoid; }
+  .rep-print-head h1 { font-size: 16pt; margin: 0 0 4px; }
+  .rep-print-head { font-size: 10pt; color: #333; border-bottom: 1px solid #999; padding-bottom: 6px; }
+
+  /* Printing without either class (e.g. Ctrl+P) prints nothing rather than the whole screen. */
+  body:not(.printing-receipt):not(.printing-report) > #root { display: none; }
+}

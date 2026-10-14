@@ -17,6 +17,9 @@ import type {
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
+  Receipt,
+  ReceiptSettings,
+  RecentSale,
   ReceiveBatchInput,
   ReorderRow,
   ReportFilter,
@@ -67,4 +70,8 @@ export const tauriRepo: PharmacyRepo = {
   resetUserPassword: (userId: string, password: string) => invoke<UserRow>("reset_user_password", { userId, password }),
   phoneScanner: () => invoke<PhoneScannerInfo>("phone_scanner_info"),
   onPhoneScan: (handler: (scan: PhoneScan) => void) => listen<PhoneScan>("phone-barcode-scanned", (e) => handler(e.payload)),
+  receiptSettings: () => invoke<ReceiptSettings>("receipt_settings"),
+  saveReceiptSettings: (settings: ReceiptSettings) => invoke<ReceiptSettings>("save_receipt_settings", { settings }),
+  saleReceipt: (saleId: string, reprint: boolean) => invoke<Receipt>("sale_receipt", { saleId, reprint }),
+  recentSales: () => invoke<RecentSale[]>("recent_sales"),
 };

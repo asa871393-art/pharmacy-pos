@@ -15,6 +15,9 @@ import type {
   ProductHit,
   PurchaseInvoice,
   PurchaseResult,
+  Receipt,
+  ReceiptSettings,
+  RecentSale,
   ReceiveBatchInput,
   ReorderRow,
   ReportFilter,
@@ -77,6 +80,14 @@ export interface PharmacyRepo {
   phoneScanner(): Promise<PhoneScannerInfo | null>;
   /** Calls `handler` for every barcode scanned on a paired phone; returns a function that stops listening. */
   onPhoneScan(handler: (scan: PhoneScan) => void): Promise<() => void>;
+  // Receipts.
+  receiptSettings(): Promise<ReceiptSettings>;
+  /** Admin only. */
+  saveReceiptSettings(settings: ReceiptSettings): Promise<ReceiptSettings>;
+  /** `reprint` marks the receipt as a copy and records it in the audit log. Cashiers get only their own sales. */
+  saleReceipt(saleId: string, reprint: boolean): Promise<Receipt>;
+  /** Today's sales, newest first (cashiers: their own). */
+  recentSales(): Promise<RecentSale[]>;
 }
 
 export function localToday(): string {

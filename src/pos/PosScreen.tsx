@@ -2,11 +2,12 @@ import { useEffect, useRef, useState, type KeyboardEvent as ReactKeyboardEvent }
 import { allocateFefo, InsufficientStockError } from "../core/fefo.ts";
 import { gtinLookupKeys, looksLikeScan, parseScan } from "../core/gs1.ts";
 import { computeTotals, formatIqd, settle, type PaymentInput } from "../core/totals.ts";
-import type { Allocation, Batch, ProductHit, SaleResult, SearchMode } from "../core/types.ts";
+import type { Allocation, Batch, ProductHit, Receipt, SaleResult, SearchMode } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "./ExpiryTag.tsx";
 import { PhoneScannerDialog } from "./PhoneScannerDialog.tsx";
-import { Receipt, type ReceiptLine } from "./Receipt.tsx";
+import { requestPrint } from "../components/PrintHost.tsx";
+import { RecentSalesDialog } from "./RecentSalesDialog.tsx";
 
 interface CartLine {
   product: ProductHit;
@@ -63,7 +64,25 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
 
   const [message, setMessage] = useState<{ kind: "error" | "info"; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
-  const [lastSale, setLastSale] = useState<{ sale: SaleResult; lines: ReceiptLine[]; method: string } | null>(null);
+  // The receipt is loaded from the saved sale right after posting, so what prints is what was recorded.
+  const [lastSale, setLastSale] = useState<{ sale: SaleResult; receipt: Receipt | null } | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
+  // Per-till preference, so it lives in this browser's storage.
+  const [autoPrint, setAutoPrint] = useState(() => {
+    try {
+      return localStorage.getItem("pos.autoPrint") === "1";
+    } catch {
+      return false;
+    }
+  });
+  function toggleAutoPrint(on: boolean) {
+    setAutoPrint(on);
+    try {
+      localStorage.setItem("pos.autoPrint", on ? "1" : "0");
+    } catch {
+      // Not remembered; still applies until the app closes.
+    }
+  }
 
   // ── Search (typed text is debounced; scans are handled on Enter) ──
   useEffect(() => {
@@ -204,14 +223,14 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
         payments,
         prescription: needsRx ? { rxNo: rxNo.trim(), prescriber: prescriber.trim() } : undefined,
       });
-      const lines: ReceiptLine[] = cart.map((l) => ({
-        name: l.product.tradeName,
-        qty: l.qty,
-        unitPrice: l.product.price,
-        total: Math.max(0, l.product.price * l.qty - l.discount),
-        batches: l.allocations.map((a) => a.batchNo).join("، "),
-      }));
-      setLastSale({ sale, lines, method: PAY_LABEL[payMode] });
+      setLastSale({ sale, receipt: null });
+      repo.saleReceipt(sale.saleId, false).then(
+        (receipt) => {
+          setLastSale((cur) => (cur?.sale.saleId === sale.saleId ? { sale, receipt } : cur));
+          if (autoPrint) requestPrint(receipt);
+        },
+        (e) => setMessage({ kind: "error", text: `تم البيع، لكن تعذّر تجهيز الإيصال: ${e instanceof Error ? e.message : String(e)}` }),
+      );
       commitCart([]);
       setTendered("");
       setCardAmount("");
@@ -386,6 +405,9 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
         <div className="cart-head">
           <h2>فاتورة جديدة</h2>
           <span className="muted">{cart.length} صنف</span>
+          <button type="button" className="btn history-btn" onClick={() => setHistoryOpen(true)}>
+            فواتير اليوم
+          </button>
         </div>
         {message && (
           <div role={message.kind === "error" ? "alert" : "status"} className={`banner ${message.kind}`}>
@@ -406,8 +428,13 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
                 </>
               )}
             </span>
-            <button type="button" className="btn" onClick={() => window.print()}>
-              طباعة الإيصال
+            <button
+              type="button"
+              className="btn"
+              disabled={!lastSale.receipt}
+              onClick={() => lastSale.receipt && requestPrint(lastSale.receipt)}
+            >
+              طبع الفاتورة
             </button>
           </div>
         )}
@@ -560,6 +587,10 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
             {formatIqd(settlement.remaining > 0 ? settlement.remaining : settlement.change)}
           </bdi>
         </div>
+        <label className="check auto-print">
+          <input type="checkbox" checked={autoPrint} onChange={(e) => toggleAutoPrint(e.target.checked)} />
+          طباعة الفاتورة تلقائياً بعد البيع
+        </label>
         <button type="button" className="complete" disabled={!canComplete} onClick={() => void complete()}>
           {busy ? "جارٍ الحفظ…" : "إتمام البيع"} <kbd>F12</kbd>
         </button>
@@ -576,7 +607,7 @@ export function PosScreen({ visible = true, canDiscount = true }: { visible?: bo
         <span><kbd>Esc</kbd> مسح البحث</span>
       </footer>
 
-      {lastSale && <Receipt sale={lastSale.sale} lines={lastSale.lines} method={lastSale.method} />}
+      {historyOpen && <RecentSalesDialog onClose={() => setHistoryOpen(false)} />}
       {phoneOpen && <PhoneScannerDialog onClose={() => setPhoneOpen(false)} />}
     </main>
   );

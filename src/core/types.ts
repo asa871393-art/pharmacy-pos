@@ -345,3 +345,42 @@ export interface PhoneScan {
   code: string;
   device: string;
 }
+
+// ── Receipts ──
+
+export type ReceiptPaper = "80" | "58" | "a4";
+
+export interface ReceiptSettings {
+  name: string;
+  address: string;
+  phone: string;
+  footer: string;
+  paper: ReceiptPaper; // 80 or 58 mm thermal roll, or A4
+}
+
+/** Built from the saved sale, so a reprint matches the record. */
+export interface Receipt {
+  saleId: string;
+  invoiceNo: string;
+  soldAt: string; // local "YYYY-MM-DD HH:MM"
+  cashier: string | null;
+  lines: { name: string; qty: number; unitPrice: number; discount: number; total: number; batches: string }[];
+  subtotal: number;
+  discount: number;
+  total: number;
+  payments: { method: "cash" | "card" | "credit" | "insurance"; amount: number }[];
+  cashTendered: number; // cash handed over; 0 when nothing was paid in cash
+  change: number;
+  prescription: { rxNo: string; prescriber: string; pharmacist: string | null } | null;
+  copy: boolean; // a reprint
+  settings: ReceiptSettings;
+}
+
+export interface RecentSale {
+  saleId: string;
+  invoiceNo: string;
+  time: string; // local "HH:MM"
+  cashier: string | null;
+  items: number;
+  total: number;
+}
