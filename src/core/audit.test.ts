@@ -75,3 +75,14 @@ test("the week starts on Saturday", () => {
   assert.equal(weekStart("2026-10-16"), "2026-10-10"); // Friday
   assert.equal(weekStart("2026-03-01"), "2026-02-28"); // Sunday, across a month end
 });
+
+test("transfer and branch entries read as one line", () => {
+  const ship = JSON.stringify({ to: "فرع الكرادة", lines: [{ product: "Brufen", batchNo: "BR400", qty: 55 }, { product: "Brufen", batchNo: "LATE-1", qty: 5 }] });
+  assert.equal(auditSummary("transfer.ship", ship), "إلى فرع الكرادة · 60 وحدة · 1 صنف");
+  const receive = JSON.stringify({ from: "الفرع الرئيسي", lines: [{ product: "Brufen", batchNo: "BR400", qty: 10 }] });
+  assert.equal(auditSummary("transfer.receive", receive), "من الفرع الرئيسي · 10 وحدة · 1 صنف");
+  assert.equal(auditSummary("device.branch", JSON.stringify({ from: "الفرع الرئيسي", to: "فرع الكرادة" })), "من الفرع الرئيسي إلى فرع الكرادة");
+  assert.equal(auditActionLabel("transfer.request"), "طلب تحويل مخزون");
+  const update = JSON.stringify({ from: { code: "KR", name: "الكرادة", address: null }, to: { code: "KR", name: "الكرادة", address: "شارع ٦٢" } });
+  assert.equal(auditSummary("branch.update", update), "الكرادة · تغيير العنوان");
+});

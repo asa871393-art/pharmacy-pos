@@ -160,6 +160,58 @@ await page.waitForSelector(".audit-diff");
 await page.screenshot({ path: "screenshots/19-audit-entry.png" });
 await page.keyboard.press("Escape");
 
+// Branches: ship stock from the main branch to Karrada, move this device to Karrada at sign-in, receive it there
+await page.getByRole("button", { name: "المخزون", exact: true }).click();
+await page.getByRole("tab", { name: "التحويل بين الفروع" }).click();
+await page.getByRole("button", { name: "شحن إلى فرع" }).click();
+await page.selectOption("#tr-branch", "br-karrada");
+await page.selectOption("#tr-product", "p-brufen-400");
+await page.fill("#tr-qty", "10");
+await page.getByRole("button", { name: "إضافة", exact: true }).click();
+await page.screenshot({ path: "screenshots/20-transfer-ship.png" });
+await page.getByRole("button", { name: "شحن", exact: true }).click();
+await page.waitForSelector(".inv-panel .banner.success");
+await page.screenshot({ path: "screenshots/21-transfer-shipped.png" });
+
+await page.click(".logout");
+await page.waitForSelector("#login-branch");
+await page.fill("#login-user", "admin");
+await page.fill("#login-pass", "demo1234");
+await page.selectOption("#login-branch", "br-karrada");
+await page.screenshot({ path: "screenshots/22-login-branch.png" });
+await page.keyboard.press("Enter");
+await page.waitForFunction(() => document.querySelector(".branch-chip")?.textContent?.includes("فرع الكرادة"));
+await page.getByRole("button", { name: "المخزون", exact: true }).click();
+await page.getByRole("tab", { name: "التحويل بين الفروع" }).click();
+await page.locator(".inv-table tbody tr", { hasText: "وارد من الفرع الرئيسي" }).getByRole("button", { name: "استلام" }).click();
+await page.waitForSelector(".inv-panel .banner.success");
+await page.screenshot({ path: "screenshots/23-transfer-received.png" });
+
+// A request from Karrada to the main branch: nothing moves until the main branch ships it
+await page.getByRole("button", { name: "طلب مخزون من فرع" }).click();
+await page.selectOption("#tr-product", "p-panadol-extra");
+await page.fill("#tr-qty", "12");
+await page.getByRole("button", { name: "إضافة", exact: true }).click();
+await page.getByRole("button", { name: "إرسال الطلب" }).click();
+await page.waitForSelector(".inv-panel .banner.success");
+
+// Reports across branches
+await page.getByRole("button", { name: "التقارير", exact: true }).click();
+await page.getByRole("tab", { name: "المبيعات والأرباح" }).click();
+await page.waitForSelector(".rep .tile.hero");
+await page.locator(".rep-filters select").first().selectOption("");
+await page.waitForSelector(".rep .tile.hero");
+await page.screenshot({ path: "screenshots/24-report-all-branches.png" });
+
+// Only an admin moves a device to another branch
+await page.click(".logout");
+await page.fill("#login-user", "pharm");
+await page.fill("#login-pass", "demo1234");
+await page.selectOption("#login-branch", "br-main");
+await page.keyboard.press("Enter");
+await page.waitForSelector(".login .banner.error");
+await page.screenshot({ path: "screenshots/25-login-branch-refused.png" });
+
 await browser.close();
 if (errors.length) {
   console.error(errors.join("\n"));

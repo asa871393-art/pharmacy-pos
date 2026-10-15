@@ -1,7 +1,8 @@
 //! Cloud sync. The local SQLite file stays the main database: every screen reads and writes it, with or without
 //! internet. Writes the cloud should know about also add an entry to the `sync_queue` outbox in the same transaction;
-//! this worker pushes those entries to Supabase when it can reach it, then pulls the catalog (owned by the cloud) and
-//! the stock level of every batch (the sum of all tills' movements) back down. The cloud side is supabase/schema.sql.
+//! this worker pushes those entries to Supabase when it can reach it, then pulls the catalog (owned by the cloud), the
+//! branches, stock transfers and the stock level of every batch (the sum of all tills' movements) back down, and the
+//! sales other tills made (for reports across branches). The cloud side is supabase/schema.sql.
 
 use rusqlite::{params, types::Value as SqlValue, types::ValueRef, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,9 @@ pub const MAX_ATTEMPTS: i64 = 5;
 const PULL_OVERLAP: i64 = 500;
 /// Rows the history backfill puts in one queue entry.
 const BACKFILL_CHUNK: usize = 200;
+/// Other tills' sales fetched per request, and at most this many requests per round.
+const SALES_PAGE: i64 = 200;
+const SALES_PAGES_PER_ROUND: usize = 10;
 
 // ── Waking the worker ──
 
@@ -36,10 +40,16 @@ pub fn nudge() {
 
 // ── Outbox ──
 
-/// Adds an entry to the outbox. Call it inside the transaction that made the change.
+/// Adds an entry to the outbox, stamped with this device and its branch. Call it inside the transaction that made the
+/// change.
 pub fn enqueue(conn: &Connection, kind: &str, payload: &Value) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO sync_queue(id, kind, payload) VALUES (?1, ?2, ?3)",
+        concat!(
+            "INSERT INTO sync_queue(id, kind, payload, branch_id, device_id)
+             VALUES (?1, ?2, ?3, ",
+            active_branch_sql!(),
+            ", (SELECT value FROM settings WHERE key = 'sync_device_id'))"
+        ),
         params![uuid::Uuid::now_v7().to_string(), kind, payload.to_string()],
     )?;
     nudge();
@@ -132,6 +142,21 @@ pub fn movement_payload(conn: &Connection, movement_id: &str) -> rusqlite::Resul
     Ok(json!({ "batches": batches, "movements": movements }))
 }
 
+pub fn branch_payload(conn: &Connection, branch_id: &str) -> rusqlite::Result<Value> {
+    Ok(json!({ "branch": row_json(conn, "SELECT * FROM branches WHERE id = ?1", [branch_id])? }))
+}
+
+/// A transfer with its lines, and the batches and movements it has made so far (out of the sender, into the receiver).
+pub fn transfer_payload(conn: &Connection, transfer_id: &str) -> rusqlite::Result<Value> {
+    let (batches, movements) = stock_parts(conn, "ref_type = 'transfer' AND ref_id = ?1", transfer_id)?;
+    Ok(json!({
+        "transfer": row_json(conn, "SELECT * FROM stock_transfers WHERE id = ?1", [transfer_id])?,
+        "items": rows_json(conn, "SELECT * FROM stock_transfer_items WHERE transfer_id = ?1 ORDER BY id", [transfer_id])?,
+        "batches": batches,
+        "movements": movements,
+    }))
+}
+
 /// Queues what was already in the database before sync existed (and the demo data of a new install), so the cloud
 /// gets the whole history. Movements already covered by a sale or purchase entry are not repeated.
 pub fn backfill(conn: &Connection) -> rusqlite::Result<()> {
@@ -140,6 +165,9 @@ pub fn backfill(conn: &Connection) -> rusqlite::Result<()> {
         let rows = stmt.query_map([], |r| r.get(0))?;
         rows.collect()
     };
+    for id in ids("SELECT id FROM branches ORDER BY created_at, id")? {
+        enqueue(conn, "UPSERT_BRANCH", &branch_payload(conn, &id)?)?;
+    }
     for id in ids("SELECT id FROM products ORDER BY id")? {
         enqueue(conn, "UPDATE_PRODUCT", &product_payload(conn, &id)?)?;
     }
@@ -249,7 +277,18 @@ pub struct PulledBatch {
 }
 
 #[derive(Deserialize, Debug, Default)]
+pub struct PulledTransfer {
+    pub doc: Map<String, Value>,
+    #[serde(default)]
+    pub items: Vec<Map<String, Value>>,
+}
+
+#[derive(Deserialize, Debug, Default)]
 pub struct Pull {
+    #[serde(default)]
+    pub branches: Vec<Map<String, Value>>,
+    #[serde(default)]
+    pub transfers: Vec<PulledTransfer>,
     #[serde(default)]
     pub categories: Vec<Map<String, Value>>,
     #[serde(default)]
@@ -275,6 +314,11 @@ pub fn pending_stock(conn: &Connection) -> rusqlite::Result<HashMap<String, i64>
 /// A batch's quantity becomes the cloud's total plus this computer's unpushed movements.
 pub fn apply_pull(conn: &mut Connection, pull: &Pull) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
+    // Branches first: batches, sales and transfers point at them. A branch whose code clashes with another one here
+    // (two admins picked the same code offline) is skipped rather than failing the whole pull.
+    for b in &pull.branches {
+        try_upsert(&tx, "branches", b)?;
+    }
     for c in &pull.categories {
         upsert_row(&tx, "categories", c, &[])?;
     }
@@ -310,8 +354,128 @@ pub fn apply_pull(conn: &mut Connection, pull: &Pull) -> rusqlite::Result<()> {
             tx.execute("UPDATE batches SET qty_on_hand = ?1 WHERE id = ?2", params![qty, id])?;
         }
     }
+    // Transfers only move forward (requested → shipped → received/cancelled); one with a change of ours still in the
+    // outbox keeps the local version.
+    for t in &pull.transfers {
+        let Some(id) = t.doc.get("id").and_then(Value::as_str) else { continue };
+        let remote = transfer_rank(t.doc.get("status").and_then(Value::as_str).unwrap_or(""));
+        let local: Option<String> =
+            tx.query_row("SELECT status FROM stock_transfers WHERE id = ?1", [id], |r| r.get(0)).optional()?;
+        let pending: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM sync_queue WHERE sent_at IS NULL AND kind = 'TRANSFER'
+                            AND json_extract(payload, '$.transfer.id') = ?1)",
+            [id],
+            |r| r.get(0),
+        )?;
+        if pending || local.is_some_and(|l| transfer_rank(&l) >= remote) {
+            continue;
+        }
+        if try_upsert(&tx, "stock_transfers", &t.doc)? {
+            for item in &t.items {
+                upsert_row(&tx, "stock_transfer_items", item, &[])?;
+            }
+        }
+    }
     tx.execute("UPDATE settings SET value = ?1 WHERE key = 'sync_cursor'", [pull.cursor.to_string()])?;
     tx.commit()
+}
+
+pub fn transfer_rank(status: &str) -> i32 {
+    match status {
+        "requested" => 0,
+        "shipped" => 1,
+        "received" | "cancelled" => 2,
+        _ => -1,
+    }
+}
+
+/// upsert_row inside a savepoint: a row that breaks a constraint is skipped (false) instead of failing the caller.
+fn try_upsert(conn: &Connection, table: &str, doc: &Map<String, Value>) -> rusqlite::Result<bool> {
+    conn.execute_batch("SAVEPOINT try_upsert")?;
+    match upsert_row(conn, table, doc, &[]) {
+        Ok(written) => {
+            conn.execute_batch("RELEASE try_upsert")?;
+            Ok(written)
+        }
+        Err(rusqlite::Error::SqliteFailure(e, _)) if e.code == rusqlite::ErrorCode::ConstraintViolation => {
+            conn.execute_batch("ROLLBACK TO try_upsert; RELEASE try_upsert")?;
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct PulledSale {
+    /// sale_payload of the till that made it.
+    pub doc: Value,
+    pub device_id: String,
+}
+
+#[derive(Deserialize, Debug, Default)]
+pub struct SalesPull {
+    #[serde(default)]
+    pub sales: Vec<PulledSale>,
+    pub cursor: i64,
+}
+
+/// Copies sales made on other tills into the local tables, for reports across branches. They change no stock here
+/// (batch quantities come from the stock pull). A sale whose lines point at a batch or product this device does not
+/// have is skipped; an invoice number another sale already uses here (numbers from before branches existed) gets the
+/// other till's tag appended. Returns how many sales were added.
+pub fn apply_sales(conn: &mut Connection, pull: &SalesPull) -> rusqlite::Result<usize> {
+    let tx = conn.transaction()?;
+    let own = setting(&tx, "sync_device_id")?;
+    let mut added = 0;
+    for s in &pull.sales {
+        let Some(sale) = s.doc.get("sale").and_then(Value::as_object) else { continue };
+        let Some(id) = sale.get("id").and_then(Value::as_str) else { continue };
+        let exists: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM sales WHERE id = ?1)", [id], |r| r.get(0))?;
+        if s.device_id == own || exists {
+            continue;
+        }
+        let mut sale = sale.clone();
+        sale.insert("device_id".into(), s.device_id.clone().into());
+        let no = sale.get("invoice_no").and_then(Value::as_str).unwrap_or_default().to_string();
+        let taken: bool = tx.query_row("SELECT EXISTS (SELECT 1 FROM sales WHERE invoice_no = ?1)", [&no], |r| r.get(0))?;
+        if taken {
+            let tag = s.device_id.replace('-', "");
+            let tag = tag[tag.len().saturating_sub(4)..].to_uppercase();
+            sale.insert("invoice_no".into(), format!("{no}/{tag}").into());
+        }
+        let rows = |key: &str| -> Vec<Map<String, Value>> {
+            s.doc
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_object().cloned()).collect())
+                .unwrap_or_default()
+        };
+        tx.execute_batch("SAVEPOINT pulled_sale")?;
+        let mut ok = upsert_row(&tx, "sales", &sale, &[])?;
+        for item in rows("items") {
+            ok = ok && upsert_row(&tx, "sale_items", &item, &[])?;
+        }
+        for p in rows("payments") {
+            ok = ok && upsert_row(&tx, "payments", &p, &[])?;
+        }
+        if ok {
+            // Needs the pharmacist's account, which lives on the other till; the sale counts without it.
+            if let Some(rx) = s.doc.get("prescription").and_then(Value::as_object) {
+                upsert_row(&tx, "sale_prescriptions", rx, &[])?;
+            }
+            tx.execute_batch("RELEASE pulled_sale")?;
+            added += 1;
+        } else {
+            tx.execute_batch("ROLLBACK TO pulled_sale; RELEASE pulled_sale")?;
+        }
+    }
+    // Never backwards: a page re-read for overlap may end below the cursor.
+    tx.execute(
+        "UPDATE settings SET value = MAX(CAST(value AS INTEGER), ?1) WHERE key = 'sync_sales_cursor'",
+        [pull.cursor],
+    )?;
+    tx.commit()?;
+    Ok(added)
 }
 
 // ── Settings and status ──
@@ -473,20 +637,24 @@ pub async fn sync_once(
     if !cfg.ready() {
         return Ok(());
     }
-    let device = json!({ "id": cfg.device_id, "name": cfg.device_name });
+    let branch: Option<String> =
+        lock(db).query_row(concat!("SELECT ", active_branch_sql!()), [], |r| r.get(0)).optional()?.flatten();
+    let device = json!({ "id": cfg.device_id, "name": cfg.device_name, "branch_id": branch });
     // Rejected in this round: tried again next round, not straight away.
     let mut rejected: Vec<String> = vec![];
     loop {
-        let batch: Vec<(String, String, String)> = {
+        type Entry = (String, String, String, Option<String>);
+        let batch: Vec<Entry> = {
             let conn = lock(db);
             let mut stmt = conn.prepare(
-                "SELECT id, kind, payload FROM sync_queue
+                "SELECT id, kind, payload, branch_id FROM sync_queue
                  WHERE sent_at IS NULL AND attempts < ?1 AND id NOT IN (SELECT value FROM json_each(?3))
                  ORDER BY seq LIMIT ?2",
             )?;
             let skip = serde_json::to_string(&rejected).unwrap_or_default();
-            let rows = stmt.query_map(params![MAX_ATTEMPTS, PUSH_BATCH, skip], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
-            let batch: Vec<(String, String, String)> = rows.collect::<rusqlite::Result<_>>()?;
+            let rows = stmt
+                .query_map(params![MAX_ATTEMPTS, PUSH_BATCH, skip], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
+            let batch: Vec<Entry> = rows.collect::<rusqlite::Result<_>>()?;
             if !batch.is_empty() {
                 report(status_with(&conn, SyncState::Syncing, None)?);
             }
@@ -497,15 +665,20 @@ pub async fn sync_once(
         }
         let entries: Vec<Value> = batch
             .iter()
-            .map(|(id, kind, payload)| {
-                json!({ "id": id, "kind": kind, "payload": serde_json::from_str::<Value>(payload).unwrap_or(Value::Null) })
+            .map(|(id, kind, payload, branch)| {
+                json!({
+                    "id": id,
+                    "kind": kind,
+                    "branch_id": branch,
+                    "payload": serde_json::from_str::<Value>(payload).unwrap_or(Value::Null),
+                })
             })
             .collect();
         let res = rpc(client, &cfg, "pos_sync_push", json!({ "p_secret": cfg.secret, "p_device": device, "p_entries": entries })).await?;
         let res: PushResult = serde_json::from_value(res).unwrap_or_default();
         let mut conn = lock(db);
         let tx = conn.transaction()?;
-        for (id, _, _) in &batch {
+        for (id, _, _, _) in &batch {
             match res.failed.iter().find(|f| &f.id == id) {
                 Some(f) => {
                     rejected.push(id.clone());
@@ -523,8 +696,25 @@ pub async fn sync_once(
     let since = if full { 0 } else { (setting(&lock(db), "sync_cursor")?.parse::<i64>().unwrap_or(0) - PULL_OVERLAP).max(0) };
     let res = rpc(client, &cfg, "pos_sync_pull", json!({ "p_secret": cfg.secret, "p_since": since })).await?;
     let pull: Pull = serde_json::from_value(res).map_err(|e| SyncError::Server(format!("رد غير مفهوم من الخادم: {e}")))?;
-    let mut conn = lock(db);
-    apply_pull(&mut conn, &pull)?;
+    apply_pull(&mut lock(db), &pull)?;
+
+    // Other tills' sales, a page at a time; the rest come in the next rounds. The first page re-reads a little before
+    // the cursor, like the main pull, so a sale committed late is not missed (sales already here are skipped).
+    for page_no in 0..SALES_PAGES_PER_ROUND {
+        let cursor = setting(&lock(db), "sync_sales_cursor")?.parse::<i64>().unwrap_or(0);
+        let since = if page_no == 0 { (cursor - SALES_PAGE).max(0) } else { cursor };
+        let body = json!({ "p_secret": cfg.secret, "p_since": since, "p_limit": SALES_PAGE });
+        let res = rpc(client, &cfg, "pos_sync_pull_sales", body).await?;
+        let page: SalesPull =
+            serde_json::from_value(res).map_err(|e| SyncError::Server(format!("رد غير مفهوم من الخادم: {e}")))?;
+        let n = page.sales.len() as i64;
+        apply_sales(&mut lock(db), &page)?;
+        if n < SALES_PAGE {
+            break;
+        }
+    }
+
+    let conn = lock(db);
     conn.execute(
         "UPDATE settings SET value = strftime('%Y-%m-%dT%H:%M:%fZ', 'now') WHERE key = 'sync_last_at'",
         [],

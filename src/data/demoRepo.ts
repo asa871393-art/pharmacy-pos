@@ -10,7 +10,10 @@ import {
   type AuditReport,
   type AuditRow,
   type Batch,
+  type Branch,
+  type BranchInput,
   type Category,
+  type DeviceInfo,
   type ExpiryReport,
   type ExpiryRow,
   type InventoryItem,
@@ -37,6 +40,10 @@ import {
   type SalesRow,
   type SearchMode,
   type Supplier,
+  type Transfer,
+  type TransferLine,
+  type TransferRequest,
+  type TransferShipment,
   type User,
   type UserRow,
   type WriteOffRow,
@@ -74,6 +81,7 @@ const maxLevels: Record<string, number> = { "p-panadol-extra": 200, "p-amoxil-50
 interface DemoSale {
   id: string;
   invoiceNo: string;
+  branchId: string;
   cashierId: string;
   day: string;
   soldAt: string;
@@ -91,7 +99,7 @@ function inAuditCategory(a: { action: string; payload: string }, category: Audit
   const group = a.action.split(".")[0];
   switch (category) {
     case "inventory":
-      return ["product", "batch", "purchase", "supplier"].includes(group);
+      return ["product", "batch", "purchase", "supplier", "transfer"].includes(group);
     case "users":
       return group === "user" && a.action !== "user.login";
     case "prices": {
@@ -105,7 +113,7 @@ function inAuditCategory(a: { action: string; payload: string }, category: Audit
     case "sales":
       return group === "sale" || group === "receipt";
     case "settings":
-      return group === "settings";
+      return group === "settings" || group === "branch" || a.action === "device.branch";
   }
 }
 
@@ -123,6 +131,7 @@ function applyPayments(total: number, payments: { method: "cash" | "card" | "cre
 }
 
 interface DemoWriteOff {
+  branchId: string;
   day: string;
   productId: string;
   batchNo: string;
@@ -174,11 +183,22 @@ const products: DemoProduct[] = [
   { id: "p-brufen-400", tradeName: "Brufen 400 mg", ingredients: [ing.ibuprofen], strength: "400 mg", form: "قرص", packSize: 30, price: 3500, rx: false, key: "ibuprofen:400mg", barcode: "2000000000121" },
 ];
 
-function seedBatches(today: string): Batch[] {
-  const row = (id: string, productId: string, batchNo: string, days: number, unitCost: number, sellPrice: number, qty: number): Batch => ({
-    id, productId, batchNo, expiryDate: addDays(today, days), qtyOnHand: qty, unitCost, sellPrice, receivedAt: "2026-01-01",
+// The demo has a second branch with a little stock, so transfers can be tried in the browser.
+const branches: Branch[] = [
+  { id: "br-main", code: "MB", name: "الفرع الرئيسي", address: null, phone: null, active: true },
+  { id: "br-karrada", code: "KR", name: "فرع الكرادة", address: "بغداد، الكرادة داخل", phone: null, active: true },
+];
+
+type DemoBatch = Batch & { branchId: string };
+
+function seedBatches(today: string): DemoBatch[] {
+  const row = (id: string, productId: string, batchNo: string, days: number, unitCost: number, sellPrice: number, qty: number, branchId = "br-main"): DemoBatch => ({
+    id, productId, batchNo, expiryDate: addDays(today, days), qtyOnHand: qty, unitCost, sellPrice, receivedAt: "2026-01-01", branchId,
   });
   return [
+    row("b-kr-px", "p-panadol-extra", "PX1104", 260, 2100, 3000, 30, "br-karrada"),
+    row("b-kr-br", "p-brufen-400", "BR400", 380, 2400, 3500, 12, "br-karrada"),
+    row("b-kr-am", "p-amoxil-500", "AM014", 22, 2900, 4500, 6, "br-karrada"),
     row("b-gl-554", "p-glucophage-850", "GL554", 300, 5000, 6250, 46),
     row("b-gl-601", "p-glucophage-850", "GL601", 520, 5050, 6250, 30),
     row("b-mf-220", "p-metformin-850", "MF220", 400, 2900, 4000, 120),
@@ -244,6 +264,66 @@ const UNLIMITED_DISCOUNT_ROLES: Role[] = ["admin", "chief_pharmacist"];
 export function createDemoRepo(): PharmacyRepo {
   const today = localToday();
   const batches = seedBatches(today);
+  // Like settings 'branch_id' on a desktop till.
+  let branchId = "br-main";
+  const shelf = () => batches.filter((b) => b.branchId === branchId);
+  const branchById = (id: string) => branches.find((b) => b.id === id);
+  const transfers: (Omit<Transfer, "direction"> & { createdAt: string })[] = [];
+  let transferCounter = 0;
+  // Cost and price of each shipped line ("transferId|item index"), for the receiving branch's batch.
+  const shipped = new Map<string, { unitCost: number; sellPrice: number }>();
+  // Transfer helpers (function declarations: they use productById, defined further down).
+  function isClosed(t: { status: string }) {
+    return t.status === "received" || t.status === "cancelled";
+  }
+  function view(t: (typeof transfers)[number]): Transfer {
+    const { createdAt: _c, ...rest } = t;
+    return { ...rest, direction: t.fromBranchId === branchId ? "out" : "in", items: t.items.map((i) => ({ ...i })) };
+  }
+  function nowLocal() {
+    return new Date().toLocaleString("sv-SE").slice(0, 19);
+  }
+  function otherBranch(id: string) {
+    if (id === branchId) throw new Error("اختر فرعاً غير فرع هذا الجهاز");
+    const b = branchById(id);
+    if (!b?.active) throw new Error("الفرع غير موجود أو موقوف");
+    return b;
+  }
+  function checkLines(lines: TransferLine[]) {
+    if (lines.length === 0) throw new Error("أضف صنفاً واحداً على الأقل");
+    const seen = new Set<string>();
+    for (const l of lines) {
+      const name = productById(l.productId).tradeName;
+      if (!(l.qty > 0) || !Number.isInteger(l.qty)) throw new Error(`${name}: الكمية يجب أن تكون أكبر من صفر`);
+      if (seen.has(l.productId)) throw new Error(`${name} مكرر، اجمع الكمية في سطر واحد`);
+      seen.add(l.productId);
+    }
+    return lines;
+  }
+  function newTransfer(from: string, to: string, status: Transfer["status"], note?: string) {
+    transferCounter += 1;
+    const t = {
+      id: `t-demo-${Date.now()}-${transferCounter}`,
+      transferNo: `TR-${branchById(from)!.code}DEMO-${String(transferCounter).padStart(5, "0")}`,
+      fromBranchId: from,
+      fromBranch: branchById(from)!.name,
+      toBranchId: to,
+      toBranch: branchById(to)!.name,
+      status,
+      note: note?.trim() || null,
+      requestedBy: null,
+      requestedAt: null,
+      shippedBy: null,
+      shippedAt: null,
+      receivedBy: null,
+      receivedAt: null,
+      units: 0,
+      items: [] as Transfer["items"],
+      createdAt: new Date().toISOString(),
+    };
+    transfers.push(t);
+    return t;
+  }
   let counter = 0;
   let currentId: string | null = null;
   // Looked up on every call, so a deactivated account stops working at once (as in the desktop app).
@@ -273,7 +353,7 @@ export function createDemoRepo(): PharmacyRepo {
   };
 
   const toHit = (p: DemoProduct): ProductHit => {
-    const own = batches.filter((b) => b.productId === p.id);
+    const own = shelf().filter((b) => b.productId === p.id);
     const sellable = sellableBatches(own, { today });
     return {
       id: p.id,
@@ -291,8 +371,8 @@ export function createDemoRepo(): PharmacyRepo {
     };
   };
 
-  const toInventory = (p: DemoProduct): InventoryItem => {
-    const own = batches.filter((b) => b.productId === p.id);
+  const toInventory = (p: DemoProduct, inBranch = branchId): InventoryItem => {
+    const own = batches.filter((b) => b.productId === p.id && b.branchId === inBranch);
     const categoryId = categoryOf(p);
     return {
       id: p.id,
@@ -416,9 +496,9 @@ export function createDemoRepo(): PharmacyRepo {
       seen.add(`${p.id}|${batchNo}`);
       if (prices.has(p.id) && prices.get(p.id) !== l.sellPrice) throw new Error(`${p.tradeName}: سعر البيع مختلف بين أسطر الفاتورة`);
       prices.set(p.id, l.sellPrice);
-      const shelf = batches.find((b) => b.productId === p.id && b.batchNo === batchNo);
-      if (shelf && shelf.expiryDate !== l.expiryDate) {
-        throw new Error(`التشغيلة ${batchNo} مسجّلة بتاريخ انتهاء ${shelf.expiryDate}، والفاتورة تذكر ${l.expiryDate}. تحقّق من العبوة`);
+      const onShelf = shelf().find((b) => b.productId === p.id && b.batchNo === batchNo);
+      if (onShelf && onShelf.expiryDate !== l.expiryDate) {
+        throw new Error(`التشغيلة ${batchNo} مسجّلة بتاريخ انتهاء ${onShelf.expiryDate}، والفاتورة تذكر ${l.expiryDate}. تحقّق من العبوة`);
       }
     });
 
@@ -426,19 +506,20 @@ export function createDemoRepo(): PharmacyRepo {
     let updated = 0;
     for (const l of inv.lines) {
       const batchNo = l.batchNo.trim();
-      const shelf = batches.find((b) => b.productId === l.productId && b.batchNo === batchNo);
+      const onShelf = shelf().find((b) => b.productId === l.productId && b.batchNo === batchNo);
       const entry = { productId: l.productId, batchNo, qty: l.qty, unitCost: l.unitCost, expiryDate: l.expiryDate, invoiceNo };
       const subject = `${productById(l.productId).tradeName} / ${batchNo}`;
-      if (shelf) {
-        const from = { qty: shelf.qtyOnHand, unitCost: shelf.unitCost };
-        const qty = shelf.qtyOnHand + l.qty;
-        shelf.unitCost = Math.floor((shelf.qtyOnHand * shelf.unitCost + l.qty * l.unitCost + Math.floor(qty / 2)) / qty);
-        shelf.qtyOnHand = qty;
-        shelf.sellPrice = l.sellPrice;
+      if (onShelf) {
+        const from = { qty: onShelf.qtyOnHand, unitCost: onShelf.unitCost };
+        const qty = onShelf.qtyOnHand + l.qty;
+        onShelf.unitCost = Math.floor((onShelf.qtyOnHand * onShelf.unitCost + l.qty * l.unitCost + Math.floor(qty / 2)) / qty);
+        onShelf.qtyOnHand = qty;
+        onShelf.sellPrice = l.sellPrice;
         updated += 1;
-        log(me.id, "batch.receive", "batches", shelf.id, subject, { ...entry, from, to: { qty, unitCost: shelf.unitCost } });
+        log(me.id, "batch.receive", "batches", onShelf.id, subject, { ...entry, from, to: { qty, unitCost: onShelf.unitCost } });
       } else {
         batches.push({
+          branchId,
           id: `b-demo-${Date.now()}-${created}`,
           productId: l.productId,
           batchNo,
@@ -503,9 +584,17 @@ export function createDemoRepo(): PharmacyRepo {
     async setupAdmin() {
       throw new Error("تم إعداد كلمة المرور مسبقاً، سجّل الدخول");
     },
-    async login(username: string, password: string) {
+    async login(username: string, password: string, pickedBranch?: string) {
       const u = users.find((x) => x.username === username.trim().toLowerCase() && x.active);
       if (!u || password !== u.password) throw new Error("اسم المستخدم أو كلمة المرور غير صحيحة");
+      // Same rule as set_device_branch: only an admin moves the device.
+      if (pickedBranch && pickedBranch !== branchId) {
+        if (u.role !== "admin") throw new Error("تغيير فرع هذا الجهاز للمدير فقط");
+        const to = branchById(pickedBranch);
+        if (!to?.active) throw new Error("الفرع غير موجود أو موقوف");
+        log(u.id, "device.branch", "branches", to.id, to.name, { from: branchById(branchId)?.name ?? null, to: to.name, deviceId: "demo-browser" });
+        branchId = to.id;
+      }
       currentId = u.id;
       u.lastLogin = new Date().toLocaleString("sv-SE").slice(0, 19);
       log(u.id, "user.login", "users", u.id, u.fullName);
@@ -535,7 +624,9 @@ export function createDemoRepo(): PharmacyRepo {
       return sortHits(products.filter((p) => p.key === key && p.id !== productId).map(toHit));
     },
     async batches(productId: string) {
-      return batches.filter((b) => b.productId === productId && b.qtyOnHand > 0).map((b) => ({ ...b }));
+      return shelf()
+        .filter((b) => b.productId === productId && b.qtyOnHand > 0)
+        .map(({ branchId: _b, ...b }) => b);
     },
     async postSale(draft: SaleDraft): Promise<SaleResult> {
       const user = signedIn();
@@ -575,15 +666,19 @@ export function createDemoRepo(): PharmacyRepo {
       for (const l of draft.lines) {
         for (const a of l.allocations) {
           const b = batches.find((x) => x.id === a.batchId);
-          if (!b || b.productId !== l.productId || b.qtyOnHand < a.qty) throw new Error(`الدفعة ${a.batchNo} لم تعد تكفي، حدّث السلة`);
+          if (!b || b.productId !== l.productId || b.qtyOnHand < a.qty || b.branchId !== branchId) {
+            throw new Error(`الدفعة ${a.batchNo} لم تعد تكفي، حدّث السلة`);
+          }
         }
       }
+      const invoiceNo = `${branchById(branchId)!.code}DEMO-${today.slice(0, 4)}-${String(counter + 1).padStart(6, "0")}`;
       const costOf = (l: SaleDraft["lines"][number]) =>
         l.allocations.reduce((sum, a) => sum + a.qty * batches.find((x) => x.id === a.batchId)!.unitCost, 0);
       counter += 1;
       sales.push({
         id: `demo-${counter}`,
-        invoiceNo: `MB-${today.slice(0, 4)}-${String(counter).padStart(6, "0")}`,
+        invoiceNo,
+        branchId,
         cashierId: user.id,
         day: today,
         soldAt: new Date().toISOString(),
@@ -602,7 +697,6 @@ export function createDemoRepo(): PharmacyRepo {
         change: s.change,
       });
       for (const l of draft.lines) for (const a of l.allocations) batches.find((x) => x.id === a.batchId)!.qtyOnHand -= a.qty;
-      const invoiceNo = `MB-${today.slice(0, 4)}-${String(counter).padStart(6, "0")}`;
       log(user.id, "sale.create", "sales", `demo-${counter}`, invoiceNo, {
         invoiceNo,
         total: totals.total,
@@ -621,13 +715,13 @@ export function createDemoRepo(): PharmacyRepo {
     },
     async inventory() {
       if (!signedIn()) throw new Error("سجّل الدخول أولاً");
-      return products.map(toInventory).sort((a, b) => a.tradeName.localeCompare(b.tradeName));
+      return products.map((p) => toInventory(p)).sort((a, b) => a.tradeName.localeCompare(b.tradeName));
     },
     async inventoryBatches(productId: string) {
-      return batches
+      return shelf()
         .filter((b) => b.productId === productId && b.qtyOnHand > 0)
         .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate) || a.receivedAt.localeCompare(b.receivedAt))
-        .map((b) => ({ ...b, status: "active" }));
+        .map(({ branchId: _b, ...b }) => ({ ...b, status: "active" }));
     },
     async categories() {
       return categories;
@@ -685,10 +779,11 @@ export function createDemoRepo(): PharmacyRepo {
       if (!isIsoDate(input.expiryDate)) throw new Error("تاريخ الانتهاء غير صالح");
       if (input.expiryDate <= today) throw new Error("لا يُستلم مخزون منتهي الصلاحية");
       const p = productById(input.productId);
-      if (batches.some((b) => b.productId === p.id && b.batchNo === batchNo)) {
+      if (shelf().some((b) => b.productId === p.id && b.batchNo === batchNo)) {
         throw new Error(`الدفعة ${batchNo} موجودة مسبقاً لهذا الصنف، عدّل كميتها بدلاً من ذلك`);
       }
       batches.push({
+        branchId,
         id: `b-demo-${Date.now()}`,
         productId: p.id,
         batchNo,
@@ -716,9 +811,11 @@ export function createDemoRepo(): PharmacyRepo {
       if (input.newQty < 0) throw new Error("الكمية لا تكون سالبة");
       const b = batches.find((x) => x.id === input.batchId);
       if (!b) throw new Error("الدفعة غير موجودة");
+      if (b.branchId !== branchId) throw new Error("الدفعة تخص فرعاً آخر؛ يُعدَّل مخزون كل فرع من أجهزته");
       if (input.newQty === b.qtyOnHand) throw new Error("الكمية الجديدة مساوية للحالية");
       if (input.newQty < b.qtyOnHand) {
         writeOffs.push({
+          branchId,
           day: today,
           productId: b.productId,
           batchNo: b.batchNo,
@@ -767,6 +864,7 @@ export function createDemoRepo(): PharmacyRepo {
       // One row per sale line; the invoice discount is shared over the sale's lines by value.
       const items = sales
         .filter((s) => s.day >= f.from && s.day <= f.to && (!f.cashierId || s.cashierId === f.cashierId))
+        .filter((s) => !f.branchId || s.branchId === f.branchId)
         .flatMap((s) => {
           const linesTotal = s.lines.reduce((sum, l) => sum + l.qty * l.unitPrice - l.discount, 0);
           return s.lines
@@ -823,7 +921,7 @@ export function createDemoRepo(): PharmacyRepo {
       if (!(withinDays >= 0 && withinDays <= 730)) throw new Error("مدة التنبيه بين ٠ و٧٣٠ يوماً");
       const horizon = addDays(today, withinDays);
       const rows: ExpiryRow[] = batches
-        .filter((b) => b.qtyOnHand > 0 && b.expiryDate <= horizon)
+        .filter((b) => b.qtyOnHand > 0 && b.expiryDate <= horizon && (!f.branchId || b.branchId === f.branchId))
         .filter((b) => !f.categoryId || categoryOf(productById(b.productId)) === f.categoryId)
         .map((b) => {
           const p = productById(b.productId);
@@ -841,7 +939,7 @@ export function createDemoRepo(): PharmacyRepo {
         })
         .sort((a, b) => a.expiryDate.localeCompare(b.expiryDate) || a.product.localeCompare(b.product));
       const offs: WriteOffRow[] = writeOffs
-        .filter((w) => w.day >= f.from && w.day <= f.to)
+        .filter((w) => w.day >= f.from && w.day <= f.to && (!f.branchId || w.branchId === f.branchId))
         .filter((w) => !f.categoryId || categoryOf(productById(w.productId)) === f.categoryId)
         .map((w) => ({
           day: w.day,
@@ -866,15 +964,15 @@ export function createDemoRepo(): PharmacyRepo {
         writtenOffValue: sum(offs, "value"),
       };
     },
-    async reportReorder(categoryId?: string): Promise<ReorderRow[]> {
+    async reportReorder(categoryId?: string, inBranch = branchId): Promise<ReorderRow[]> {
       requirePermission("modifyInventory", "viewReports");
       const monthAgo = addDays(today, -30);
       return products
         .filter((p) => !categoryId || categoryOf(p) === categoryId)
         .map((p) => {
-          const inv = toInventory(p);
+          const inv = toInventory(p, inBranch);
           const sold = sales
-            .filter((s) => s.day > monthAgo)
+            .filter((s) => s.day > monthAgo && s.branchId === inBranch)
             .flatMap((s) => s.lines)
             .filter((l) => l.productId === p.id)
             .reduce((s, l) => s + l.qty, 0);
@@ -909,6 +1007,7 @@ export function createDemoRepo(): PharmacyRepo {
       checkRange(f);
       const rows: RxRow[] = sales
         .filter((s) => s.prescription && s.day >= f.from && s.day <= f.to && (!f.cashierId || s.cashierId === f.cashierId))
+        .filter((s) => !f.branchId || s.branchId === f.branchId)
         .filter((s) => !f.categoryId || s.lines.some((l) => categoryOf(productById(l.productId)) === f.categoryId))
         .map((s) => {
           const rxLines = s.lines.filter((l) => productById(l.productId).rx);
@@ -1126,7 +1225,12 @@ export function createDemoRepo(): PharmacyRepo {
             }
           : null,
         copy: reprint,
-        settings: { ...receiptSettings },
+        settings: {
+          ...receiptSettings,
+          address: branchById(s.branchId)?.address || receiptSettings.address,
+          phone: branchById(s.branchId)?.phone || receiptSettings.phone,
+        },
+        branchName: branchById(s.branchId)?.name ?? "",
       };
     },
     async recentSales(): Promise<RecentSale[]> {
@@ -1134,7 +1238,7 @@ export function createDemoRepo(): PharmacyRepo {
       if (!me) throw new Error("سجّل الدخول أولاً");
       const all = resolvePermissions(me.role, me.overrides).viewReports;
       return sales
-        .filter((s) => s.day === today && (all || s.cashierId === me.id))
+        .filter((s) => s.day === today && s.branchId === branchId && (all || s.cashierId === me.id))
         .map((s) => ({
           saleId: s.id,
           invoiceNo: s.invoiceNo,
@@ -1145,5 +1249,131 @@ export function createDemoRepo(): PharmacyRepo {
         }))
         .reverse();
     },
+
+    // Branches and transfers: same rules as src-tauri/src/branches.rs.
+    async deviceInfo(): Promise<DeviceInfo> {
+      return { deviceId: "demo-browser", deviceTag: "DEMO", deviceName: "المتصفح (تجريبي)", branch: { ...branchById(branchId)! }, branches: branches.map((b) => ({ ...b })) };
+    },
+    async saveBranch(input: BranchInput) {
+      const me = requireAdmin();
+      const code = input.code.trim().toUpperCase();
+      const name = input.name.trim();
+      if (!/^[A-Z0-9]{1,6}$/.test(code)) throw new Error("رمز الفرع من ١ إلى ٦ أحرف إنجليزية أو أرقام");
+      if (!name || [...name].length > 60) throw new Error("اسم الفرع مطلوب (حتى ٦٠ حرفاً)");
+      if (branches.some((b) => b.code === code && b.id !== input.id)) throw new Error(`الرمز ${code} مستخدم لفرع آخر`);
+      const next = { code, name, address: input.address?.trim() || null, phone: input.phone?.trim() || null, active: input.active };
+      if (input.id) {
+        const b = branchById(input.id);
+        if (!b) throw new Error("الفرع غير موجود");
+        if (!input.active && b.id === branchId) throw new Error("لا يمكن إيقاف الفرع الذي يعمل عليه هذا الجهاز");
+        const before = { ...b };
+        Object.assign(b, next);
+        log(me.id, "branch.update", "branches", b.id, b.name, { from: before, to: { ...b } });
+        return { ...b };
+      }
+      const b: Branch = { id: `br-demo-${Date.now()}`, ...next };
+      branches.push(b);
+      log(me.id, "branch.create", "branches", b.id, b.name, { from: null, to: b });
+      return { ...b };
+    },
+    async transfers() {
+      requirePermission("modifyInventory");
+      return transfers
+        .filter((t) => t.fromBranchId === branchId || t.toBranchId === branchId)
+        .sort((a, b) => Number(isClosed(a)) - Number(isClosed(b)) || b.createdAt.localeCompare(a.createdAt))
+        .map(view);
+    },
+    async requestTransfer(req: TransferRequest) {
+      const me = requirePermission("modifyInventory");
+      const from = otherBranch(req.fromBranchId);
+      const lines = checkLines(req.lines);
+      const t = newTransfer(from.id, branchId, "requested", req.note);
+      Object.assign(t, { requestedBy: me.fullName, requestedAt: nowLocal() });
+      t.items = lines.map((l) => ({ productId: l.productId, product: productById(l.productId).tradeName, requestedQty: l.qty, qty: 0, batchNo: null, expiryDate: null }));
+      t.units = lines.reduce((s, l) => s + l.qty, 0);
+      log(me.id, "transfer.request", "stock_transfers", t.id, t.transferNo, { from: from.name, lines: lines.map((l) => ({ product: productById(l.productId).tradeName, qty: l.qty })) });
+      return view(t);
+    },
+    async shipTransfer(s: TransferShipment) {
+      const me = requirePermission("modifyInventory");
+      const lines = checkLines(s.lines);
+      const request = s.transferId ? transfers.find((x) => x.id === s.transferId) : undefined;
+      if (s.transferId) {
+        if (!request) throw new Error("التحويل غير موجود");
+        if (request.fromBranchId !== branchId) throw new Error("هذا الطلب موجّه إلى فرع آخر");
+        if (request.status !== "requested") throw new Error("هذا الطلب لم يعد بانتظار الشحن");
+      } else if (!s.toBranchId) {
+        throw new Error("اختر الفرع المستلم");
+      }
+      const to = request ? null : otherBranch(s.toBranchId!);
+      // FEFO from this branch's sellable batches; check everything before taking anything.
+      const plan = lines.map((l) => {
+        const lots = sellableBatches(shelf().filter((b) => b.productId === l.productId), { today }) as DemoBatch[];
+        const available = lots.reduce((sum, b) => sum + b.qtyOnHand, 0);
+        if (available < l.qty) throw new Error(`${productById(l.productId).tradeName}: المتوفر للتحويل ${available} فقط`);
+        return { l, lots };
+      });
+      const t = request ?? newTransfer(branchId, to!.id, "shipped", s.note);
+      const lineLog: { product: string; batchNo: string; qty: number }[] = [];
+      for (const { l, lots } of plan) {
+        let left = l.qty;
+        for (const b of lots) {
+          if (left === 0) break;
+          const take = Math.min(left, b.qtyOnHand);
+          left -= take;
+          b.qtyOnHand -= take;
+          const product = productById(l.productId).tradeName;
+          t.items.push({ productId: l.productId, product, requestedQty: 0, qty: take, batchNo: b.batchNo, expiryDate: b.expiryDate });
+          shipped.set(`${t.id}|${t.items.length - 1}`, { unitCost: b.unitCost, sellPrice: b.sellPrice });
+          lineLog.push({ product, batchNo: b.batchNo, qty: take });
+        }
+      }
+      Object.assign(t, { status: "shipped", shippedBy: me.fullName, shippedAt: nowLocal(), units: lineLog.reduce((sum, x) => sum + x.qty, 0) });
+      if (s.note?.trim()) t.note = s.note.trim();
+      log(me.id, "transfer.ship", "stock_transfers", t.id, t.transferNo, { to: t.toBranch, lines: lineLog });
+      return view(t);
+    },
+    async receiveTransfer(id: string) {
+      const me = requirePermission("modifyInventory");
+      const t = transfers.find((x) => x.id === id);
+      if (!t) throw new Error("التحويل غير موجود");
+      if (t.toBranchId !== branchId) throw new Error("يُستلم التحويل في الفرع المرسَل إليه");
+      if (t.status === "requested") throw new Error("لم يُشحن التحويل بعد");
+      if (t.status !== "shipped") throw new Error("التحويل مستلم أو ملغى مسبقاً");
+      t.items.forEach((item, i) => {
+        if (item.qty === 0 || !item.batchNo || !item.expiryDate) return;
+        const { unitCost, sellPrice } = shipped.get(`${t.id}|${i}`)!;
+        const same = shelf().find((b) => b.productId === item.productId && b.batchNo === item.batchNo);
+        if (same && same.expiryDate === item.expiryDate) {
+          const total = same.qtyOnHand + item.qty;
+          same.unitCost = Math.floor((same.qtyOnHand * same.unitCost + item.qty * unitCost + Math.floor(total / 2)) / total);
+          same.qtyOnHand = total;
+        } else {
+          let batchNo = item.batchNo;
+          if (same) {
+            batchNo = `${item.batchNo}-TR`;
+            for (let n = 2; shelf().some((b) => b.productId === item.productId && b.batchNo === batchNo); n++) batchNo = `${item.batchNo}-TR${n}`;
+          }
+          batches.push({ id: `b-demo-${Date.now()}-${i}`, productId: item.productId, batchNo, expiryDate: item.expiryDate, qtyOnHand: item.qty, unitCost, sellPrice, receivedAt: new Date().toISOString(), branchId });
+        }
+      });
+      Object.assign(t, { status: "received", receivedBy: me.fullName, receivedAt: nowLocal() });
+      log(me.id, "transfer.receive", "stock_transfers", t.id, t.transferNo, {
+        from: t.fromBranch,
+        lines: t.items.filter((i) => i.qty > 0).map((i) => ({ product: i.product, batchNo: i.batchNo, qty: i.qty })),
+      });
+      return view(t);
+    },
+    async cancelTransfer(id: string) {
+      const me = requirePermission("modifyInventory");
+      const t = transfers.find((x) => x.id === id);
+      if (!t) throw new Error("التحويل غير موجود");
+      if (t.fromBranchId !== branchId && t.toBranchId !== branchId) throw new Error("التحويل لا يخص هذا الفرع");
+      if (t.status !== "requested") throw new Error("لا يُلغى إلا طلب لم يُشحن بعد");
+      t.status = "cancelled";
+      log(me.id, "transfer.cancel", "stock_transfers", t.id, t.transferNo, { from: "requested", to: "cancelled" });
+      return view(t);
+    },
   };
+
 }

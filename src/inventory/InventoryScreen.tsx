@@ -1,10 +1,11 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { addDays, daysBetween, DEFAULT_THRESHOLDS } from "../core/fefo.ts";
 import { formatIqd } from "../core/totals.ts";
-import type { Category, InventoryBatch, InventoryItem, User } from "../core/types.ts";
+import type { Category, DeviceInfo, InventoryBatch, InventoryItem, User } from "../core/types.ts";
 import { localToday, repo } from "../data/index.ts";
 import { ExpiryTag } from "../pos/ExpiryTag.tsx";
 import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
+import { TransfersPanel } from "./TransfersPanel.tsx";
 
 type Filter = "all" | "low" | "expiring" | "expired" | "out";
 
@@ -38,9 +39,11 @@ function matchesFilter(i: InventoryItem, f: Filter, today: string): boolean {
   }
 }
 
-export function InventoryScreen({ user }: { user: User }) {
+/** Stock of this device's branch (`device.branch`), and transfers to and from the other branches. */
+export function InventoryScreen({ user, device }: { user: User; device: DeviceInfo }) {
   const today = localToday();
   const canEdit = user.permissions.modifyInventory;
+  const [tab, setTab] = useState<"stock" | "transfers">("stock");
   const [items, setItems] = useState<InventoryItem[] | null>(null);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
@@ -49,8 +52,9 @@ export function InventoryScreen({ user }: { user: User }) {
   const [editing, setEditing] = useState<InventoryItem | null>(null);
   const [selected, setSelected] = useState<InventoryItem | null>(null);
 
+  const reload = () => repo.inventory().then(setItems, (e) => setError(errorText(e)));
   useEffect(() => {
-    repo.inventory().then(setItems, (e) => setError(errorText(e)));
+    void reload();
   }, []);
 
   function upsert(item: InventoryItem) {
@@ -74,121 +78,137 @@ export function InventoryScreen({ user }: { user: User }) {
     <main className="inv">
       <section className="panel inv-panel" aria-labelledby="inv-title">
         <div className="inv-head">
-          <h2 id="inv-title">المخزون</h2>
-          <span className="muted">{items ? `${items.length} صنف` : "جارٍ التحميل…"}</span>
+          <h2 id="inv-title">المخزون · {device.branch.name}</h2>
           {canEdit && (
+            <div role="tablist" aria-label="أقسام المخزون" className="chips">
+              <button type="button" role="tab" className={`chip ${tab === "stock" ? "on" : ""}`} aria-selected={tab === "stock"} onClick={() => setTab("stock")}>
+                الأصناف
+              </button>
+              <button type="button" role="tab" className={`chip ${tab === "transfers" ? "on" : ""}`} aria-selected={tab === "transfers"} onClick={() => setTab("transfers")}>
+                التحويل بين الفروع
+              </button>
+            </div>
+          )}
+          <span className="muted">{items ? `${items.length} صنف` : "جارٍ التحميل…"}</span>
+          {canEdit && tab === "stock" && (
             <button type="button" className="btn primary" onClick={() => setAdding(true)}>
               + صنف جديد
             </button>
           )}
         </div>
-        <div className="inv-tools">
-          <div className="search-box">
-            <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
-              <circle cx="11" cy="11" r="7" />
-              <path d="M20 20 L16 16" />
-            </svg>
-            <input
-              id="inv-search"
-              aria-label="بحث في المخزون"
-              value={query}
-              autoComplete="off"
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === "Escape" && setQuery("")}
-              placeholder="اسم الصنف أو الباركود"
-            />
-          </div>
-          <div role="group" aria-label="تصفية" className="chips">
-            {FILTERS.map((f) => (
-              <button
-                key={f.id}
-                type="button"
-                className={`chip ${filter === f.id ? "on" : ""}`}
-                aria-pressed={filter === f.id}
-                onClick={() => setFilter(f.id)}
-              >
-                {f.label} <span className="num">{searched.filter((i) => matchesFilter(i, f.id, today)).length}</span>
-              </button>
-            ))}
-          </div>
-        </div>
-        {error && (
-          <div role="alert" className="banner error">
-            <span>{error}</span>
-          </div>
+        {tab === "transfers" ? (
+          <TransfersPanel device={device} items={items ?? []} onStockChanged={() => void reload()} />
+        ) : (
+          <>
+            <div className="inv-tools">
+              <div className="search-box">
+                <svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true">
+                  <circle cx="11" cy="11" r="7" />
+                  <path d="M20 20 L16 16" />
+                </svg>
+                <input
+                  id="inv-search"
+                  aria-label="بحث في المخزون"
+                  value={query}
+                  autoComplete="off"
+                  onChange={(e) => setQuery(e.target.value)}
+                  onKeyDown={(e) => e.key === "Escape" && setQuery("")}
+                  placeholder="اسم الصنف أو الباركود"
+                />
+              </div>
+              <div role="group" aria-label="تصفية" className="chips">
+                {FILTERS.map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    className={`chip ${filter === f.id ? "on" : ""}`}
+                    aria-pressed={filter === f.id}
+                    onClick={() => setFilter(f.id)}
+                  >
+                    {f.label} <span className="num">{searched.filter((i) => matchesFilter(i, f.id, today)).length}</span>
+                  </button>
+                ))}
+              </div>
+            </div>
+            {error && (
+              <div role="alert" className="banner error">
+                <span>{error}</span>
+              </div>
+            )}
+            <div className="table-wrap">
+              <table className="cart inv-table">
+                <thead>
+                  <tr>
+                    <th>الباركود</th>
+                    <th>الصنف</th>
+                    <th>التصنيف</th>
+                    <th>المخزون</th>
+                    <th>سعر البيع</th>
+                    <th>أقرب انتهاء (FEFO)</th>
+                    <th>
+                      <span className="sr-only">الدفعات</span>
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {items && shown.length === 0 && (
+                    <tr>
+                      <td colSpan={7} className="empty">
+                        {items.length === 0 ? "لا توجد أصناف بعد" : "لا توجد أصناف تطابق البحث أو التصفية"}
+                      </td>
+                    </tr>
+                  )}
+                  {shown.map((i) => (
+                    <tr key={i.id} onClick={() => setSelected(i)} className="clickable">
+                      <td>{i.barcode ? <bdi className="num">{i.barcode}</bdi> : <span className="muted">—</span>}</td>
+                      <td>
+                        <div className="strong">
+                          <bdi>{i.tradeName}</bdi>
+                          {i.requiresRx && <span className="tag info">وصفة</span>}
+                        </div>
+                        <div className="muted small">
+                          {i.tradeNameAr && <><bdi>{i.tradeNameAr}</bdi> · </>}
+                          {i.form} · <bdi>{i.strength}</bdi> · عبوة {i.packSize}
+                        </div>
+                      </td>
+                      <td>{i.category ?? <span className="muted">—</span>}</td>
+                      <td>
+                        <div className="stock-cell">
+                          <bdi className="num strong">{i.stock}</bdi>
+                          {isOut(i) ? (
+                            <span className="tag bad">نفد</span>
+                          ) : isLow(i) ? (
+                            <span className="tag warn" title={`حد إعادة الطلب ${i.reorderLevel}`}>منخفض</span>
+                          ) : null}
+                          {i.expiredQty > 0 && <span className="tag bad">منتهي {i.expiredQty}</span>}
+                        </div>
+                      </td>
+                      <td className="num">{formatIqd(i.price)}</td>
+                      <td>{i.nearestExpiry ? <ExpiryTag date={i.nearestExpiry} today={today} /> : <span className="muted">—</span>}</td>
+                      <td>
+                        <button
+                          type="button"
+                          className="link-btn"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelected(i);
+                          }}
+                        >
+                          {canEdit ? "الدفعات والكميات" : "الدفعات"}
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+            <div className="cart-foot">
+              {canEdit
+                ? "اضغط على صنف لعرض دفعاته، واستلام دفعة جديدة، أو تصحيح الكمية بعد الجرد."
+                : "عرض فقط: ليست لديك صلاحية تعديل المخزون."}
+            </div>
+          </>
         )}
-        <div className="table-wrap">
-          <table className="cart inv-table">
-            <thead>
-              <tr>
-                <th>الباركود</th>
-                <th>الصنف</th>
-                <th>التصنيف</th>
-                <th>المخزون</th>
-                <th>سعر البيع</th>
-                <th>أقرب انتهاء (FEFO)</th>
-                <th>
-                  <span className="sr-only">الدفعات</span>
-                </th>
-              </tr>
-            </thead>
-            <tbody>
-              {items && shown.length === 0 && (
-                <tr>
-                  <td colSpan={7} className="empty">
-                    {items.length === 0 ? "لا توجد أصناف بعد" : "لا توجد أصناف تطابق البحث أو التصفية"}
-                  </td>
-                </tr>
-              )}
-              {shown.map((i) => (
-                <tr key={i.id} onClick={() => setSelected(i)} className="clickable">
-                  <td>{i.barcode ? <bdi className="num">{i.barcode}</bdi> : <span className="muted">—</span>}</td>
-                  <td>
-                    <div className="strong">
-                      <bdi>{i.tradeName}</bdi>
-                      {i.requiresRx && <span className="tag info">وصفة</span>}
-                    </div>
-                    <div className="muted small">
-                      {i.tradeNameAr && <><bdi>{i.tradeNameAr}</bdi> · </>}
-                      {i.form} · <bdi>{i.strength}</bdi> · عبوة {i.packSize}
-                    </div>
-                  </td>
-                  <td>{i.category ?? <span className="muted">—</span>}</td>
-                  <td>
-                    <div className="stock-cell">
-                      <bdi className="num strong">{i.stock}</bdi>
-                      {isOut(i) ? (
-                        <span className="tag bad">نفد</span>
-                      ) : isLow(i) ? (
-                        <span className="tag warn" title={`حد إعادة الطلب ${i.reorderLevel}`}>منخفض</span>
-                      ) : null}
-                      {i.expiredQty > 0 && <span className="tag bad">منتهي {i.expiredQty}</span>}
-                    </div>
-                  </td>
-                  <td className="num">{formatIqd(i.price)}</td>
-                  <td>{i.nearestExpiry ? <ExpiryTag date={i.nearestExpiry} today={today} /> : <span className="muted">—</span>}</td>
-                  <td>
-                    <button
-                      type="button"
-                      className="link-btn"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setSelected(i);
-                      }}
-                    >
-                      {canEdit ? "الدفعات والكميات" : "الدفعات"}
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-        <div className="cart-foot">
-          {canEdit
-            ? "اضغط على صنف لعرض دفعاته، واستلام دفعة جديدة، أو تصحيح الكمية بعد الجرد."
-            : "عرض فقط: ليست لديك صلاحية تعديل المخزون."}
-        </div>
       </section>
 
       {adding && (

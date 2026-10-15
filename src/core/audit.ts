@@ -34,6 +34,14 @@ export const AUDIT_ACTIONS: Record<string, string> = {
   "supplier.create": "إضافة مورد",
   "settings.sales": "إعدادات البيع",
   "settings.receipt": "إعدادات الإيصال",
+  "settings.sync": "إعدادات المزامنة",
+  "branch.create": "إضافة فرع",
+  "branch.update": "تعديل فرع",
+  "device.branch": "تغيير فرع الجهاز",
+  "transfer.request": "طلب تحويل مخزون",
+  "transfer.ship": "شحن تحويل",
+  "transfer.receive": "استلام تحويل",
+  "transfer.cancel": "إلغاء طلب تحويل",
 };
 
 export const auditActionLabel = (action: string) => AUDIT_ACTIONS[action] ?? action;
@@ -62,6 +70,7 @@ const FIELDS: Record<string, string> = {
   phone: "الهاتف",
   footer: "التذييل",
   paper: "الورق",
+  code: "الرمز",
   // Details stored next to the change.
   reason: "السبب",
   source: "المصدر",
@@ -232,6 +241,28 @@ export function auditSummary(action: string, payload: string): string {
       parts.push(changed.length ? `تغيير ${changed.map((c) => c.label).join("، ")}` : "بدون تغيير");
       break;
     }
+    case "branch.create":
+      parts.push(`${p.to?.name ?? ""} (${p.to?.code ?? ""})`);
+      break;
+    case "branch.update": {
+      const changed = changes();
+      parts.push(String(p.to?.name ?? ""), changed.length ? `تغيير ${changed.map((c) => c.label).join("، ")}` : "بدون تغيير");
+      break;
+    }
+    case "device.branch":
+      parts.push(`من ${p.from ?? "—"} إلى ${p.to}`);
+      break;
+    case "transfer.request":
+    case "transfer.ship":
+    case "transfer.receive": {
+      const lines: { product: string; qty: number }[] = Array.isArray(p.lines) ? p.lines : [];
+      const units = lines.reduce((s, l) => s + (Number(l.qty) || 0), 0);
+      parts.push(p.to ? `إلى ${p.to}` : `من ${p.from}`, `${units} وحدة`, `${new Set(lines.map((l) => l.product)).size} صنف`);
+      break;
+    }
+    case "transfer.cancel":
+      parts.push("إلغاء الطلب قبل الشحن");
+      break;
     default:
       if (Object.keys(p).length) parts.push(payload);
   }

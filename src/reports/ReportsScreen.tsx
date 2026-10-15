@@ -7,12 +7,14 @@ import {
   type AuditReport,
   type AuditRow,
   type Category,
+  type DeviceInfo,
   type ExpiryReport,
   type ReorderRow,
   type ReportFilter,
   type RxReport,
   type SalesReport,
   type SalesRow,
+  type SyncStatus,
   type User,
   type UserRef,
 } from "../core/types.ts";
@@ -36,13 +38,28 @@ const TABS: {
   /** Label of the user filter, if the report has one. */
   userFilter?: string;
   usesCategory: boolean;
+  /** "all": a branch or every branch; "one": a single branch; undefined: this device only (the audit log). */
+  branches?: "all" | "one";
 }[] = [
-  { id: "sales", label: "المبيعات والأرباح", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true },
-  { id: "expiry", label: "الصلاحية والتالف", allowed: stockReports, usesDates: true, usesCategory: true },
-  { id: "reorder", label: "إعادة الطلب", allowed: stockReports, usesDates: false, usesCategory: true },
-  { id: "rx", label: "سجل الوصفات الطبية", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true },
+  { id: "sales", label: "المبيعات والأرباح", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true, branches: "all" },
+  { id: "expiry", label: "الصلاحية والتالف", allowed: stockReports, usesDates: true, usesCategory: true, branches: "all" },
+  { id: "reorder", label: "إعادة الطلب", allowed: stockReports, usesDates: false, usesCategory: true, branches: "one" },
+  { id: "rx", label: "سجل الوصفات الطبية", allowed: moneyReports, usesDates: true, userFilter: "الكاشير", usesCategory: true, branches: "all" },
   { id: "audit", label: "سجل التدقيق", allowed: adminOnly, usesDates: true, userFilter: "المستخدم", usesCategory: false },
 ];
+
+/** Other branches' figures reach this device through the cloud, so they are offered only while it is connected.
+ *  The browser demo keeps every branch in memory and counts as connected. */
+function useOnline(): boolean {
+  const [status, setStatus] = useState<SyncStatus | null>(null);
+  useEffect(() => {
+    let stop = () => {};
+    repo.syncStatus().then(setStatus, () => {});
+    void repo.onSyncStatus(setStatus).then((unlisten) => (stop = unlisten));
+    return () => stop();
+  }, []);
+  return repo.kind === "demo" || status?.state === "synced" || status?.state === "syncing";
+}
 
 const HORIZONS = [30, 90, 180];
 
@@ -387,8 +404,11 @@ function toCsv(title: string, meta: string[], view: View): string {
 // ── Screen ──
 
 /** Stays mounted (filters survive switching screens); reloads whenever it becomes `visible`, so figures are current. */
-export function ReportsScreen({ user, visible = true }: { user: User; visible?: boolean }) {
+export function ReportsScreen({ user, visible = true, device }: { user: User; visible?: boolean; device: DeviceInfo }) {
   const today = localToday();
+  const online = useOnline();
+  // "" is every branch. Offline, reports stay on this device's branch whatever was picked.
+  const [branchPick, setBranchPick] = useState(device.branch.id);
   const tabs = TABS.filter((t) => t.allowed(user));
   const [tab, setTab] = useState<Tab | undefined>(tabs[0]?.id);
   const [from, setFrom] = useState(today.slice(0, 8) + "01");
@@ -408,6 +428,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
 
   const current = TABS.find((t) => t.id === tab);
   const view = loaded && loaded.tab === tab ? loaded.view : null;
+  const branchId = !online ? device.branch.id : current?.branches === "one" ? branchPick || device.branch.id : branchPick;
   const canSeeMoney = user.permissions.viewReports;
 
   useEffect(() => {
@@ -418,7 +439,13 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
   useEffect(() => {
     if (!tab || !visible) return;
     let stale = false;
-    const f: ReportFilter = { from, to, cashierId: cashierId || undefined, categoryId: categoryId || undefined };
+    const f: ReportFilter = {
+      from,
+      to,
+      cashierId: cashierId || undefined,
+      categoryId: categoryId || undefined,
+      branchId: branchId || undefined,
+    };
     setLoading(true);
     setError("");
     setNotice("");
@@ -428,7 +455,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
         : tab === "expiry"
           ? repo.reportExpiry(f, withinDays).then((r) => expiryView(r, withinDays, today))
           : tab === "reorder"
-            ? repo.reportReorder(f.categoryId).then(reorderView)
+            ? repo.reportReorder(f.categoryId, f.branchId).then(reorderView)
             : tab === "rx"
               ? repo.reportPrescriptions(f).then(rxView)
               : repo.reportAudit({ ...f, categoryId: undefined }, auditCategory || undefined).then((r) => auditView(r, setAuditEntry));
@@ -443,7 +470,7 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
     return () => {
       stale = true;
     };
-  }, [tab, from, to, cashierId, categoryId, withinDays, auditCategory, today, visible]);
+  }, [tab, from, to, cashierId, categoryId, branchId, withinDays, auditCategory, today, visible]);
 
   if (!tab || !current) {
     return (
@@ -467,6 +494,9 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
   // What the report covers, for the print header and the CSV file.
   const meta = [
     current.usesDates ? `الفترة: من ${from} إلى ${to}` : `حتى تاريخ ${today}`,
+    current.branches
+      ? `الفرع: ${branchId ? device.branches.find((b) => b.id === branchId)?.name ?? branchId : "كل الفروع"}`
+      : `الجهاز: ${device.deviceTag} · ${device.branch.name}`,
     ...(tab === "expiry" ? [`تنبيه الانتهاء: خلال ${withinDays} يوماً`] : []),
     ...(current.userFilter && cashierId ? [`${current.userFilter}: ${users.find((u) => u.id === cashierId)?.fullName ?? cashierId}`] : []),
     ...(current.usesCategory && categoryId ? [`التصنيف: ${categories.find((c) => c.id === categoryId)?.nameAr ?? categoryId}`] : []),
@@ -524,6 +554,27 @@ export function ReportsScreen({ user, visible = true }: { user: User; visible?: 
         </div>
 
         <div className="rep-filters no-print">
+          {current.branches && device.branches.length > 1 && (
+            <label className="rep-field">
+              <span className="label">الفرع</span>
+              <select
+                className="field"
+                value={online ? (current.branches === "one" ? branchPick || device.branch.id : branchPick) : device.branch.id}
+                disabled={!online}
+                title={online ? undefined : "غير متصل بالسحابة: تقارير هذا الفرع فقط"}
+                onChange={(e) => setBranchPick(e.target.value)}
+              >
+                {current.branches === "all" && <option value="">كل الفروع</option>}
+                {device.branches.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.name}
+                    {b.id === device.branch.id ? " (هذا الفرع)" : ""}
+                  </option>
+                ))}
+              </select>
+              {!online && <span className="muted small">غير متصل: هذا الفرع فقط</span>}
+            </label>
+          )}
           {current.usesDates && (
             <>
               <label className="rep-field">

@@ -7,6 +7,9 @@ import type {
   AuditReport,
   AuthStatus,
   Batch,
+  Branch,
+  BranchInput,
+  DeviceInfo,
   Category,
   ExpiryReport,
   FirewallState,
@@ -37,6 +40,9 @@ import type {
   SalesReport,
   SearchMode,
   Supplier,
+  Transfer,
+  TransferRequest,
+  TransferShipment,
   User,
   UserRef,
   UserRow,
@@ -46,8 +52,9 @@ import type { PharmacyRepo } from "./repo.ts";
 export const tauriRepo: PharmacyRepo = {
   kind: "sqlite",
   authStatus: () => invoke<AuthStatus>("auth_status"),
-  setupAdmin: (password: string) => invoke<User>("setup_admin", { password }),
-  login: (username: string, password: string) => invoke<User>("login", { username, password }),
+  setupAdmin: (password: string, branchId?: string) => invoke<User>("setup_admin", { password, branchId: branchId ?? null }),
+  login: (username: string, password: string, branchId?: string) =>
+    invoke<User>("login", { username, password, branchId: branchId ?? null }),
   logout: () => invoke<void>("logout"),
   search: (query: string, mode: SearchMode) => invoke<ProductHit[]>("search_products", { query, mode }),
   findByCode: (codes: string[]) => invoke<ProductHit | null>("find_by_code", { codes }),
@@ -67,7 +74,8 @@ export const tauriRepo: PharmacyRepo = {
   reportUsers: () => invoke<UserRef[]>("report_users"),
   reportSales: (filter: ReportFilter) => invoke<SalesReport>("report_sales", { filter }),
   reportExpiry: (filter: ReportFilter, withinDays: number) => invoke<ExpiryReport>("report_expiry", { filter, withinDays }),
-  reportReorder: (categoryId?: string) => invoke<ReorderRow[]>("report_reorder", { categoryId: categoryId ?? null }),
+  reportReorder: (categoryId?: string, branchId?: string) =>
+    invoke<ReorderRow[]>("report_reorder", { categoryId: categoryId ?? null, branchId: branchId ?? null }),
   reportPrescriptions: (filter: ReportFilter) => invoke<RxReport>("report_prescriptions", { filter }),
   reportAudit: (filter: ReportFilter, category?: AuditCategory) =>
     invoke<AuditReport>("report_audit", { filter, category: category ?? null }),
@@ -93,4 +101,11 @@ export const tauriRepo: PharmacyRepo = {
   saveReceiptSettings: (settings: ReceiptSettings) => invoke<ReceiptSettings>("save_receipt_settings", { settings }),
   saleReceipt: (saleId: string, reprint: boolean) => invoke<Receipt>("sale_receipt", { saleId, reprint }),
   recentSales: () => invoke<RecentSale[]>("recent_sales"),
+  deviceInfo: () => invoke<DeviceInfo>("device_info"),
+  saveBranch: (branch: BranchInput) => invoke<Branch>("save_branch", { branch: { ...branch, id: branch.id ?? null } }),
+  transfers: () => invoke<Transfer[]>("list_transfers"),
+  requestTransfer: (request: TransferRequest) => invoke<Transfer>("request_transfer", { request }),
+  shipTransfer: (shipment: TransferShipment) => invoke<Transfer>("ship_transfer", { shipment }),
+  receiveTransfer: (transferId: string) => invoke<Transfer>("receive_transfer", { transferId }),
+  cancelTransfer: (transferId: string) => invoke<Transfer>("cancel_transfer", { transferId }),
 };

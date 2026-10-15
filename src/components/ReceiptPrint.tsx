@@ -46,6 +46,7 @@ export function ReceiptPrint({ receipt: r }: { receipt: Receipt }) {
     <div className={`receipt-print paper-${s.paper}`} dir="rtl">
       <header className="r-center">
         <div className="r-title">{s.name}</div>
+        {r.branchName && <div>{r.branchName}</div>}
         {s.address && <div>{s.address}</div>}
         {s.phone && (
           <div>

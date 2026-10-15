@@ -9,7 +9,7 @@ import {
   type Permission,
   type PermissionOverrides,
 } from "../core/permissions.ts";
-import type { Role, SyncSettings, SyncStatus, User, UserRow } from "../core/types.ts";
+import type { Branch, DeviceInfo, Role, SyncSettings, SyncStatus, User, UserRow } from "../core/types.ts";
 import { repo } from "../data/index.ts";
 import { errorText, Field, Modal, toInt } from "../ui/Modal.tsx";
 
@@ -19,12 +19,13 @@ type Dialog =
   | { kind: "add" }
   | { kind: "discount" }
   | { kind: "sync" }
+  | { kind: "branches" }
   | { kind: "access"; user: UserRow }
   | { kind: "password"; user: UserRow }
   | { kind: "deactivate"; user: UserRow };
 
 /** Employees and their access. Admin only: App renders it for admins, and every user command checks again. */
-export function UsersScreen({ me }: { me: User }) {
+export function UsersScreen({ me, device, onBranchesChanged }: { me: User; device: DeviceInfo; onBranchesChanged: () => void }) {
   const [users, setUsers] = useState<UserRow[] | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
@@ -58,6 +59,9 @@ export function UsersScreen({ me }: { me: User }) {
         <div className="inv-head">
           <h2 id="users-title">الموظفين</h2>
           <span className="muted">{users ? `${users.filter((u) => u.active).length} نشط من ${users.length}` : "جارٍ التحميل…"}</span>
+          <button type="button" className="btn" onClick={() => setDialog({ kind: "branches" })}>
+            الفروع
+          </button>
           <button type="button" className="btn" onClick={() => setDialog({ kind: "sync" })}>
             المزامنة السحابية
           </button>
@@ -143,6 +147,16 @@ export function UsersScreen({ me }: { me: User }) {
           onSaved={(s) => {
             setDialog(null);
             setNotice(s.enabled ? "تم حفظ إعدادات المزامنة وتفعيلها" : "تم حفظ إعدادات المزامنة (غير مفعّلة)");
+          }}
+        />
+      )}
+      {dialog?.kind === "branches" && (
+        <BranchesDialog
+          device={device}
+          onClose={() => setDialog(null)}
+          onSaved={(b) => {
+            onBranchesChanged();
+            setNotice(`تم حفظ الفرع ${b.name}`);
           }}
         />
       )}
@@ -479,6 +493,103 @@ function DiscountCapDialog({ onClose, onSaved }: { onClose: () => void; onSaved:
           <button type="button" className="btn" onClick={onClose}>إلغاء</button>
           <button type="submit" className="btn primary" disabled={busy || pct === null}>
             {busy ? "جارٍ الحفظ…" : "حفظ"}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+/** Every branch of the pharmacy. New branches reach the other devices with the cloud sync; a device is moved to a
+ *  branch by an admin choosing it at sign-in. */
+function BranchesDialog({ device, onClose, onSaved }: { device: DeviceInfo; onClose: () => void; onSaved: (b: Branch) => void }) {
+  const [branches, setBranches] = useState<Branch[]>(device.branches);
+  const empty = { id: undefined as string | undefined, code: "", name: "", address: "", phone: "", active: true };
+  const [f, setF] = useState(empty);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const set = (key: "code" | "name" | "address" | "phone") => (e: { target: { value: string } }) => setF({ ...f, [key]: e.target.value });
+  const edit = (b: Branch) => setF({ id: b.id, code: b.code, name: b.name, address: b.address ?? "", phone: b.phone ?? "", active: b.active });
+
+  async function submit(e: FormEvent) {
+    e.preventDefault();
+    setError("");
+    setBusy(true);
+    try {
+      const saved = await repo.saveBranch({ ...f, address: f.address || undefined, phone: f.phone || undefined });
+      setBranches((all) => [...all.filter((b) => b.id !== saved.id), saved]);
+      setF(empty);
+      onSaved(saved);
+    } catch (err) {
+      setError(errorText(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <Modal title="الفروع" onClose={onClose} wide>
+      <form className="modal-body" onSubmit={submit}>
+        {error && <div role="alert" className="banner error"><span>{error}</span></div>}
+        <div className="table-wrap">
+          <table className="cart">
+            <thead>
+              <tr>
+                <th>الرمز</th>
+                <th>الفرع</th>
+                <th>العنوان والهاتف</th>
+                <th>الحالة</th>
+                <th><span className="sr-only">تعديل</span></th>
+              </tr>
+            </thead>
+            <tbody>
+              {branches.map((b) => (
+                <tr key={b.id}>
+                  <td><bdi className="num">{b.code}</bdi></td>
+                  <td>
+                    {b.name}
+                    {b.id === device.branch.id && <span className="tag info">هذا الجهاز</span>}
+                  </td>
+                  <td className="muted small">{[b.address, b.phone].filter(Boolean).join(" · ") || "—"}</td>
+                  <td>{b.active ? <span className="tag ok">يعمل</span> : <span className="tag">موقوف</span>}</td>
+                  <td>
+                    <button type="button" className="link-btn" onClick={() => edit(b)}>تعديل</button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <h4 className="audit-sub">{f.id ? `تعديل ${f.name || "الفرع"}` : "فرع جديد"}</h4>
+        <div className="form-grid">
+          <Field id="br-code" label="الرمز *" hint="حتى ٦ أحرف إنجليزية أو أرقام؛ يبدأ به رقم الفاتورة">
+            <input id="br-code" className="field num" dir="ltr" maxLength={6} value={f.code} onChange={set("code")} required />
+          </Field>
+          <Field id="br-name" label="اسم الفرع *">
+            <input id="br-name" className="field" value={f.name} onChange={set("name")} required />
+          </Field>
+          <Field id="br-address" label="العنوان" hint="يُطبع على إيصالات هذا الفرع">
+            <input id="br-address" className="field" value={f.address} onChange={set("address")} />
+          </Field>
+          <Field id="br-phone" label="الهاتف">
+            <input id="br-phone" className="field num" dir="ltr" value={f.phone} onChange={set("phone")} />
+          </Field>
+        </div>
+        {f.id && (
+          <label className="check">
+            <input type="checkbox" checked={f.active} onChange={(e) => setF({ ...f, active: e.target.checked })} />
+            الفرع يعمل (الموقوف لا يُختار عند الدخول ولا يُحوَّل إليه)
+          </label>
+        )}
+        <p className="muted small">
+          يصل الفرع الجديد إلى الأجهزة الأخرى بالمزامنة السحابية. لنقل جهاز إلى فرع يختاره المدير في شاشة الدخول.
+        </p>
+        <div className="modal-actions">
+          {f.id && <button type="button" className="btn" onClick={() => setF(empty)}>فرع جديد بدلاً من ذلك</button>}
+          <button type="button" className="btn" onClick={onClose}>إغلاق</button>
+          <button type="submit" className="btn primary" disabled={busy}>
+            {busy ? "جارٍ الحفظ…" : f.id ? "حفظ التعديل" : "إضافة الفرع"}
           </button>
         </div>
       </form>

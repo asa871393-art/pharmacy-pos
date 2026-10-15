@@ -232,6 +232,8 @@ export interface ReportFilter {
   to: string;
   cashierId?: string;
   categoryId?: string;
+  /** Leave out for every branch. */
+  branchId?: string;
 }
 
 export interface SalesTotals {
@@ -448,7 +450,9 @@ export interface Receipt {
   change: number;
   prescription: { rxNo: string; prescriber: string; pharmacist: string | null } | null;
   copy: boolean; // a reprint
+  /** Address and phone are the branch's own when it has them. */
   settings: ReceiptSettings;
+  branchName: string;
 }
 
 export interface RecentSale {
@@ -458,4 +462,90 @@ export interface RecentSale {
   cashier: string | null;
   items: number;
   total: number;
+}
+
+// ── Branches and transfers ──
+
+export interface Branch {
+  id: string;
+  code: string;
+  name: string;
+  address: string | null;
+  phone: string | null;
+  active: boolean;
+}
+
+export interface BranchInput {
+  /** Leave out to add a branch. */
+  id?: string;
+  code: string;
+  name: string;
+  address?: string;
+  phone?: string;
+  active: boolean;
+}
+
+/** This device, the branch it works for, and every branch it knows. */
+export interface DeviceInfo {
+  deviceId: string;
+  /** Short form of the device id; also part of invoice and transfer numbers. */
+  deviceTag: string;
+  deviceName: string;
+  branch: Branch;
+  branches: Branch[];
+}
+
+export type TransferStatus = "requested" | "shipped" | "received" | "cancelled";
+
+export interface TransferItem {
+  productId: string;
+  product: string;
+  /** Request lines. */
+  requestedQty: number;
+  /** Shipped lines, one per batch taken. */
+  qty: number;
+  batchNo: string | null;
+  expiryDate: string | null;
+}
+
+export interface Transfer {
+  id: string;
+  transferNo: string;
+  fromBranchId: string;
+  fromBranch: string;
+  toBranchId: string;
+  toBranch: string;
+  status: TransferStatus;
+  /** "out": this branch sends; "in": this branch receives. */
+  direction: "out" | "in";
+  note: string | null;
+  requestedBy: string | null;
+  requestedAt: string | null;
+  shippedBy: string | null;
+  shippedAt: string | null;
+  receivedBy: string | null;
+  receivedAt: string | null;
+  /** Units shipped, or requested while only requested. */
+  units: number;
+  items: TransferItem[];
+}
+
+export interface TransferLine {
+  productId: string;
+  qty: number;
+}
+
+export interface TransferRequest {
+  /** The branch asked to send; this device's branch receives. */
+  fromBranchId: string;
+  note?: string;
+  lines: TransferLine[];
+}
+
+export interface TransferShipment {
+  /** Ship a request addressed to this branch; leave out for a new transfer to `toBranchId`. */
+  transferId?: string;
+  toBranchId?: string;
+  note?: string;
+  lines: TransferLine[];
 }

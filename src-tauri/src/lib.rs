@@ -10,6 +10,16 @@ use sha2::{Digest, Sha256};
 use std::sync::{Arc, Mutex};
 use tauri::{Emitter, Manager, State};
 
+/// SQL for this device's branch: the one chosen at sign-in (settings 'branch_id'), else the first branch.
+/// A macro so it can be spliced into the `concat!` queries below and into sync.rs.
+macro_rules! active_branch_sql {
+    () => {
+        "(SELECT COALESCE((SELECT b.id FROM settings s JOIN branches b ON b.id = s.value WHERE s.key = 'branch_id'),
+                          (SELECT id FROM branches ORDER BY created_at, id LIMIT 1)))"
+    };
+}
+
+mod branches;
 mod phone_scanner;
 mod sync;
 
@@ -25,6 +35,7 @@ const USER_PERMISSIONS_SQL: &str = include_str!("../migrations/0003_user_permiss
 const RECEIPT_SETTINGS_SQL: &str = include_str!("../migrations/0004_receipt_settings.sql");
 const REPORT_INDEXES_SQL: &str = include_str!("../migrations/0005_report_indexes.sql");
 const SYNC_QUEUE_SQL: &str = include_str!("../migrations/0006_sync_queue.sql");
+const BRANCHES_SQL: &str = include_str!("../migrations/0007_branches.sql");
 const DEMO_SQL: &str = include_str!("../migrations/demo_seed.sql");
 
 fn migrate(conn: &Connection) -> rusqlite::Result<()> {
@@ -73,6 +84,12 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         tx.execute_batch("PRAGMA user_version = 6;")?;
         tx.commit()?;
     }
+    if version < 7 {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(BRANCHES_SQL)?;
+        tx.execute_batch("PRAGMA user_version = 7;")?;
+        tx.commit()?;
+    }
     // Version 0.1 ships with demo data so the shop can try every screen right away.
     let products: i64 = conn.query_row("SELECT COUNT(*) FROM products", [], |r| r.get(0))?;
     if products == 0 {
@@ -81,6 +98,11 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         sync::backfill(&tx)?;
         tx.commit()?;
     }
+    // Pin this device to a branch before any pull can bring in branches that sort earlier.
+    conn.execute(
+        "INSERT OR IGNORE INTO settings(key, value) SELECT 'branch_id', id FROM branches ORDER BY created_at, id LIMIT 1",
+        [],
+    )?;
     Ok(())
 }
 
@@ -326,17 +348,22 @@ pub struct SaleResult {
 
 // ── Product search ──
 
-const HIT_SELECT: &str = "SELECT p.id, p.trade_name, p.strength_label, p.dosage_form, p.pack_size, p.sell_price,
+/// Stock figures are this device's branch only.
+const HIT_SELECT: &str = concat!(
+    "SELECT p.id, p.trade_name, p.strength_label, p.dosage_form, p.pack_size, p.sell_price,
   p.requires_rx, p.composition_key,
   COALESCE((SELECT group_concat(ai.name_inn, ' + ') FROM product_ingredients pi
             JOIN active_ingredients ai ON ai.id = pi.ingredient_id WHERE pi.product_id = p.id), '') AS generic,
   COALESCE((SELECT group_concat(COALESCE(ai.drug_class, ''), ',') FROM product_ingredients pi
             JOIN active_ingredients ai ON ai.id = pi.ingredient_id WHERE pi.product_id = p.id), '') AS classes,
   COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
-            AND b.expiry_date > date('now', 'localtime')), 0) AS stock,
+            AND b.expiry_date > date('now', 'localtime') AND b.branch_id = br.id), 0) AS stock,
   (SELECT MIN(b.expiry_date) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
-            AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime')) AS nearest
-  FROM products p";
+            AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime') AND b.branch_id = br.id) AS nearest
+  FROM products p, (SELECT ",
+    active_branch_sql!(),
+    " AS id) br"
+);
 
 fn map_hit(r: &rusqlite::Row) -> rusqlite::Result<ProductHit> {
     let classes: String = r.get(9)?;
@@ -435,11 +462,12 @@ fn alternatives(db: State<'_, Db>, product_id: String) -> Result<Vec<ProductHit>
 fn product_batches(db: State<'_, Db>, product_id: String) -> Result<Vec<BatchDto>, String> {
     let conn = db.0.lock().map_err(err)?;
     let mut stmt = conn
-        .prepare(
+        .prepare(concat!(
             "SELECT id, product_id, batch_no, expiry_date, qty_on_hand, unit_cost, sell_price, received_at
-             FROM batches WHERE product_id = ?1 AND status = 'active' AND qty_on_hand > 0
-             ORDER BY expiry_date, received_at",
-        )
+             FROM batches WHERE product_id = ?1 AND status = 'active' AND qty_on_hand > 0 AND branch_id = ",
+            active_branch_sql!(),
+            " ORDER BY expiry_date, received_at"
+        ))
         .map_err(err)?;
     let rows = stmt
         .query_map(params![product_id], |r| {
@@ -464,8 +492,41 @@ fn new_id() -> String {
     uuid::Uuid::now_v7().to_string()
 }
 
+// ── Branch and device ──
+
+/// The branch this device works for (see active_branch_sql).
+fn active_branch(conn: &Connection) -> Result<String, String> {
+    conn.query_row(concat!("SELECT ", active_branch_sql!()), [], |r| r.get::<_, Option<String>>(0))
+        .map_err(err)?
+        .ok_or_else(|| "لم يُعرَّف أي فرع بعد".to_string())
+}
+
+fn branch_code(conn: &Connection, branch_id: &str) -> Result<String, String> {
+    conn.query_row("SELECT code FROM branches WHERE id = ?1", params![branch_id], |r| r.get(0))
+        .optional()
+        .map_err(err)?
+        .ok_or_else(|| "الفرع غير موجود".to_string())
+}
+
+fn device_id(conn: &Connection) -> Result<String, String> {
+    setting(conn, "sync_device_id")
+}
+
+/// Last four hex digits of the device id, upper case: tells apart numbers made on different devices.
+fn device_tag(conn: &Connection) -> Result<String, String> {
+    let id = device_id(conn)?.replace('-', "");
+    Ok(id[id.len().saturating_sub(4)..].to_uppercase())
+}
+
+/// Increments a counter kept in settings and returns the new value.
+fn next_counter(tx: &Connection, key: &str) -> Result<i64, String> {
+    tx.execute("INSERT OR IGNORE INTO settings(key, value) VALUES (?1, '0')", params![key]).map_err(err)?;
+    tx.execute("UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key = ?1", params![key]).map_err(err)?;
+    tx.query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = ?1", params![key], |r| r.get(0)).map_err(err)
+}
+
 fn append_audit(
-    tx: &rusqlite::Transaction,
+    tx: &Connection,
     user_id: &str,
     action: &str,
     entity: &str,
@@ -537,8 +598,8 @@ fn utc_now(conn: &Connection) -> Result<String, String> {
     conn.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now')", [], |r| r.get(0)).map_err(err)
 }
 
-/// First run only: sets the password of the first admin account and signs it in.
-fn setup_admin_inner(conn: &mut Connection, password: &str) -> Result<UserDto, String> {
+/// First run only: sets the password of the first admin account and signs it in, on the chosen branch.
+fn setup_admin_inner(conn: &mut Connection, password: &str, branch_id: Option<&str>) -> Result<UserDto, String> {
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!("كلمة المرور يجب ألا تقل عن {MIN_PASSWORD_LEN} أحرف"));
     }
@@ -559,12 +620,16 @@ fn setup_admin_inner(conn: &mut Connection, password: &str) -> Result<UserDto, S
         .map_err(err)?;
     let now = utc_now(&tx)?;
     append_audit(&tx, &admin_id, "user.setup", "users", &admin_id, "{}", &now).map_err(err)?;
+    if let Some(b) = branch_id {
+        branches::set_device_branch(&tx, &admin_id, b)?;
+    }
     let user = active_user(&tx, &admin_id)?.ok_or(BAD_LOGIN)?;
     tx.commit().map_err(err)?;
     Ok(user)
 }
 
-fn login_inner(conn: &mut Connection, username: &str, password: &str) -> Result<UserDto, String> {
+/// `branch_id`: the branch picked on the sign-in screen. Moving the device to another branch needs an admin.
+fn login_inner(conn: &mut Connection, username: &str, password: &str, branch_id: Option<&str>) -> Result<UserDto, String> {
     let found: Option<(String, Option<String>)> = conn
         .query_row(
             "SELECT id, password_hash FROM users WHERE username = ?1 AND is_active = 1",
@@ -578,6 +643,9 @@ fn login_inner(conn: &mut Connection, username: &str, password: &str) -> Result<
         _ => return Err(BAD_LOGIN.into()),
     };
     let tx = conn.transaction().map_err(err)?;
+    if let Some(b) = branch_id {
+        branches::set_device_branch(&tx, &user_id, b)?;
+    }
     let now = utc_now(&tx)?;
     append_audit(&tx, &user_id, "user.login", "users", &user_id, "{}", &now).map_err(err)?;
     let user = active_user(&tx, &user_id)?.ok_or(BAD_LOGIN)?;
@@ -597,17 +665,28 @@ fn auth_status(db: State<'_, Db>, session: State<'_, Session>) -> Result<AuthSta
 }
 
 #[tauri::command]
-fn setup_admin(db: State<'_, Db>, session: State<'_, Session>, password: String) -> Result<UserDto, String> {
+fn setup_admin(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    password: String,
+    branch_id: Option<String>,
+) -> Result<UserDto, String> {
     let mut conn = db.0.lock().map_err(err)?;
-    let user = setup_admin_inner(&mut conn, &password)?;
+    let user = setup_admin_inner(&mut conn, &password, branch_id.as_deref())?;
     *session.0.lock().map_err(err)? = Some(user.id.clone());
     Ok(user)
 }
 
 #[tauri::command]
-fn login(db: State<'_, Db>, session: State<'_, Session>, username: String, password: String) -> Result<UserDto, String> {
+fn login(
+    db: State<'_, Db>,
+    session: State<'_, Session>,
+    username: String,
+    password: String,
+    branch_id: Option<String>,
+) -> Result<UserDto, String> {
     let mut conn = db.0.lock().map_err(err)?;
-    let user = login_inner(&mut conn, &username, &password)?;
+    let user = login_inner(&mut conn, &username, &password, branch_id.as_deref())?;
     *session.0.lock().map_err(err)? = Some(user.id.clone());
     Ok(user)
 }
@@ -732,9 +811,7 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
         return Err("البيع بالآجل يتطلب اختيار عميل".into());
     }
 
-    let branch_id: String = tx
-        .query_row("SELECT id FROM branches ORDER BY created_at LIMIT 1", [], |r| r.get(0))
-        .map_err(err)?;
+    let branch_id = active_branch(&tx)?;
     let (now, year): (String, String) = tx
         .query_row(
             "SELECT strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y', 'now', 'localtime')",
@@ -742,18 +819,9 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .map_err(err)?;
-    tx.execute(
-        "UPDATE settings SET value = CAST(value AS INTEGER) + 1 WHERE key = 'invoice_counter'",
-        [],
-    )
-    .map_err(err)?;
-    let counter: i64 = tx
-        .query_row("SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'invoice_counter'", [], |r| r.get(0))
-        .map_err(err)?;
-    let prefix: String = tx
-        .query_row("SELECT value FROM settings WHERE key = 'invoice_prefix'", [], |r| r.get(0))
-        .map_err(err)?;
-    let invoice_no = format!("{prefix}-{year}-{counter:06}");
+    let counter = next_counter(&tx, "invoice_counter")?;
+    // Branch code and device tag keep numbers unique across every till of every branch, e.g. MB7F3A-2026-000012.
+    let invoice_no = format!("{}{}-{year}-{counter:06}", branch_code(&tx, &branch_id)?, device_tag(&tx)?);
     let sale_id = new_id();
     let paid = total;
 
@@ -801,8 +869,8 @@ fn post_sale_inner(conn: &mut Connection, user_id: &str, draft: SaleDraft) -> Re
                 .execute(
                     "UPDATE batches SET qty_on_hand = qty_on_hand - ?1
                      WHERE id = ?2 AND qty_on_hand >= ?1 AND status = 'active'
-                       AND expiry_date > date('now', 'localtime')",
-                    params![a.qty, a.batch_id],
+                       AND expiry_date > date('now', 'localtime') AND branch_id = ?3",
+                    params![a.qty, a.batch_id, branch_id],
                 )
                 .map_err(err)?;
             if changed != 1 {
@@ -912,19 +980,24 @@ pub struct InventoryItem {
     reorder_level: Option<i64>,
 }
 
-const INVENTORY_SELECT: &str = "SELECT p.id,
+/// Stock and reorder level of this device's branch.
+const INVENTORY_SELECT: &str = concat!(
+    "SELECT p.id,
   (SELECT code FROM product_barcodes pb WHERE pb.product_id = p.id ORDER BY code LIMIT 1),
   p.trade_name, p.trade_name_ar, c.name_ar, p.dosage_form, p.strength_label, p.pack_size, p.sell_price, p.requires_rx,
   COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
-            AND b.expiry_date > date('now', 'localtime')), 0),
-  COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id
+            AND b.expiry_date > date('now', 'localtime') AND b.branch_id = br.id), 0),
+  COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.branch_id = br.id
             AND (b.status = 'expired' OR b.expiry_date <= date('now', 'localtime'))), 0),
   (SELECT MIN(b.expiry_date) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
-            AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime')),
-  (SELECT rr.reorder_level FROM reorder_rules rr WHERE rr.product_id = p.id LIMIT 1),
+            AND b.qty_on_hand > 0 AND b.expiry_date > date('now', 'localtime') AND b.branch_id = br.id),
+  (SELECT rr.reorder_level FROM reorder_rules rr WHERE rr.product_id = p.id AND rr.branch_id = br.id),
   p.category_id
-  FROM products p LEFT JOIN categories c ON c.id = p.category_id
-  WHERE p.is_active = 1";
+  FROM products p LEFT JOIN categories c ON c.id = p.category_id, (SELECT ",
+    active_branch_sql!(),
+    " AS id) br
+  WHERE p.is_active = 1"
+);
 
 fn map_inventory(r: &rusqlite::Row) -> rusqlite::Result<InventoryItem> {
     Ok(InventoryItem {
@@ -979,10 +1052,12 @@ pub struct InventoryBatch {
 /// Every batch of a product that still holds stock, expired ones included, in FEFO order.
 fn inventory_batches_inner(conn: &Connection, product_id: &str) -> Result<Vec<InventoryBatch>, String> {
     let mut stmt = conn
-        .prepare(
+        .prepare(concat!(
             "SELECT id, batch_no, expiry_date, qty_on_hand, unit_cost, sell_price, status, received_at
-             FROM batches WHERE product_id = ?1 AND qty_on_hand > 0 ORDER BY expiry_date, received_at",
-        )
+             FROM batches WHERE product_id = ?1 AND qty_on_hand > 0 AND branch_id = ",
+            active_branch_sql!(),
+            " ORDER BY expiry_date, received_at"
+        ))
         .map_err(err)?;
     let rows = stmt
         .query_map(params![product_id], |r| {
@@ -1104,11 +1179,15 @@ fn check_product(tx: &Connection, p: &NewProduct, own_id: Option<&str>) -> Resul
 /// A product's editable fields by name, for before/after audit entries.
 fn product_snapshot(conn: &Connection, id: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
     conn.query_row(
-        "SELECT p.trade_name, p.trade_name_ar, c.name_ar, p.dosage_form, p.strength_label, p.pack_size, p.requires_rx,
+        concat!(
+            "SELECT p.trade_name, p.trade_name_ar, c.name_ar, p.dosage_form, p.strength_label, p.pack_size, p.requires_rx,
                 p.sell_price,
                 (SELECT code FROM product_barcodes WHERE product_id = p.id ORDER BY code LIMIT 1),
-                (SELECT reorder_level FROM reorder_rules WHERE product_id = p.id LIMIT 1)
-         FROM products p LEFT JOIN categories c ON c.id = p.category_id WHERE p.id = ?1 AND p.is_active = 1",
+                (SELECT reorder_level FROM reorder_rules WHERE product_id = p.id AND branch_id = br.id)
+         FROM products p LEFT JOIN categories c ON c.id = p.category_id, (SELECT ",
+            active_branch_sql!(),
+            " AS id) br WHERE p.id = ?1 AND p.is_active = 1"
+        ),
         params![id],
         |r| {
             let v = serde_json::json!({
@@ -1148,8 +1227,7 @@ fn add_product_inner(conn: &mut Connection, user_id: &str, p: NewProduct) -> Res
     }
     if let Some(level) = p.reorder_level {
         tx.execute(
-            "INSERT INTO reorder_rules(product_id, branch_id, reorder_level)
-             SELECT ?1, id, ?2 FROM branches ORDER BY created_at LIMIT 1",
+            concat!("INSERT INTO reorder_rules(product_id, branch_id, reorder_level) VALUES (?1, ", active_branch_sql!(), ", ?2)"),
             params![id, level],
         )
         .map_err(err)?;
@@ -1193,12 +1271,14 @@ fn update_product_inner(conn: &mut Connection, user_id: &str, id: &str, p: NewPr
     match p.reorder_level {
         Some(level) => {
             let n = tx
-                .execute("UPDATE reorder_rules SET reorder_level = ?2 WHERE product_id = ?1", params![id, level])
+                .execute(
+                    concat!("UPDATE reorder_rules SET reorder_level = ?2 WHERE product_id = ?1 AND branch_id = ", active_branch_sql!()),
+                    params![id, level],
+                )
                 .map_err(err)?;
             if n == 0 {
                 tx.execute(
-                    "INSERT INTO reorder_rules(product_id, branch_id, reorder_level)
-                     SELECT ?1, id, ?2 FROM branches ORDER BY created_at LIMIT 1",
+                    concat!("INSERT INTO reorder_rules(product_id, branch_id, reorder_level) VALUES (?1, ", active_branch_sql!(), ", ?2)"),
                     params![id, level],
                 )
                 .map_err(err)?;
@@ -1207,11 +1287,19 @@ fn update_product_inner(conn: &mut Connection, user_id: &str, id: &str, p: NewPr
         // A rule that also holds a max level or a preferred supplier is kept, with no reorder level.
         None => {
             tx.execute(
-                "DELETE FROM reorder_rules WHERE product_id = ?1 AND max_qty = 0 AND preferred_supplier_id IS NULL",
+                concat!(
+                    "DELETE FROM reorder_rules WHERE product_id = ?1 AND max_qty = 0 AND preferred_supplier_id IS NULL
+                       AND branch_id = ",
+                    active_branch_sql!()
+                ),
                 params![id],
             )
             .map_err(err)?;
-            tx.execute("UPDATE reorder_rules SET reorder_level = 0 WHERE product_id = ?1", params![id]).map_err(err)?;
+            tx.execute(
+                concat!("UPDATE reorder_rules SET reorder_level = 0 WHERE product_id = ?1 AND branch_id = ", active_branch_sql!()),
+                params![id],
+            )
+            .map_err(err)?;
         }
     }
 
@@ -1299,9 +1387,7 @@ fn receive_batch_inner(conn: &mut Connection, user_id: &str, b: ReceiveBatch) ->
         .optional()
         .map_err(err)?
         .ok_or("صنف غير موجود أو موقوف")?;
-    let branch_id: String = tx
-        .query_row("SELECT id FROM branches ORDER BY created_at LIMIT 1", [], |r| r.get(0))
-        .map_err(err)?;
+    let branch_id = active_branch(&tx)?;
     let duplicate: bool = tx
         .query_row(
             "SELECT EXISTS (SELECT 1 FROM batches WHERE product_id = ?1 AND branch_id = ?2 AND batch_no = ?3)",
@@ -1372,13 +1458,18 @@ fn adjust_batch_inner(conn: &mut Connection, user_id: &str, a: AdjustBatch) -> R
     if a.new_qty < 0 {
         return Err("الكمية لا تكون سالبة".into());
     }
-    let (product_id, old_qty, unit_cost): (String, i64, i64) = tx
-        .query_row("SELECT product_id, qty_on_hand, unit_cost FROM batches WHERE id = ?1", params![a.batch_id], |r| {
-            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
-        })
+    let (product_id, old_qty, unit_cost, branch_id): (String, i64, i64, String) = tx
+        .query_row(
+            "SELECT product_id, qty_on_hand, unit_cost, branch_id FROM batches WHERE id = ?1",
+            params![a.batch_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
         .optional()
         .map_err(err)?
         .ok_or("الدفعة غير موجودة")?;
+    if branch_id != active_branch(&tx)? {
+        return Err("الدفعة تخص فرعاً آخر؛ يُعدَّل مخزون كل فرع من أجهزته".into());
+    }
     let delta = a.new_qty - old_qty;
     if delta == 0 {
         return Err("الكمية الجديدة مساوية للحالية".into());
@@ -1614,9 +1705,7 @@ fn post_purchase_inner(conn: &mut Connection, user_id: &str, inv: PurchaseInvoic
     }
     let total = subtotal;
 
-    let branch_id: String = tx
-        .query_row("SELECT id FROM branches ORDER BY created_at LIMIT 1", [], |r| r.get(0))
-        .map_err(err)?;
+    let branch_id = active_branch(&tx)?;
     let now = utc_now(&tx)?;
     let due_date: Option<String> = if on_credit {
         Some(
@@ -1828,6 +1917,9 @@ pub struct ReportFilter {
     to: String,
     cashier_id: Option<String>,
     category_id: Option<String>,
+    /// None: every branch.
+    #[serde(default)]
+    branch_id: Option<String>,
 }
 
 fn check_range(conn: &Connection, f: &ReportFilter) -> Result<(), String> {
@@ -1911,13 +2003,14 @@ pub struct SalesReport {
 
 /// One row per sale item in the filter. The invoice discount is shared over the sale's lines by value, so totals per
 /// cashier, day, product or category add up to the invoice totals. ?1..?2 UTC range (utc_range), ?3 cashier,
-/// ?4 category.
+/// ?4 category, ?5 branch.
 const SALE_ITEMS_CTE: &str = "WITH s AS (
     SELECT s.id, s.cashier_id, date(s.created_at, 'localtime') AS day,
            s.discount_total - COALESCE((SELECT SUM(discount) FROM sale_items WHERE sale_id = s.id), 0) AS inv_disc,
            COALESCE((SELECT SUM(line_total) FROM sale_items WHERE sale_id = s.id), 0) AS lines_total
     FROM sales s
     WHERE s.status = 'paid' AND s.created_at >= ?1 AND s.created_at < ?2 AND (?3 IS NULL OR s.cashier_id = ?3)
+      AND (?5 IS NULL OR s.branch_id = ?5)
   ), i AS (
     SELECT s.id AS sale_id, s.cashier_id, s.day, it.product_id, p.trade_name, it.qty,
            it.qty * it.unit_price AS gross,
@@ -1937,7 +2030,7 @@ fn sales_rows(conn: &Connection, f: &ReportFilter, key: &str, label: &str, tail:
     let sql = format!("{SALE_ITEMS_CTE} SELECT {key}, {label}, {SALES_AGG} FROM i {tail}");
     let mut stmt = conn.prepare(&sql).map_err(err)?;
     let rows = stmt
-        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id, f.branch_id], |r| {
             Ok(SalesRow {
                 key: r.get(0)?,
                 label: r.get(1)?,
@@ -1961,7 +2054,7 @@ fn report_sales_inner(conn: &Connection, f: &ReportFilter) -> Result<SalesReport
                 "{SALE_ITEMS_CTE} SELECT COUNT(DISTINCT sale_id), COALESCE(SUM(qty), 0), COALESCE(SUM(gross), 0),
                    CAST(ROUND(COALESCE(SUM(disc), 0)) AS INTEGER), COALESCE(SUM(cost), 0) FROM i"
             ),
-            params![lo, hi, f.cashier_id, f.category_id],
+            params![lo, hi, f.cashier_id, f.category_id, f.branch_id],
             |r| {
                 let (gross, discounts, cost): (i64, i64, i64) = (r.get(2)?, r.get(3)?, r.get(4)?);
                 Ok(SalesTotals {
@@ -2053,12 +2146,12 @@ fn report_expiry_inner(conn: &Connection, f: &ReportFilter, within_days: i64) ->
                     b.qty_on_hand, b.unit_cost
              FROM batches b JOIN products p ON p.id = b.product_id LEFT JOIN categories c ON c.id = p.category_id
              WHERE b.qty_on_hand > 0 AND b.expiry_date <= date('now', 'localtime', '+' || ?1 || ' days')
-               AND (?2 IS NULL OR p.category_id = ?2)
+               AND (?2 IS NULL OR p.category_id = ?2) AND (?3 IS NULL OR b.branch_id = ?3)
              ORDER BY b.expiry_date, p.trade_name",
         )
         .map_err(err)?;
     let batches = stmt
-        .query_map(params![within_days, f.category_id], |r| {
+        .query_map(params![within_days, f.category_id, f.branch_id], |r| {
             let (qty, unit_cost): (i64, i64) = (r.get(6)?, r.get(7)?);
             Ok(ExpiryRow {
                 batch_id: r.get(0)?,
@@ -2088,12 +2181,13 @@ fn report_expiry_inner(conn: &Connection, f: &ReportFilter, within_days: i64) ->
              LEFT JOIN users u ON u.id = m.user_id
              WHERE m.type IN ('adjust', 'damage', 'destroy') AND m.qty < 0
                AND m.occurred_at >= ?1 AND m.occurred_at < ?2 AND (?3 IS NULL OR p.category_id = ?3)
+               AND (?4 IS NULL OR b.branch_id = ?4)
              ORDER BY m.occurred_at DESC",
         )
         .map_err(err)?;
     let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
     let write_offs = stmt
-        .query_map(params![lo, hi, f.category_id], |r| {
+        .query_map(params![lo, hi, f.category_id, f.branch_id], |r| {
             Ok(WriteOffRow {
                 day: r.get(0)?,
                 product: r.get(1)?,
@@ -2153,29 +2247,29 @@ pub struct ReorderRow {
     last_cost: Option<i64>,
 }
 
-/// Products out of stock or at/below their reorder level, the most urgent first.
-fn report_reorder_inner(conn: &Connection, category_id: Option<&str>) -> Result<Vec<ReorderRow>, String> {
+/// Products out of stock or at/below their reorder level in one branch, the most urgent first.
+fn report_reorder_inner(conn: &Connection, category_id: Option<&str>, branch_id: &str) -> Result<Vec<ReorderRow>, String> {
     let mut stmt = conn
         .prepare(
             "SELECT p.id, p.trade_name,
                (SELECT code FROM product_barcodes pb WHERE pb.product_id = p.id ORDER BY code LIMIT 1),
                c.name_ar,
                COALESCE((SELECT SUM(b.qty_on_hand) FROM batches b WHERE b.product_id = p.id AND b.status = 'active'
-                         AND b.expiry_date > date('now', 'localtime')), 0) AS stock,
+                         AND b.expiry_date > date('now', 'localtime') AND b.branch_id = ?2), 0) AS stock,
                rr.reorder_level, COALESCE(rr.max_qty, 0),
                COALESCE((SELECT SUM(si.qty) FROM sale_items si JOIN sales s ON s.id = si.sale_id
-                         WHERE si.product_id = p.id AND s.status = 'paid'
+                         WHERE si.product_id = p.id AND s.status = 'paid' AND s.branch_id = ?2
                            AND s.created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', date('now', 'localtime', '-29 days'), 'utc')), 0),
                (SELECT name FROM suppliers WHERE id = rr.preferred_supplier_id),
                (SELECT unit_cost FROM batches b WHERE b.product_id = p.id ORDER BY b.received_at DESC LIMIT 1)
              FROM products p
              LEFT JOIN categories c ON c.id = p.category_id
-             LEFT JOIN reorder_rules rr ON rr.product_id = p.id
+             LEFT JOIN reorder_rules rr ON rr.product_id = p.id AND rr.branch_id = ?2
              WHERE p.is_active = 1 AND (?1 IS NULL OR p.category_id = ?1)",
         )
         .map_err(err)?;
     let mut rows: Vec<ReorderRow> = stmt
-        .query_map(params![category_id], |r| {
+        .query_map(params![category_id, branch_id], |r| {
             let stock: i64 = r.get(4)?;
             let level: Option<i64> = r.get(5)?;
             let max_qty: i64 = r.get(6)?;
@@ -2209,11 +2303,16 @@ fn report_reorder(
     db: State<'_, Db>,
     session: State<'_, Session>,
     category_id: Option<String>,
+    branch_id: Option<String>,
 ) -> Result<Vec<ReorderRow>, String> {
     let user_id = session_user(&session)?;
     let conn = db.0.lock().map_err(err)?;
     require_permission(&conn, &user_id, &["modify_inventory", "view_reports"])?;
-    report_reorder_inner(&conn, category_id.as_deref())
+    let branch = match branch_id {
+        Some(b) => b,
+        None => active_branch(&conn)?,
+    };
+    report_reorder_inner(&conn, category_id.as_deref(), &branch)
 }
 
 // ── Prescriptions ──
@@ -2251,10 +2350,11 @@ pub struct RxReport {
 fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxReport, String> {
     check_range(conn, f)?;
     let (lo, hi) = utc_range(conn, &f.from, &f.to)?;
-    // ?1..?2 is the UTC range; ?3 is the cashier who rang the sale up; ?4 keeps prescriptions with at least one item in the category.
+    // ?1..?2 is the UTC range; ?3 is the cashier who rang the sale up; ?4 keeps prescriptions with at least one item in the category;
+    // ?5 the branch.
     let base = "FROM sale_prescriptions sp JOIN sales s ON s.id = sp.sale_id
       WHERE s.status = 'paid' AND s.created_at >= ?1 AND s.created_at < ?2
-        AND (?3 IS NULL OR s.cashier_id = ?3)
+        AND (?3 IS NULL OR s.cashier_id = ?3) AND (?5 IS NULL OR s.branch_id = ?5)
         AND (?4 IS NULL OR EXISTS (SELECT 1 FROM sale_items si JOIN products p ON p.id = si.product_id
                                    WHERE si.sale_id = s.id AND p.category_id = ?4))";
     let rx_items = "FROM sale_items si JOIN products p ON p.id = si.product_id WHERE si.sale_id = s.id AND p.requires_rx = 1";
@@ -2269,7 +2369,7 @@ fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxR
         ))
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id, f.branch_id], |r| {
             Ok(RxRow {
                 sale_id: r.get(0)?,
                 invoice_no: r.get(1)?,
@@ -2291,7 +2391,7 @@ fn report_prescriptions_inner(conn: &Connection, f: &ReportFilter) -> Result<RxR
         ))
         .map_err(err)?;
     let by_prescriber = stmt
-        .query_map(params![lo, hi, f.cashier_id, f.category_id], |r| {
+        .query_map(params![lo, hi, f.cashier_id, f.category_id, f.branch_id], |r| {
             Ok(PrescriberRow { prescriber: r.get(0)?, prescriptions: r.get(1)?, units: r.get(2)? })
         })
         .map_err(err)?
@@ -2382,7 +2482,8 @@ fn audit_category(category: Option<&str>) -> Result<&'static str, String> {
         None => "1",
         // Products, stock and purchasing.
         Some("inventory") => {
-            "(a.action LIKE 'product.%' OR a.action LIKE 'batch.%' OR a.action LIKE 'purchase.%' OR a.action LIKE 'supplier.%')"
+            "(a.action LIKE 'product.%' OR a.action LIKE 'batch.%' OR a.action LIKE 'purchase.%' OR a.action LIKE 'supplier.%'
+              OR a.action LIKE 'transfer.%')"
         }
         Some("users") => "(a.action LIKE 'user.%' AND a.action != 'user.login')",
         // Selling price changes, and purchases that changed a batch's unit cost.
@@ -2393,7 +2494,7 @@ fn audit_category(category: Option<&str>) -> Result<&'static str, String> {
         }
         Some("login") => "a.action = 'user.login'",
         Some("sales") => "(a.action LIKE 'sale.%' OR a.action LIKE 'receipt.%')",
-        Some("settings") => "a.action LIKE 'settings.%'",
+        Some("settings") => "(a.action LIKE 'settings.%' OR a.action LIKE 'branch.%' OR a.action = 'device.branch')",
         Some(_) => return Err("نوع العملية غير معروف".into()),
     })
 }
@@ -2422,6 +2523,8 @@ fn report_audit_inner(conn: &Connection, f: &ReportFilter, category: Option<&str
                       WHEN 'purchase_invoices' THEN (SELECT supplier_invoice_no FROM purchase_invoices WHERE id = a.entity_id)
                       WHEN 'users' THEN (SELECT full_name FROM users WHERE id = a.entity_id)
                       WHEN 'suppliers' THEN (SELECT name FROM suppliers WHERE id = a.entity_id)
+                      WHEN 'branches' THEN (SELECT name FROM branches WHERE id = a.entity_id)
+                      WHEN 'stock_transfers' THEN (SELECT transfer_no FROM stock_transfers WHERE id = a.entity_id)
                     END,
                     COALESCE(a.payload, '{{}}'), a.hash
              {filter} ORDER BY a.seq DESC LIMIT {AUDIT_LIMIT}"
@@ -2974,7 +3077,9 @@ pub struct Receipt {
     prescription: Option<ReceiptRx>,
     /// A reprint, marked "نسخة" on paper.
     copy: bool,
+    /// Address and phone are the branch's own when it has them.
     settings: ReceiptSettings,
+    branch_name: String,
 }
 
 /// Cashiers see their own sales; anyone with `view_reports` (and admins) sees all.
@@ -2985,19 +3090,20 @@ fn may_see_sale(conn: &Connection, user_id: &str, sale_cashier: Option<&str>) ->
 
 fn sale_receipt_inner(conn: &mut Connection, user_id: &str, sale_id: &str, reprint: bool) -> Result<Receipt, String> {
     let tx = conn.transaction().map_err(err)?;
-    type Head = (String, String, Option<String>, Option<String>, i64, i64, i64, i64);
+    type Head = (String, String, Option<String>, Option<String>, i64, i64, i64, i64, String);
     let head: Head = tx
         .query_row(
             "SELECT s.invoice_no, strftime('%Y-%m-%d %H:%M', s.created_at, 'localtime'), s.cashier_id,
-                    (SELECT full_name FROM users WHERE id = s.cashier_id), s.subtotal, s.discount_total, s.total, s.change_given
+                    (SELECT full_name FROM users WHERE id = s.cashier_id), s.subtotal, s.discount_total, s.total, s.change_given,
+                    s.branch_id
              FROM sales s WHERE s.id = ?1",
             params![sale_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?)),
         )
         .optional()
         .map_err(err)?
         .ok_or("الفاتورة غير موجودة")?;
-    let (invoice_no, sold_at, cashier_id, cashier, subtotal, discount, total, change) = head;
+    let (invoice_no, sold_at, cashier_id, cashier, subtotal, discount, total, change, branch_id) = head;
     if !may_see_sale(&tx, user_id, cashier_id.as_deref())? {
         return Err("لا يمكنك طباعة فاتورة كاشير آخر".into());
     }
@@ -3048,7 +3154,18 @@ fn sale_receipt_inner(conn: &mut Connection, user_id: &str, sale_id: &str, repri
         let payload = serde_json::json!({ "invoiceNo": invoice_no }).to_string();
         append_audit(&tx, user_id, "receipt.reprint", "sales", sale_id, &payload, &now).map_err(err)?;
     }
-    let settings = receipt_settings_inner(&tx)?;
+    let mut settings = receipt_settings_inner(&tx)?;
+    let (branch_name, address, phone): (String, Option<String>, Option<String>) = tx
+        .query_row("SELECT name, address, phone FROM branches WHERE id = ?1", params![branch_id], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .map_err(err)?;
+    if let Some(a) = address.filter(|a| !a.is_empty()) {
+        settings.address = a;
+    }
+    if let Some(p) = phone.filter(|p| !p.is_empty()) {
+        settings.phone = p;
+    }
     tx.commit().map_err(err)?;
     Ok(Receipt {
         sale_id: sale_id.to_string(),
@@ -3065,6 +3182,7 @@ fn sale_receipt_inner(conn: &mut Connection, user_id: &str, sale_id: &str, repri
         prescription,
         copy: reprint,
         settings,
+        branch_name,
     })
 }
 
@@ -3092,7 +3210,8 @@ pub struct RecentSale {
     total: i64,
 }
 
-/// Today's sales, newest first: the user's own, or everyone's for users with `view_reports`.
+/// Today's sales made on this device, newest first: the user's own, or everyone's for users with `view_reports`.
+/// Sales other tills made (pulled from the cloud for reports) are not listed here.
 fn recent_sales_inner(conn: &Connection, user_id: &str) -> Result<Vec<RecentSale>, String> {
     let role = active_role(conn, user_id)?;
     let all = has_permission(conn, user_id, &role, "view_reports")?;
@@ -3103,11 +3222,12 @@ fn recent_sales_inner(conn: &Connection, user_id: &str) -> Result<Vec<RecentSale
                     (SELECT COALESCE(SUM(qty), 0) FROM sale_items WHERE sale_id = s.id), s.total
              FROM sales s
              WHERE s.created_at >= strftime('%Y-%m-%dT%H:%M:%fZ', date('now', 'localtime'), 'utc') AND (?1 OR s.cashier_id = ?2)
+               AND (s.device_id IS NULL OR s.device_id = ?3)
              ORDER BY s.created_at DESC LIMIT 100",
         )
         .map_err(err)?;
     let rows = stmt
-        .query_map(params![all, user_id], |r| {
+        .query_map(params![all, user_id, device_id(conn)?], |r| {
             Ok(RecentSale {
                 sale_id: r.get(0)?,
                 invoice_no: r.get(1)?,
@@ -3385,7 +3505,14 @@ pub fn run() {
             sync_now,
             sync_settings,
             save_sync_settings,
-            recent_sales
+            recent_sales,
+            branches::device_info,
+            branches::save_branch,
+            branches::list_transfers,
+            branches::request_transfer,
+            branches::ship_transfer,
+            branches::receive_transfer,
+            branches::cancel_transfer
         ])
         .run(tauri::generate_context!())
         .expect("error while running the pharmacy app");
@@ -3716,23 +3843,23 @@ mod tests {
     fn first_run_setup_then_login() {
         let mut conn = db();
         assert!(needs_setup(&conn).unwrap());
-        assert!(login_inner(&mut conn, "admin", "").is_err(), "no password set yet: nobody can sign in");
-        assert!(setup_admin_inner(&mut conn, "short").unwrap_err().contains("8"));
+        assert!(login_inner(&mut conn, "admin", "", None).is_err(), "no password set yet: nobody can sign in");
+        assert!(setup_admin_inner(&mut conn, "short", None).unwrap_err().contains("8"));
 
-        let u = setup_admin_inner(&mut conn, "correct horse").unwrap();
+        let u = setup_admin_inner(&mut conn, "correct horse", None).unwrap();
         assert_eq!((u.id.as_str(), u.role.as_str()), (ADMIN, "admin"));
         assert!(!needs_setup(&conn).unwrap());
         let stored: String =
             conn.query_row("SELECT password_hash FROM users WHERE id = ?1", params![ADMIN], |r| r.get(0)).unwrap();
         assert!(stored.starts_with("$argon2") && !stored.contains("correct horse"));
 
-        assert!(setup_admin_inner(&mut conn, "another password").is_err(), "setup runs only once");
-        assert_eq!(login_inner(&mut conn, "admin", "correct horse").unwrap().id, ADMIN);
-        assert_eq!(login_inner(&mut conn, "admin", "wrong password").unwrap_err(), BAD_LOGIN);
-        assert_eq!(login_inner(&mut conn, "nobody", "correct horse").unwrap_err(), BAD_LOGIN);
+        assert!(setup_admin_inner(&mut conn, "another password", None).is_err(), "setup runs only once");
+        assert_eq!(login_inner(&mut conn, "admin", "correct horse", None).unwrap().id, ADMIN);
+        assert_eq!(login_inner(&mut conn, "admin", "wrong password", None).unwrap_err(), BAD_LOGIN);
+        assert_eq!(login_inner(&mut conn, "nobody", "correct horse", None).unwrap_err(), BAD_LOGIN);
 
         conn.execute("UPDATE users SET is_active = 0 WHERE id = ?1", params![ADMIN]).unwrap();
-        assert_eq!(login_inner(&mut conn, "admin", "correct horse").unwrap_err(), BAD_LOGIN);
+        assert_eq!(login_inner(&mut conn, "admin", "correct horse", None).unwrap_err(), BAD_LOGIN);
     }
 
     #[test]
@@ -3742,7 +3869,7 @@ mod tests {
         conn.execute_batch("PRAGMA user_version = 1;").unwrap();
         migrate(&conn).unwrap();
         let v: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
-        assert_eq!(v, 6);
+        assert_eq!(v, 7);
         let pct: String =
             conn.query_row("SELECT value FROM settings WHERE key = 'max_discount_pct'", [], |r| r.get(0)).unwrap();
         assert_eq!(pct, "10");
@@ -4111,7 +4238,7 @@ mod tests {
 
     fn filter(conn: &Connection, cashier: Option<&str>, category: Option<&str>) -> ReportFilter {
         let d = today(conn);
-        ReportFilter { from: d.clone(), to: d, cashier_id: cashier.map(String::from), category_id: category.map(String::from) }
+        ReportFilter { from: d.clone(), to: d, cashier_id: cashier.map(String::from), category_id: category.map(String::from), branch_id: None }
     }
 
     /// Two sales: the admin sells 10 Brufen (line discount 1,000, invoice discount 500) plus one Augmentin;
@@ -4160,13 +4287,13 @@ mod tests {
         let share: f64 = 500.0 * 18_500.0 / (34_000.0 + 18_500.0);
         assert_eq!(rx.discounts, share.round() as i64);
 
-        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-12-31".into(), cashier_id: None, category_id: None };
+        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-12-31".into(), cashier_id: None, category_id: None, branch_id: None };
         let none = report_sales_inner(&conn, &old).unwrap();
         assert_eq!((none.totals.invoices, none.totals.net, none.by_day.len()), (0, 0, 0));
 
-        let backwards = ReportFilter { from: "2026-02-01".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None };
+        let backwards = ReportFilter { from: "2026-02-01".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None, branch_id: None };
         assert!(report_sales_inner(&conn, &backwards).unwrap_err().contains("بعد"));
-        let bad = ReportFilter { from: "yesterday".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None };
+        let bad = ReportFilter { from: "yesterday".into(), to: "2026-01-01".into(), cashier_id: None, category_id: None, branch_id: None };
         assert!(report_sales_inner(&conn, &bad).unwrap_err().contains("غير صالح"));
     }
 
@@ -4225,7 +4352,7 @@ mod tests {
         let mut conn = db();
         // Sell 3 Ventolin today: 6 left at 3 a month = 60 days of cover.
         post_sale_inner(&mut conn, ADMIN, cash_sale(vec![line("p-ventolin", 7000, &[("b-vt-501", 3)])], 21_000)).unwrap();
-        let rows = report_reorder_inner(&conn, None).unwrap();
+        let rows = report_reorder_inner(&conn, None, "br-main").unwrap();
         let ids: Vec<_> = rows.iter().map(|r| r.product_id.as_str()).collect();
         assert_eq!(ids, ["p-glucophage-xr", "p-ventolin", "p-amoxil-500"]);
 
@@ -4237,7 +4364,7 @@ mod tests {
         let am = &rows[2];
         assert_eq!((am.stock, am.reorder_level, am.suggested_qty, am.days_of_cover), (18, Some(25), 80 - 18, None));
 
-        assert!(report_reorder_inner(&conn, Some("cat-otc")).unwrap().is_empty());
+        assert!(report_reorder_inner(&conn, Some("cat-otc"), "br-main").unwrap().is_empty());
     }
 
     #[test]
@@ -4289,10 +4416,10 @@ mod tests {
         .unwrap();
         assert_eq!(report_sales_inner(&conn, &filter(&conn, None, None)).unwrap().totals.invoices, 1);
         let yesterday: String = conn.query_row("SELECT date(?1, '-1 day')", params![d], |r| r.get(0)).unwrap();
-        let y = ReportFilter { from: yesterday.clone(), to: yesterday.clone(), cashier_id: None, category_id: None };
+        let y = ReportFilter { from: yesterday.clone(), to: yesterday.clone(), cashier_id: None, category_id: None, branch_id: None };
         let r = report_sales_inner(&conn, &y).unwrap();
         assert_eq!((r.totals.invoices, r.by_day[0].key.as_str()), (1, yesterday.as_str()));
-        let both = ReportFilter { from: yesterday, to: d, cashier_id: None, category_id: None };
+        let both = ReportFilter { from: yesterday, to: d, cashier_id: None, category_id: None, branch_id: None };
         assert_eq!(report_sales_inner(&conn, &both).unwrap().by_day.len(), 2);
     }
 
@@ -4301,7 +4428,9 @@ mod tests {
         let conn = db();
         let plan = |sql: &str| -> String {
             let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
-            let rows = stmt.query_map(params!["a", "b", None::<String>, None::<String>], |r| r.get::<_, String>(3)).unwrap();
+            let n = stmt.parameter_count();
+            let args = ["a", "b"].into_iter().map(Some).chain(std::iter::repeat(None)).take(n);
+            let rows = stmt.query_map(params_from_iter(args), |r| r.get::<_, String>(3)).unwrap();
             rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
         };
         assert!(plan(&format!("{SALE_ITEMS_CTE} SELECT COUNT(*) FROM i")).contains("idx_sales_created"));
@@ -4331,7 +4460,7 @@ mod tests {
         let logins = report_audit_inner(&conn, &filter(&conn, None, None), Some("login")).unwrap();
         assert_eq!(logins.total, 1);
         assert!(report_audit_inner(&conn, &filter(&conn, None, None), Some("nope")).is_err());
-        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-01-31".into(), cashier_id: None, category_id: None };
+        let old = ReportFilter { from: "2020-01-01".into(), to: "2020-01-31".into(), cashier_id: None, category_id: None, branch_id: None };
         assert_eq!(report_audit_inner(&conn, &old, None).unwrap().total, 0);
 
         // Editing an entry behind the app's back breaks the chain at that entry.
@@ -4353,7 +4482,7 @@ mod tests {
     /// Demo database where the admin has chosen a password.
     fn admin_db() -> Connection {
         let mut conn = db();
-        setup_admin_inner(&mut conn, PW).unwrap();
+        setup_admin_inner(&mut conn, PW, None).unwrap();
         conn
     }
 
@@ -4388,7 +4517,7 @@ mod tests {
         );
         let stored: String = conn.query_row("SELECT password_hash FROM users WHERE id = ?1", params![u.id], |r| r.get(0)).unwrap();
         assert!(stored.starts_with("$argon2"));
-        let logged = login_inner(&mut conn, "sara.k", PW).unwrap();
+        let logged = login_inner(&mut conn, "sara.k", PW, None).unwrap();
         assert_eq!(logged.id, u.id);
         assert!(!logged.permissions.dispense_rx);
 
@@ -4440,7 +4569,7 @@ mod tests {
             denied(reset_user_password_inner(&mut conn, who, ADMIN, "takeover-123").unwrap_err());
         }
         assert_eq!(active_role(&conn, ADMIN).unwrap(), "admin");
-        assert!(login_inner(&mut conn, "admin", PW).is_ok(), "admin password unchanged");
+        assert!(login_inner(&mut conn, "admin", PW, None).is_ok(), "admin password unchanged");
     }
 
     #[test]
@@ -4500,14 +4629,14 @@ mod tests {
         let u = create_user_inner(&mut conn, ADMIN, new_user("sara", "cashier")).unwrap();
         let off = toggle_user_status_inner(&mut conn, ADMIN, &u.id, false).unwrap();
         assert!(!off.active);
-        assert_eq!(login_inner(&mut conn, "sara", PW).unwrap_err(), BAD_LOGIN);
+        assert_eq!(login_inner(&mut conn, "sara", PW, None).unwrap_err(), BAD_LOGIN);
         // Already signed in elsewhere: the next sale is refused.
         assert!(post_sale_inner(&mut conn, &u.id, cash_sale(vec![brufen(1, 0)], 3500)).unwrap_err().contains("معطّل"));
         toggle_user_status_inner(&mut conn, ADMIN, &u.id, false).unwrap();
         assert_eq!(audits(&conn, "user.status"), 1, "repeating the same state changes nothing");
 
         toggle_user_status_inner(&mut conn, ADMIN, &u.id, true).unwrap();
-        assert!(login_inner(&mut conn, "sara", PW).is_ok());
+        assert!(login_inner(&mut conn, "sara", PW, None).is_ok());
         assert_eq!(audits(&conn, "user.status"), 2);
     }
 
@@ -4534,8 +4663,8 @@ mod tests {
         let u = create_user_inner(&mut conn, ADMIN, new_user("sara", "cashier")).unwrap();
         assert!(reset_user_password_inner(&mut conn, ADMIN, &u.id, "short").unwrap_err().contains("كلمة المرور"));
         reset_user_password_inner(&mut conn, ADMIN, &u.id, "new-secret-99").unwrap();
-        assert_eq!(login_inner(&mut conn, "sara", PW).unwrap_err(), BAD_LOGIN);
-        assert!(login_inner(&mut conn, "sara", "new-secret-99").is_ok());
+        assert_eq!(login_inner(&mut conn, "sara", PW, None).unwrap_err(), BAD_LOGIN);
+        assert!(login_inner(&mut conn, "sara", "new-secret-99", None).is_ok());
         let payload: String =
             conn.query_row("SELECT payload FROM audit_log WHERE action = 'user.password_reset'", [], |r| r.get(0)).unwrap();
         assert_eq!(payload, "{}");
@@ -4858,6 +4987,8 @@ mod tests {
         orphan.insert("product_id".into(), "p-unknown".into());
 
         let pull = sync::Pull {
+            branches: vec![],
+            transfers: vec![],
             categories: vec![doc(serde_json::json!({ "id": "cat-new", "name_ar": "مستلزمات" }))],
             products: vec![sync::PulledProduct {
                 doc: panadol,
@@ -4935,6 +5066,8 @@ mod tests {
         status: Option<u16>,
         pull: serde_json::Value,
         pulls: Vec<i64>,
+        /// Other tills' sales: {"doc": sale_payload, "device_id", "rev"}.
+        sales: Vec<serde_json::Value>,
     }
 
     async fn mock_cloud(state: Arc<Mutex<MockCloud>>) -> String {
@@ -4960,9 +5093,18 @@ mod tests {
             m.pulls.push(body["p_since"].as_i64().unwrap());
             Json(m.pull.clone())
         }
+        async fn pull_sales(AxState(s): AxState<S>, Json(body): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            let m = s.lock().unwrap();
+            let since = body["p_since"].as_i64().unwrap();
+            let sales: Vec<serde_json::Value> =
+                m.sales.iter().filter(|x| x["rev"].as_i64().unwrap() > since).cloned().collect();
+            let cursor = sales.iter().map(|x| x["rev"].as_i64().unwrap()).max().unwrap_or(since);
+            Json(serde_json::json!({ "sales": sales, "cursor": cursor }))
+        }
         let app = Router::new()
             .route("/rest/v1/rpc/pos_sync_push", post(push))
             .route("/rest/v1/rpc/pos_sync_pull", post(pull))
+            .route("/rest/v1/rpc/pos_sync_pull_sales", post(pull_sales))
             .with_state(state);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
@@ -5111,5 +5253,339 @@ mod tests {
         }
         round("A pulls B's sale", &a, &client).await;
         assert_eq!(qty(&a.lock().unwrap(), "b-br-400"), 52);
+    }
+
+    // ── Branches and transfers ──
+
+    fn add_branch(conn: &mut Connection, code: &str, name: &str) -> String {
+        let b = branches::BranchIn {
+            id: None,
+            code: code.into(),
+            name: name.into(),
+            address: Some("شارع ٦٢".into()),
+            phone: None,
+            active: true,
+        };
+        branches::save_branch_inner(conn, ADMIN, b).unwrap().id
+    }
+
+    fn move_to(conn: &Connection, branch: &str) {
+        branches::set_device_branch(conn, ADMIN, branch).unwrap();
+    }
+
+    fn tline(product: &str, qty: i64) -> branches::TransferLineIn {
+        branches::TransferLineIn { product_id: product.into(), qty }
+    }
+
+    fn ship(to: &str, lines: Vec<branches::TransferLineIn>) -> branches::TransferShipIn {
+        branches::TransferShipIn { transfer_id: None, to_branch_id: Some(to.into()), note: None, lines }
+    }
+
+    fn search_stock(conn: &Connection, product: &str) -> i64 {
+        run_hits(conn, "p.id = ?1", vec![product.into()]).unwrap()[0].stock
+    }
+
+    #[test]
+    fn a_device_sells_receives_and_counts_only_in_its_own_branch() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        assert_eq!(search_stock(&conn, "p-brufen-400"), 55);
+        move_to(&conn, &karrada);
+        assert_eq!(branches::device_info_inner(&conn).unwrap().branch.name, "فرع الكرادة");
+        assert_eq!(search_stock(&conn, "p-brufen-400"), 0, "the main branch's batch is not on this shelf");
+        assert!(product_batches_rows(&conn, "p-brufen-400").is_empty());
+        let err = post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap_err();
+        assert!(err.contains("BR400"), "{err}");
+        assert_eq!(qty(&conn, "b-br-400"), 55);
+        let adjust = AdjustBatch { batch_id: "b-br-400".into(), new_qty: 50, reason: "جرد".into() };
+        assert!(adjust_batch_inner(&mut conn, ADMIN, adjust).unwrap_err().contains("فرع"));
+
+        let item = receive_batch_inner(&mut conn, ADMIN, receive("p-brufen-400", "KR-1", "2030-01-01", 12)).unwrap();
+        assert_eq!(item.stock, 12);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM batches WHERE batch_no = 'KR-1' AND branch_id != 'br-main'"), 1);
+        let kr_batch: String = conn.query_row("SELECT id FROM batches WHERE batch_no = 'KR-1'", [], |r| r.get(0)).unwrap();
+        let sale = post_sale_inner(&mut conn, ADMIN, cash_sale(vec![line("p-brufen-400", 3500, &[(&kr_batch, 2)])], 7000)).unwrap();
+        assert!(sale.invoice_no.starts_with("KR"), "{}", sale.invoice_no);
+        let branch: String = conn.query_row("SELECT branch_id FROM sales WHERE id = ?1", [&sale.sale_id], |r| r.get(0)).unwrap();
+        assert_eq!(branch, karrada);
+        let receipt = sale_receipt_inner(&mut conn, ADMIN, &sale.sale_id, false).unwrap();
+        assert_eq!((receipt.branch_name.as_str(), receipt.settings.address.as_str()), ("فرع الكرادة", "شارع ٦٢"));
+    }
+
+    #[test]
+    fn invoice_numbers_carry_the_branch_code_and_the_device_tag() {
+        let mut conn = db();
+        let tag = device_tag(&conn).unwrap();
+        assert_eq!(tag.len(), 4);
+        let sale = post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        assert!(sale.invoice_no.starts_with(&format!("MB{tag}-")), "{}", sale.invoice_no);
+        assert!(sale.invoice_no.ends_with("-000001"));
+    }
+
+    #[test]
+    fn only_an_admin_moves_the_device_and_the_move_is_logged() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        add_user(&conn, "u-ph", "pharmacist");
+        assert!(branches::set_device_branch(&conn, "u-ph", &karrada).unwrap_err().contains("للمدير"));
+        branches::set_device_branch(&conn, "u-ph", "br-main").expect("staying put needs no admin");
+        assert!(branches::set_device_branch(&conn, ADMIN, "br-nowhere").is_err());
+        move_to(&conn, &karrada);
+        assert_eq!(active_branch(&conn).unwrap(), karrada);
+        assert_eq!(last_audit(&conn, "device.branch")["to"], "فرع الكرادة");
+
+        // The branch this device works on cannot be switched off; codes are unique.
+        let off = branches::BranchIn {
+            id: Some(karrada.clone()),
+            code: "KR".into(),
+            name: "فرع الكرادة".into(),
+            address: None,
+            phone: None,
+            active: false,
+        };
+        assert!(branches::save_branch_inner(&mut conn, ADMIN, off).unwrap_err().contains("هذا الجهاز"));
+        let clash = branches::BranchIn { id: None, code: "kr".into(), name: "x".into(), address: None, phone: None, active: true };
+        assert!(branches::save_branch_inner(&mut conn, ADMIN, clash).unwrap_err().contains("KR"));
+        let not_admin = branches::BranchIn { id: None, code: "ZZ".into(), name: "x".into(), address: None, phone: None, active: true };
+        assert!(branches::save_branch_inner(&mut conn, "u-ph", not_admin).is_err());
+    }
+
+    #[test]
+    fn sign_in_picks_the_branch() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        setup_admin_inner(&mut conn, "correct horse", Some(&karrada)).unwrap();
+        assert_eq!(active_branch(&conn).unwrap(), karrada);
+        create_user_inner(&mut conn, ADMIN, new_user("sara", "cashier")).unwrap();
+        assert!(login_inner(&mut conn, "sara", PW, Some("br-main")).unwrap_err().contains("للمدير"));
+        assert_eq!(active_branch(&conn).unwrap(), karrada, "a refused move changes nothing");
+        login_inner(&mut conn, "sara", PW, Some(&karrada)).unwrap();
+        login_inner(&mut conn, "admin", "correct horse", Some("br-main")).unwrap();
+        assert_eq!(active_branch(&conn).unwrap(), "br-main");
+    }
+
+    #[test]
+    fn request_ship_and_receive_move_stock_between_branches() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        move_to(&conn, &karrada);
+        let req = branches::TransferRequestIn { from_branch_id: "br-main".into(), note: Some("نفد".into()), lines: vec![tline("p-brufen-400", 10)] };
+        let t = branches::request_transfer_inner(&mut conn, ADMIN, req).unwrap();
+        assert_eq!((t.status.as_str(), t.direction.as_str(), t.units), ("requested", "in", 10));
+        assert_eq!(qty(&conn, "b-br-400"), 55, "a request moves nothing");
+
+        move_to(&conn, "br-main");
+        let listed = branches::list_transfers_inner(&conn).unwrap();
+        assert_eq!((listed.len(), listed[0].direction.as_str()), (1, "out"));
+        assert!(branches::receive_transfer_inner(&mut conn, ADMIN, &t.id).unwrap_err().contains("المرسَل إليه"));
+        clear_queue(&conn);
+        let shipment = branches::TransferShipIn { transfer_id: Some(t.id.clone()), to_branch_id: None, note: None, lines: vec![tline("p-brufen-400", 10)] };
+        let t = branches::ship_transfer_inner(&mut conn, ADMIN, shipment).unwrap();
+        assert_eq!(t.status, "shipped");
+        assert_eq!(qty(&conn, "b-br-400"), 45);
+        assert_eq!(count(&conn, "SELECT SUM(qty) FROM stock_movements WHERE type = 'transfer_out'"), -10);
+        assert_eq!(kinds(&conn), ["AUDIT_LOG", "TRANSFER"]);
+        let payload = &queue(&conn)[1].1;
+        assert_eq!(payload["transfer"]["status"], "shipped");
+        assert_eq!(payload["movements"][0]["qty"], -10);
+
+        move_to(&conn, &karrada);
+        assert_eq!(search_stock(&conn, "p-brufen-400"), 0, "in transit");
+        let t = branches::receive_transfer_inner(&mut conn, ADMIN, &t.id).unwrap();
+        assert_eq!(t.status, "received");
+        assert_eq!(search_stock(&conn, "p-brufen-400"), 10);
+        let (batch_no, cost): (String, i64) = conn
+            .query_row("SELECT batch_no, unit_cost FROM batches WHERE branch_id = ?1", [&karrada], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!((batch_no.as_str(), cost), ("BR400", 2400), "same batch number, expiry and cost");
+        assert_eq!(count(&conn, "SELECT SUM(qty) FROM stock_movements WHERE ref_type = 'transfer'"), 0, "out and in balance");
+        assert!(branches::receive_transfer_inner(&mut conn, ADMIN, &t.id).unwrap_err().contains("مسبقاً"));
+        assert_eq!(last_audit(&conn, "transfer.receive")["lines"][0]["qty"], 10);
+    }
+
+    #[test]
+    fn direct_shipments_use_fefo_and_never_overdraw() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        receive_batch_inner(&mut conn, ADMIN, receive("p-brufen-400", "LATE-1", "2035-01-01", 20)).unwrap();
+        let err = branches::ship_transfer_inner(&mut conn, ADMIN, ship(&karrada, vec![tline("p-brufen-400", 500)])).unwrap_err();
+        assert!(err.contains("75"), "{err}");
+        assert!(branches::ship_transfer_inner(&mut conn, ADMIN, ship("br-main", vec![tline("p-brufen-400", 1)])).is_err());
+        let t = branches::ship_transfer_inner(&mut conn, ADMIN, ship(&karrada, vec![tline("p-brufen-400", 60)])).unwrap();
+        // 55 from the batch expiring first, then 5 from the later one.
+        let lots: Vec<(String, i64)> = t.items.iter().map(|i| (i.batch_no.clone().unwrap(), i.qty)).collect();
+        assert_eq!(lots, [("BR400".to_string(), 55), ("LATE-1".to_string(), 5)]);
+        assert!(t.transfer_no.starts_with("TR-MB"));
+        assert!(branches::cancel_transfer_inner(&mut conn, ADMIN, &t.id).unwrap_err().contains("لم يُشحن"));
+        add_user(&conn, "u-cash", "cashier");
+        assert!(branches::ship_transfer_inner(&mut conn, "u-cash", ship(&karrada, vec![tline("p-brufen-400", 1)])).is_err());
+    }
+
+    #[test]
+    fn a_request_can_be_cancelled_before_it_ships() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        let req = branches::TransferRequestIn { from_branch_id: karrada, note: None, lines: vec![tline("p-brufen-400", 3)] };
+        let t = branches::request_transfer_inner(&mut conn, ADMIN, req).unwrap();
+        assert_eq!(branches::cancel_transfer_inner(&mut conn, ADMIN, &t.id).unwrap().status, "cancelled");
+        assert!(branches::cancel_transfer_inner(&mut conn, ADMIN, &t.id).is_err());
+    }
+
+    #[test]
+    fn every_outbox_entry_carries_its_branch_and_device() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        let device = device_id(&conn).unwrap();
+        assert_eq!(kinds(&conn).first().map(String::as_str), Some("UPSERT_BRANCH"), "the cloud learns branches first");
+        move_to(&conn, &karrada);
+        clear_queue(&conn);
+        receive_batch_inner(&mut conn, ADMIN, receive("p-brufen-400", "KR-1", "2030-01-01", 5)).unwrap();
+        let stamps: Vec<(String, String)> = {
+            let mut stmt = conn.prepare("SELECT branch_id, device_id FROM sync_queue").unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
+        };
+        assert!(!stamps.is_empty());
+        assert!(stamps.iter().all(|(b, d)| *b == karrada && *d == device), "{stamps:?}");
+        let moved: String = conn.query_row("SELECT device_id FROM stock_movements WHERE type = 'purchase' ORDER BY occurred_at DESC LIMIT 1", [], |r| r.get(0)).unwrap();
+        assert_eq!(moved, device);
+    }
+
+    #[test]
+    fn an_upgraded_outbox_keeps_its_entries_after_the_branch_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(INIT_SQL).unwrap();
+        conn.execute_batch("PRAGMA user_version = 1;").unwrap();
+        // Stop at version 6 by running the old steps by hand, with demo data, then upgrade.
+        for sql in [SALE_CONTROLS_SQL, USER_PERMISSIONS_SQL, RECEIPT_SETTINGS_SQL, REPORT_INDEXES_SQL, SYNC_QUEUE_SQL] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute("INSERT INTO settings(key, value) VALUES ('sync_device_id', 'dev-old')", []).unwrap();
+        conn.execute_batch(DEMO_SQL).unwrap();
+        conn.execute("INSERT INTO sync_queue(id, kind, payload) VALUES ('q-old', 'AUDIT_LOG', '{\"entries\": []}')", []).unwrap();
+        conn.execute_batch("PRAGMA user_version = 6;").unwrap();
+        migrate(&conn).unwrap();
+        let k = kinds(&conn);
+        assert_eq!(k[0], "UPSERT_BRANCH");
+        assert_eq!(k[1], "AUDIT_LOG");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_queue WHERE branch_id = 'br-main' AND device_id = 'dev-old'"), k.len() as i64);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM stock_movements WHERE device_id IS NULL"), 0);
+    }
+
+    #[test]
+    fn reports_filter_by_branch() {
+        let mut conn = db();
+        let karrada = add_branch(&mut conn, "KR", "فرع الكرادة");
+        post_sale_inner(&mut conn, ADMIN, cash_sale(vec![brufen(2, 0)], 7000)).unwrap();
+        let mut f = filter(&conn, None, None);
+        assert_eq!(report_sales_inner(&conn, &f).unwrap().totals.invoices, 1, "all branches");
+        f.branch_id = Some("br-main".into());
+        assert_eq!(report_sales_inner(&conn, &f).unwrap().totals.units, 2);
+        f.branch_id = Some(karrada.clone());
+        assert_eq!(report_sales_inner(&conn, &f).unwrap().totals.invoices, 0);
+        assert!(report_expiry_inner(&conn, &f, 730).unwrap().batches.is_empty());
+        let main_reorder = report_reorder_inner(&conn, None, "br-main").unwrap().len();
+        let kr_reorder = report_reorder_inner(&conn, None, &karrada).unwrap();
+        assert!(kr_reorder.len() > main_reorder, "nothing is stocked in the new branch");
+        assert!(kr_reorder.iter().all(|r| r.stock == 0));
+    }
+
+    fn other_till() -> Connection {
+        let conn = db();
+        assert_ne!(device_id(&conn).unwrap(), "", "each install has its own device id");
+        conn
+    }
+
+    #[test]
+    fn other_tills_sales_are_copied_for_reports_without_moving_stock() {
+        let mut here = db();
+        let mut there = other_till();
+        let sale = post_sale_inner(&mut there, ADMIN, cash_sale(vec![brufen(3, 0)], 10_500)).unwrap();
+        let doc = sync::sale_payload(&there, &sale.sale_id).unwrap();
+        let from = device_id(&there).unwrap();
+        let pull = sync::SalesPull {
+            sales: vec![
+                sync::PulledSale { doc: doc.clone(), device_id: from.clone() },
+                // This till's own sale, echoed back: skipped.
+                sync::PulledSale { doc: serde_json::json!({ "sale": { "id": "s-own" } }), device_id: device_id(&here).unwrap() },
+            ],
+            cursor: 77,
+        };
+        assert_eq!(sync::apply_sales(&mut here, &pull).unwrap(), 1);
+        assert_eq!(qty(&here, "b-br-400"), 55, "stock comes from the stock pull, not from copied sales");
+        let mut f = filter(&here, None, None);
+        f.branch_id = Some("br-main".into());
+        assert_eq!(report_sales_inner(&here, &f).unwrap().totals.units, 3);
+        assert_eq!(count(&here, "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'sync_sales_cursor'"), 77);
+        assert!(recent_sales_inner(&here, ADMIN).unwrap().is_empty(), "today's list shows this till's sales only");
+        assert_eq!(sync::apply_sales(&mut here, &pull).unwrap(), 0, "applied once");
+
+        // A clashing old-style number gets the other till's tag.
+        here.execute("UPDATE sales SET invoice_no = 'MB-2026-000001' WHERE id = ?1", [&sale.sale_id]).unwrap();
+        let mut old = doc.clone();
+        old["sale"]["id"] = "s-old".into();
+        old["sale"]["invoice_no"] = "MB-2026-000001".into();
+        for (i, item) in old["items"].as_array_mut().unwrap().iter_mut().enumerate() {
+            item["id"] = format!("si-old-{i}").into();
+            item["sale_id"] = "s-old".into();
+        }
+        old["payments"] = serde_json::json!([]);
+        let pull = sync::SalesPull { sales: vec![sync::PulledSale { doc: old, device_id: from.clone() }], cursor: 78 };
+        assert_eq!(sync::apply_sales(&mut here, &pull).unwrap(), 1);
+        let tag = from.replace('-', "");
+        let renamed: String = here.query_row("SELECT invoice_no FROM sales WHERE id = 's-old'", [], |r| r.get(0)).unwrap();
+        assert_eq!(renamed, format!("MB-2026-000001/{}", tag[tag.len() - 4..].to_uppercase()));
+    }
+
+    #[test]
+    fn pulled_branches_and_transfers_only_move_forward() {
+        let mut conn = db();
+        let branch = doc(serde_json::json!({ "id": "br-2", "code": "KR", "name": "فرع الكرادة", "kind": "store", "is_active": 1,
+                                             "created_at": "2026-01-01T00:00:00Z" }));
+        let clash = doc(serde_json::json!({ "id": "br-3", "code": "KR", "name": "مكرر", "kind": "store", "is_active": 1,
+                                            "created_at": "2026-01-01T00:00:00Z" }));
+        let transfer = |status: &str| sync::PulledTransfer {
+            doc: doc(serde_json::json!({ "id": "t-1", "transfer_no": "TR-KR0001-00001", "from_branch_id": "br-2",
+                                         "to_branch_id": "br-main", "status": status, "created_at": "2026-01-01T00:00:00Z" })),
+            items: vec![doc(serde_json::json!({ "id": "ti-1", "transfer_id": "t-1", "product_id": "p-brufen-400",
+                                               "qty": 4, "batch_no": "BR400", "expiry_date": "2031-01-01",
+                                               "unit_cost": 2400, "sell_price": 3500, "requested_qty": 0 }))],
+        };
+        let pull = sync::Pull { branches: vec![branch, clash], transfers: vec![transfer("shipped")], cursor: 3, ..Default::default() };
+        sync::apply_pull(&mut conn, &pull).unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM branches"), 2, "the clashing code is skipped");
+        let incoming = branches::list_transfers_inner(&conn).unwrap();
+        assert_eq!((incoming[0].status.as_str(), incoming[0].direction.as_str(), incoming[0].units), ("shipped", "in", 4));
+
+        // Received here; an older copy from the cloud does not undo it. BR400 is already on this shelf with another
+        // expiry, so the transfer gets a batch of its own.
+        branches::receive_transfer_inner(&mut conn, ADMIN, "t-1").unwrap();
+        assert_eq!(count(&conn, "SELECT qty_on_hand FROM batches WHERE batch_no = 'BR400-TR' AND expiry_date = '2031-01-01'"), 4);
+        assert_eq!(qty(&conn, "b-br-400"), 55);
+        clear_queue(&conn);
+        let stale = sync::Pull { transfers: vec![transfer("shipped")], cursor: 4, ..Default::default() };
+        sync::apply_pull(&mut conn, &stale).unwrap();
+        assert_eq!(branches::list_transfers_inner(&conn).unwrap()[0].status, "received");
+    }
+
+    #[tokio::test]
+    async fn a_sync_round_also_pulls_other_tills_sales_page_by_page() {
+        let mut there = other_till();
+        let sale = post_sale_inner(&mut there, ADMIN, cash_sale(vec![brufen(1, 0)], 3500)).unwrap();
+        let doc = sync::sale_payload(&there, &sale.sale_id).unwrap();
+        let cloud = Arc::new(Mutex::new(MockCloud {
+            pull: serde_json::json!({ "cursor": 1 }),
+            sales: vec![serde_json::json!({ "doc": doc, "device_id": device_id(&there).unwrap(), "rev": 12 })],
+            ..Default::default()
+        }));
+        let url = mock_cloud(cloud.clone()).await;
+        let conn = db();
+        configure(&conn, &url);
+        let db = Mutex::new(conn);
+        sync::sync_once(&db, &sync::client(), true, &|_| {}).await.unwrap();
+        let conn = db.lock().unwrap();
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM sales"), 1);
+        assert_eq!(count(&conn, "SELECT CAST(value AS INTEGER) FROM settings WHERE key = 'sync_sales_cursor'"), 12);
+        let pushed = &cloud.lock().unwrap().pushed;
+        assert!(pushed.iter().all(|e| e["branch_id"] == "br-main"), "each entry names its branch");
     }
 }

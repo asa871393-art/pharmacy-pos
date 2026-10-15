@@ -2,7 +2,7 @@ import { useEffect, useState } from "react";
 import { Login } from "./auth/Login.tsx";
 import { SyncBadge } from "./components/SyncBadge.tsx";
 import { ROLE_LABEL } from "./core/permissions.ts";
-import type { AuthStatus, User } from "./core/types.ts";
+import type { AuthStatus, DeviceInfo, User } from "./core/types.ts";
 import { repo } from "./data/index.ts";
 import { InventoryScreen } from "./inventory/InventoryScreen.tsx";
 import { PosScreen } from "./pos/PosScreen.tsx";
@@ -24,10 +24,17 @@ export function App() {
   const [auth, setAuth] = useState<AuthStatus | null>(null);
   const [error, setError] = useState("");
   const [view, setView] = useState<View>("pos");
+  const [device, setDevice] = useState<DeviceInfo | null>(null);
+  const loadDevice = () => repo.deviceInfo().then(setDevice, (e) => setError(String(e)));
 
   useEffect(() => {
     repo.authStatus().then(setAuth, (e) => setError(String(e)));
   }, []);
+  // Again after each sign-in: an admin may have moved this device to another branch.
+  const userId = auth?.user?.id;
+  useEffect(() => {
+    if (userId) void loadDevice();
+  }, [userId]);
 
   if (error) return <div role="alert" className="banner error">{error}</div>;
   if (!auth) return null;
@@ -64,7 +71,14 @@ export function App() {
         </div>
         <div className="topbar-end">
           <SyncBadge />
-          <span>الفرع الرئيسي</span>
+          {device && (
+            <span className="branch-chip" title={`معرّف الجهاز: ${device.deviceId}${device.deviceName ? ` · ${device.deviceName}` : ""}`}>
+              <strong>{device.branch.name}</strong>
+              <span className="device-tag">
+                جهاز <bdi className="num">{device.deviceTag}</bdi>
+              </span>
+            </span>
+          )}
           <strong>{user.fullName}</strong>
           <span>{ROLE_LABEL[user.role]}</span>
           <button type="button" className="logout" onClick={() => void logout()}>
@@ -77,15 +91,15 @@ export function App() {
       <div className="view" hidden={view !== "pos"}>
         <PosScreen key={user.id} visible={view === "pos"} canDiscount={user.permissions.giveDiscount} />
       </div>
-      {view === "inventory" && <InventoryScreen key={user.id} user={user} />}
+      {view === "inventory" && device && <InventoryScreen key={`${user.id}|${device.branch.id}`} user={user} device={device} />}
       <div className="view" hidden={view !== "purchasing"}>
         <PurchasingScreen key={user.id} user={user} />
       </div>
       <div className="view" hidden={view !== "reports"}>
-        <ReportsScreen key={user.id} user={user} visible={view === "reports"} />
+        {device && <ReportsScreen key={`${user.id}|${device.branch.id}`} user={user} visible={view === "reports"} device={device} />}
       </div>
       {/* Only rendered for an admin; the user commands also refuse anyone else. */}
-      {view === "users" && isAdmin && <UsersScreen key={user.id} me={user} />}
+      {view === "users" && isAdmin && device && <UsersScreen key={user.id} me={user} device={device} onBranchesChanged={loadDevice} />}
     </div>
   );
 }
