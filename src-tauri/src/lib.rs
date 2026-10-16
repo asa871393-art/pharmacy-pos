@@ -75,18 +75,24 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if version < 6 {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(SYNC_QUEUE_SQL)?;
-        // This computer's id in the cloud, and everything recorded so far, queued for the first push.
+        // This computer's id in the cloud. What was recorded so far is queued after version 7, whose outbox columns
+        // enqueue() writes.
         tx.execute(
             "INSERT OR IGNORE INTO settings(key, value) VALUES ('sync_device_id', ?1)",
             [uuid::Uuid::now_v7().to_string()],
         )?;
-        sync::backfill(&tx)?;
         tx.execute_batch("PRAGMA user_version = 6;")?;
         tx.commit()?;
     }
     if version < 7 {
         let tx = conn.unchecked_transaction()?;
         tx.execute_batch(BRANCHES_SQL)?;
+        if version < 6 {
+            // A database from before sync: queue its whole history for the first push. backfill() queues the
+            // branches first itself, so the branch entries 0007 added for an existing outbox are dropped.
+            tx.execute("DELETE FROM sync_queue WHERE kind = 'UPSERT_BRANCH'", [])?;
+            sync::backfill(&tx)?;
+        }
         tx.execute_batch("PRAGMA user_version = 7;")?;
         tx.commit()?;
     }
@@ -5469,6 +5475,27 @@ mod tests {
         assert_eq!(k[1], "AUDIT_LOG");
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM sync_queue WHERE branch_id = 'br-main' AND device_id = 'dev-old'"), k.len() as i64);
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM stock_movements WHERE device_id IS NULL"), 0);
+    }
+
+    #[test]
+    fn a_version_5_database_with_data_upgrades_and_queues_its_history() {
+        let conn = Connection::open_in_memory().unwrap();
+        for sql in [INIT_SQL, SALE_CONTROLS_SQL, USER_PERMISSIONS_SQL, RECEIPT_SETTINGS_SQL, REPORT_INDEXES_SQL, DEMO_SQL] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 5;").unwrap();
+        migrate(&conn).unwrap();
+        assert_eq!(count(&conn, "PRAGMA user_version"), 7);
+        let k = kinds(&conn);
+        assert_eq!(k.iter().filter(|x| *x == "UPSERT_BRANCH").count(), 1, "{k:?}");
+        assert_eq!(k[0], "UPSERT_BRANCH");
+        assert_eq!(k.iter().filter(|x| *x == "UPDATE_PRODUCT").count() as i64, count(&conn, "SELECT COUNT(*) FROM products"));
+        let device = device_id(&conn).unwrap();
+        assert_eq!(
+            count(&conn, &format!("SELECT COUNT(*) FROM sync_queue WHERE branch_id = 'br-main' AND device_id = '{device}'")),
+            k.len() as i64
+        );
+        assert_eq!(active_branch(&conn).unwrap(), "br-main");
     }
 
     #[test]
